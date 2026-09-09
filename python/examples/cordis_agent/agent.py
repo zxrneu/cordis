@@ -1,0 +1,63 @@
+from __future__ import annotations
+
+import asyncio
+import json
+from typing import Any
+
+from cordis import Context
+
+from .contracts import ToolCall
+
+
+class AgentRuntime:
+    def __init__(self, ctx: Context, *, max_steps: int):
+        self.ctx = ctx
+        self.max_steps = max_steps
+        self._lock = asyncio.Lock()
+
+    async def run(self, text: str) -> str:
+        async with self._lock:
+            return await self._run(text)
+
+    async def _run(self, text: str) -> str:
+        session = self.ctx.session
+        if not session.messages:
+            await session.append({"role": "system", "content": self.ctx.system_prompt})
+        await session.append({"role": "user", "content": text})
+
+        for _ in range(self.max_steps):
+            message = await self.ctx.llm.complete(
+                session.messages,
+                self.ctx.tools.schemas(),
+            )
+            await session.append(message)
+            calls = message.get("tool_calls") or []
+            if not calls:
+                return message.get("content") or ""
+
+            for raw in calls:
+                call = self._parse_call(raw)
+                result = await self.ctx.tools.execute(call)
+                await session.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": json.dumps(result, ensure_ascii=False),
+                    }
+                )
+        raise RuntimeError(f"Agent 超过最大工具迭代次数 {self.max_steps}")
+
+    @staticmethod
+    def _parse_call(raw: Any) -> ToolCall:
+        try:
+            call_id = raw["id"]
+            function = raw["function"]
+            name = function["name"]
+            arguments = json.loads(function["arguments"])
+        except (KeyError, TypeError, json.JSONDecodeError) as error:
+            raise ValueError(f"模型返回了无效 ToolCall：{raw!r}") from error
+        if not all(isinstance(value, str) and value for value in (call_id, name)):
+            raise ValueError(f"ToolCall id/name 无效：{raw!r}")
+        if not isinstance(arguments, dict):
+            raise ValueError("ToolCall arguments 必须是 JSON object")
+        return ToolCall(call_id, name, arguments)
