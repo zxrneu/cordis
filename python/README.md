@@ -1,8 +1,8 @@
 # Cordis for Python
 
-入门文档：[第一次使用 Cordis](docs/zh-CN.md) · [使用教程](docs/tutorial.md) · [核心概念](docs/core-concepts.md) · [类型化插件开发](docs/typing.md) · [实战：配置自动更新的 CSV 导入](docs/scenarios.md)
+入门文档：[开发者完全指南（入门到深入与 Q&A）](docs/developer-guide.md) · [第一次使用 Cordis](docs/zh-CN.md) · [使用教程](docs/tutorial.md) · [核心概念](docs/core-concepts.md) · [类型化插件开发](docs/typing.md) · [实战：配置自动更新的 CSV 导入](docs/scenarios.md)
 
-进阶参考：[API 参考](docs/api.md) · [实现与维护参考](docs/implementation.md) · [与最新 DSH 的差距](docs/cordis-agent-vs-dsh.md) · [Cordis Agent](examples/cordis_agent/) · [离线架构 Demo](examples/dsh_like.py) · [安全卸载 Demo](examples/graceful_unload.py)
+进阶参考：[核心原理代码走读与维护手册](docs/internals-walkthrough.md) · [API 参考](docs/api.md) · [实现与维护参考](docs/implementation.md) · [与最新 DSH 的差距](docs/cordis-agent-vs-dsh.md) · [Cordis Agent](examples/cordis_agent/) · [离线架构 Demo](examples/dsh_like.py) · [安全卸载 Demo](examples/graceful_unload.py)
 
 本仓库是论文 [*A Programming Paradigm for Spatiotemporal Composability*](https://arxiv.org/abs/2608.25512) 中所描述运行时架构的 Python 实现：
 
