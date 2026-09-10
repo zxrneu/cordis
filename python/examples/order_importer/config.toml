@@ -6,7 +6,7 @@ path = "var/orders.sqlite3"
 
 [validation]
 # Decimal text avoids floating-point rounding. Change to "100.00" while running.
-max_amount = "0.01"
+max_amount = "100.00"
 
 [importer]
 directory = "incoming"
