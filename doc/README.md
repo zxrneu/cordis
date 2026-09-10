@@ -11,7 +11,9 @@
 
 | 章节 | 文件 | 核心内容概要 |
 | :--- | :--- | :--- |
-| **01. 为什么需要 Cordis** | [01-why-cordis.md](file:///Users/zxr/coding/cordis/doc/01-why-cordis.md) | 传统 IoC/插件架构的痛点、时空可组合性（Spatiotemporal Composability）哲学、响应式依赖与全自动副作用管理。 |
+| **⭐ 开发者完全指南 & QA** | [developer-guide.md](developer-guide.md) | 从零到深入全面指南、契约与生命周期、依赖注入、高级事件、多租户、可调用服务与 10 大高频 QA。 |
+| **🛠️ 核心原理走读与维护手册** | [internals-walkthrough.md](internals-walkthrough.md) | 深度源码走读（Proxy 陷阱、Fiber 状态机、Inertia 锁）、内存模型、LIFO 清理流与四大维护铁律。 |
+| **01. 为什么需要 Cordis** | [01-why-cordis.md](01-why-cordis.md) | 传统 IoC/插件架构的痛点、时空可组合性（Spatiotemporal Composability）哲学、响应式依赖与全自动副作用管理。 |
 | **02. 架构设计与体系结构** | [02-architecture.md](file:///Users/zxr/coding/cordis/doc/02-architecture.md) | Monorepo 模块分层、核心对象关系拓扑（Mermaid 图解）、生命周期与控制流模型。 |
 | **03. 核心机制：Context、Fiber 与 Effect** | [03-core-concepts.md](file:///Users/zxr/coding/cordis/doc/03-core-concepts.md) | 原型链上下文派生、Fiber 6 态状态机、惯性锁（Inertia Lock）、生成器与异步 Effect 收集释放机制。 |
 | **04. 服务体系与响应式依赖注入** | [04-service-and-injection.md](file:///Users/zxr/coding/cordis/doc/04-service-and-injection.md) | `Service` 基类生命周期、`provide`/`inject` 动态挂载、Stage 3 `@Inject` 装饰器、Callable 服务、Associate 对象追踪。 |
