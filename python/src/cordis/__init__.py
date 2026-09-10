@@ -6,22 +6,31 @@ from .core import (
     Fiber,
     FiberState,
     EffectHandle,
+    Cleanup,
+    EffectCallback,
+    EffectResult,
     InactiveContextError,
     InactiveServiceError,
     MissingProvisionError,
+    TaskPolicy,
+    Plugin,
     UndeclaredServiceError,
     component,
     plugin,
 )
 from .hmr import FullRestartRequired, HotReloader, ModuleGraph
 from .loader import Entry, Loader, group, import_plugin
+from .keys import ServiceKey
 
 __all__ = [
     "Component",
+    "Cleanup",
     "Context",
     "CordisError",
     "DuplicateServiceError",
     "EffectHandle",
+    "EffectCallback",
+    "EffectResult",
     "Entry",
     "Fiber",
     "FiberState",
@@ -32,6 +41,9 @@ __all__ = [
     "Loader",
     "MissingProvisionError",
     "ModuleGraph",
+    "Plugin",
+    "ServiceKey",
+    "TaskPolicy",
     "UndeclaredServiceError",
     "component",
     "group",

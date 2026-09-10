@@ -36,7 +36,7 @@ def _source_path(module: ModuleType) -> Path | None:
 class ModuleGraph:
     """A source-level import graph for currently loaded Python modules."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.paths: dict[str, Path] = {}
         self.by_path: dict[Path, set[str]] = {}
         for name, module in list(sys.modules.items()):
@@ -108,7 +108,7 @@ class ModuleGraph:
 class HotReloader:
     """Dependency-aware, transactional module reload for Loader entries."""
 
-    def __init__(self, loader: "Loader", *, externals: Iterable[str] = ()):
+    def __init__(self, loader: "Loader", *, externals: Iterable[str] = ()) -> None:
         self.loader = loader
         self.externals = set(externals)
 
@@ -194,7 +194,9 @@ class HotReloader:
             failures = [
                 loaded.fiber.error
                 for loaded in loaded_items
-                if loaded.fiber is not None and loaded.fiber.state is FiberState.FAILED
+                if loaded.fiber is not None
+                and loaded.fiber.state is FiberState.FAILED
+                and loaded.fiber.error is not None
             ]
             if failures:
                 raise ExceptionGroup("hot reload failed", failures)

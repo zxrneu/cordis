@@ -5,16 +5,27 @@ import importlib
 import json
 import tomllib
 import weakref
-from collections.abc import Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, TypeAlias, cast
 
-from .core import Component, Context, Fiber, FiberState
+from .core import (
+    Component,
+    Context,
+    Fiber,
+    FiberState,
+    Plugin,
+    PluginCallback,
+    _as_component,
+)
 
 
 Isolation = Mapping[str, bool | str]
+_PluginLike: TypeAlias = (
+    Component[Any, Any] | PluginCallback[Any, Any] | Plugin[Any, Any]
+)
 
 
 def _freeze_mapping(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
@@ -24,8 +35,8 @@ def _freeze_mapping(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
 @dataclass(frozen=True, slots=True)
 class Entry:
     id: str
-    plugin: str | Component | Any | None = None
-    config: Any = None
+    plugin: str | _PluginLike | None = None
+    config: object = None
     enabled: bool = True
     isolate: Isolation | tuple[str, ...] = field(default_factory=dict)
     intercept: Mapping[str, Any] = field(default_factory=dict)
@@ -52,18 +63,19 @@ class Entry:
 class _Loaded:
     entry: Entry
     ctx: Context
-    fiber: Fiber | None = None
-    component: Any = None
+    fiber: Fiber[Any, Any] | None = None
+    component: Component[Any, Any] | None = None
 
 
-def import_plugin(locator: str) -> Any:
+def import_plugin(locator: str) -> _PluginLike:
     module_name, separator, attribute = locator.partition(":")
     if not separator or not module_name or not attribute:
         raise ValueError("plugin locator must use 'package.module:attribute' syntax")
     value: Any = importlib.import_module(module_name)
     for part in attribute.split("."):
         value = getattr(value, part)
-    return value
+    # Importlib is the dynamic boundary; mounting validates the resolved plugin.
+    return cast(_PluginLike, value)
 
 
 def _coerce_entry(raw: Entry | Mapping[str, Any]) -> Entry:
@@ -73,7 +85,7 @@ def _coerce_entry(raw: Entry | Mapping[str, Any]) -> Entry:
 class Loader:
     """Incrementally reconcile a stable-id component configuration."""
 
-    def __init__(self, ctx: Context):
+    def __init__(self, ctx: Context) -> None:
         self.ctx = ctx
         self._loaded: dict[str, _Loaded] = {}
         self._local_realms: dict[tuple[str, str], object] = {}
@@ -83,11 +95,12 @@ class Loader:
     def entries(self) -> tuple[Entry, ...]:
         return tuple(item.entry for item in self._loaded.values())
 
-    def get(self, entry_id: str) -> Fiber | None:
+    def get(self, entry_id: str) -> Fiber[Any, Any] | None:
         return self._loaded[entry_id].fiber
 
     def _realms(self, entry: Entry) -> dict[str, object]:
         result: dict[str, object] = {}
+        assert isinstance(entry.isolate, Mapping)
         for name, label in entry.isolate.items():
             if label is True:
                 result[name] = self._local_realms.setdefault((entry.id, name), object())
@@ -102,16 +115,19 @@ class Loader:
     def _entry_context(self, entry: Entry) -> Context:
         return self.ctx._derive(realms=self._realms(entry), intercepts=entry.intercept)
 
-    def _component(self, entry: Entry) -> Any:
+    def _component(self, entry: Entry) -> Component[Any, Any]:
         if entry.children:
             return group
-        return (
+        if entry.plugin is None:
+            raise ValueError(f"entry {entry.id!r} needs a plugin")
+        value = (
             import_plugin(entry.plugin)
             if isinstance(entry.plugin, str)
             else entry.plugin
         )
+        return _as_component(value)
 
-    def _config(self, entry: Entry) -> Any:
+    def _config(self, entry: Entry) -> object:
         return list(entry.children) if entry.children else entry.config
 
     async def _dispose(self, loaded: _Loaded) -> None:
@@ -122,7 +138,9 @@ class Loader:
         finally:
             loaded.fiber = None
 
-    async def _start(self, loaded: _Loaded, component: Any | None = None) -> Fiber:
+    async def _start(
+        self, loaded: _Loaded, component: Component[Any, Any] | None = None
+    ) -> Fiber[Any, Any]:
         loaded.component = (
             component if component is not None else self._component(loaded.entry)
         )
@@ -196,7 +214,7 @@ class Loader:
         if self.ctx.fiber.state is FiberState.ACTIVE:
             await self.ctx.flush()
 
-    async def reload(self, entry_id: str) -> Fiber:
+    async def reload(self, entry_id: str) -> Fiber[Any, Any]:
         loaded = self._loaded[entry_id]
         if not isinstance(loaded.entry.plugin, str):
             if loaded.fiber is None:
@@ -206,7 +224,10 @@ class Loader:
         from .hmr import HotReloader
 
         await HotReloader(self).reload_entries([entry_id])
-        return self._loaded[entry_id].fiber  # type: ignore[return-value]
+        fiber = self._loaded[entry_id].fiber
+        if fiber is None:
+            raise RuntimeError(f"entry {entry_id!r} did not start after reload")
+        return fiber
 
     async def reload_changed(
         self,
@@ -229,7 +250,7 @@ class Loader:
             data = data.get("plugins", data)
         elif suffix in {".yaml", ".yml"}:
             try:
-                import yaml
+                yaml = importlib.import_module("yaml")
             except ImportError as error:
                 raise RuntimeError(
                     "YAML configuration requires the optional 'yaml' extra"
@@ -276,7 +297,7 @@ _group_loaders: weakref.WeakKeyDictionary[Context, Loader] = weakref.WeakKeyDict
 
 async def _group_apply(
     ctx: Context, entries: Iterable[Entry | Mapping[str, Any]]
-) -> Any:
+) -> Callable[[], Awaitable[None]]:
     loader = Loader(ctx)
     _group_loaders[ctx] = loader
     await loader.reconcile(entries)

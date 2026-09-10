@@ -4,6 +4,8 @@
 > DSH 基线：官方最新预发布版 [`v0.1.2-alpha.5`](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.2-alpha.5)，以及同日 `master` 的 [`49a606b`](https://github.com/deepseek-ai/deepseek-harness/commit/49a606bc5b5934603f22a26957a07dc799ab0291)。  
 > 本项目基线：`src/cordis/` 的 Python Cordis 运行时，加上 `examples/cordis_agent/` 的真实 DeepSeek API Demo。
 
+> Python 运行时更新（2026-09-09）：已加入 `ctx.spawn()`、嵌套 Effect 任务归属、异步事件任务归属和协作式卸载。下文相应条目已更新；DSH 一侧仍使用上面的 2026-09-03 比较基线。
+
 ## 1. 结论
 
 当前实现是一个**能真实运行的 Python Agent Harness 纵向切片**，不是 DSH 的 Python 复刻，也还不能替代 DSH。
@@ -12,7 +14,7 @@
 
 主要不足不在插件数量，而在四个运行时闭环仍未形成：
 
-1. **执行闭环**：没有任务归属、协作取消、单工具超时、并行调度和卸载排空协议。
+1. **执行闭环**：运行时已有任务归属、协作取消和卸载排空；Agent 产品仍缺少单工具超时、并行调度及工具调用 lease 协议。
 2. **安全闭环**：路径检查不是进程沙箱；审批、权限预设、沙箱执行和审计日志没有连成一条强制执行链。
 3. **会话闭环**：保存的是 API message，不是结构化事件源，无法可靠表达流式 chunk、审批、取消、压缩、子 Agent、回放和投影。
 4. **上下文闭环**：没有 token 计量、上下文组装、溢出恢复和压缩，长会话最终会超过模型窗口。
@@ -55,7 +57,7 @@ DSH 不是一个单独的 Agent Loop。官方架构把模型适配器、工具�
 | 多 ToolCall | 有 | 有 | 当前同一回答的多个调用按顺序执行 |
 | 并行工具调用 | 无 | 对并发安全工具可并行 | 独立慢工具也会串行，延迟累加 |
 | 工具超时与取消 | 无 | `timeoutMs`、取消信号、结果分类 | 卡住的工具会卡住整个 turn，也会妨碍插件卸载 |
-| 在途任务归属 | 无 | Agent/Scope/Fiber 生命周期协同 | 卸载插件不会自动发现裸 `asyncio.Task`；作者必须手动 drain/cancel |
+| 在途任务归属 | 部分 | Agent/Scope/Fiber 生命周期协同 | `ctx.spawn()` 和异步事件已跟随 Fiber/Effect；裸 Task 和 Agent 工具调用 lease 仍需接入 |
 | Session 事件源 | 部分 | typed append-only `SessionEvent` 是唯一事实源 | 当前 JSONL 只存 API message，非消息状态无法可靠回放 |
 | 持久化与崩溃恢复 | 部分 | 独立 persistence seam、flush checkpoint、修复与版本头 | 当前逐行 append，无锁、无校验、无原子 checkpoint、尾行损坏恢复或格式迁移 |
 | Session 投影 / 查询 | 无 | 从事件导出消息、标题、列表、遥测等投影 | 当前直接把持久化数据当模型 messages，存储模型与展示模型耦合 |
@@ -103,11 +105,9 @@ DSH 的工具执行契约明确包含每工具超时、并发安全标记、取�
 
 ## 5. 关键不足
 
-### 5.1 P0：插件卸载还没有“在途任务安全”
+### 5.1 P0：工具调用仍需接入任务作用域
 
-这是当前 Cordis runtime 最影响正确性的缺口。
-
-插件 cleanup 能撤销注册和关闭资源，但裸 `asyncio.create_task()`、异步事件回调以及正在执行的工具不会自动成为所属 Fiber 的子任务。于是卸载工具插件时可能发生：
+运行时已提供 `ctx.spawn()`，异步事件回调也会自动归属于注册者的 Fiber/Effect。裸 `asyncio.create_task()` 和直接取得 handler 引用后执行的工具调用仍不自动归属于工具提供者。卸载工具插件时仍可能发生：
 
 ```text
 ToolCall 已取得 handler 引用
@@ -119,15 +119,13 @@ ToolCall 已取得 handler 引用
         +-- provider cleanup 先关闭资源 -> 在途调用失败或写入半完成
 ```
 
-当前 Demo 的工具调用由 Agent Loop 直接 `await`，`AgentRuntime.run()` 也用异步锁避免两条 turn 交错，正常关闭入口时一般会等本次调用返回；但运行时没有形成普遍保证。任何后台 task、异步事件回调或未来并行工具都会重新暴露竞态，异步锁也不等价于带投递、状态和取消语义的 Agent inbox。
-
-需要补的不是单个 `tasks: set`，而是运行时任务域：
+当前 Demo 的工具调用由 Agent Loop 直接 `await`，`AgentRuntime.run()` 也用异步锁避免两条 turn 交错。后续需要将 Agent 执行和工具调用 lease 接入运行时任务域；异步锁不等价于带投递、状态和取消语义的 Agent inbox。后台工作现在可以这样登记：
 
 ```python
 task = ctx.spawn(coro, policy="drain", timeout=30)
 ```
 
-它至少要保证：停止接收新任务、记录所属 Fiber、消费异常、卸载时 drain 或 cancel、超时后强制 cancel，并且 provider 等待所有依赖 consumer 的任务域结束后再 cleanup。
+运行时已实现停止接收新任务、记录所属 Fiber、消费异常、卸载时 drain 或 cancel、超时后请求取消，以及 provider 等待依赖 consumer 的受管任务结束后再 cleanup。取消是协作式的，忽略取消或阻塞事件循环的代码仍无法强制终止。
 
 ### 5.2 P0：路径限制不是安全沙箱
 
@@ -270,13 +268,14 @@ Python 实现应复制这些“能力 seam”，不必一开始复制 DSH 的所
 
 ### Milestone 1（P0）：任务所有权与可终止卸载
 
-- [ ] 实现 `ctx.spawn()` 和 Fiber task scope；
-- [ ] 支持 `drain`、`cancel`、deadline 和超时后 cancel；
-- [ ] 异步事件与 ToolCall 自动继承调用者/注册者 scope；
+- [x] 实现 `ctx.spawn()` 和 Fiber/Effect task scope；
+- [x] 支持 `drain`、`cancel` 和排空超时后请求 cancel；
+- [x] 异步事件自动继承注册者 scope；
+- [ ] ToolCall 接入任务作用域和业务执行期限；
 - [ ] 工具注册增加 lease/quiesce：先禁止新调用，再排空旧调用；
 - [ ] 统一消费后台异常并写入结构化错误事件。
 
-验收：在工具运行到一半时卸载插件，不能出现资源先关闭；超时后 Fiber 必须在有限时间进入终态；测试结束没有遗留 task。
+验收：在工具运行到一半时卸载插件，不能出现资源先关闭；协作式任务超时后取消并完成清理，测试结束没有遗留 task。忽略取消的协程需要更强的进程隔离边界。
 
 ### Milestone 2（P0）：事件溯源 Session
 
@@ -345,13 +344,13 @@ Agent 层之外，通用 Python Cordis 还有几项会阻碍 Harness 扩展：
 
 | 优先级 | Runtime 缺口 | 对 Harness 的影响 |
 | --- | --- | --- |
-| P0 | 无 `ctx.spawn()` / task scope | 工具、流式请求和后台 Job 无法安全跟随插件卸载 |
+| 已补齐 | `ctx.spawn()` / Fiber 与 Effect task scope | Agent 工具、流式请求和后台 Job 可接入；裸 Task 不会自动纳管 |
 | P0 | cleanup 无统一 timeout/deadline | 一个坏插件能永久卡住 reload 或进程退出 |
 | P1 | Loader reconcile 非全局事务 | 多 Entry patch 中途失败可能形成新旧配置混合态 |
 | P1 | 无依赖环诊断 | 能力互相等待时只表现为永久 `PENDING` |
 | P1 | HMR 只理解静态 import | 动态 provider、re-export 和 namespace package 可能漏重载 |
 | P1 | update hook 无 rollback 契约 | 原地配置更新失败可能留下不可见副作用 |
-| P2 | Service 类型主要是 `Any` | 大型能力图的接口漂移只能较晚发现 |
+| 已补齐 | `ServiceKey[T]`、Context 描述符及泛型配置 | 新插件可静态检查服务接口；旧字符串 API 与 Agent 示例的动态调用仍需逐步迁移 |
 | P2 | Realm/error/module graph 无资源治理 | 长运行、多 workspace 场景会积累状态和扫描成本 |
 
 这些问题的详细背景见[中文指南的“当前实现的瑕疵”](zh-CN.md#9-当前实现的瑕疵)。

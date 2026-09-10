@@ -1,5 +1,7 @@
 # Cordis Python 中文指南
 
+第一次使用建议先读[使用教程](tutorial.md)与[核心概念](core-concepts.md)；类型 API 详见[类型化插件开发](typing.md)。本文保留较完整的实现分析与应用参考。
+
 本文从 Cordis 的设计动机讲到 Python 实现、插件开发、配置加载、热重载、生产使用边界和后续路线。对应实现基于论文 [A Programming Paradigm for Spatiotemporal Composability](https://arxiv.org/abs/2608.25512)，但不是论文中 TypeScript Cordis 的逐行翻译。
 
 ## 1. Cordis 解决什么问题
@@ -138,7 +140,7 @@ def metrics(ctx, _config):
 
 因此，消费者 teardown 可以安全调用自己已经提交的依赖。提供者不会在消费者之前关闭连接。
 
-这个保证的粒度是 **Fiber 生命周期**，不是任意 Python 对象引用。裸 `asyncio.create_task()` 不会自动登记到 Fiber；详见“在途任务”。
+这个保证覆盖 **Fiber 生命周期及 `ctx.spawn()`、异步事件回调所登记的任务**，不是任意 Python 对象引用。裸 `asyncio.create_task()` 不会自动登记到 Fiber；详见“在途任务”。
 
 ### 2.5 Context、隔离域和拦截
 
@@ -367,69 +369,52 @@ def parent(ctx, _config):
 dispose = ctx.on("message", handler)
 ctx.once("ready", initialize_once)
 
-ctx.emit("message", payload)          # 同步触发；异步结果转为后台 Task
+ctx.emit("message", payload)          # 同步触发；异步结果转为监听器所属的受管 Task
 await ctx.parallel("message", payload) # 并行等待并聚合异常
 result = await ctx.serial("query", payload)
 result = ctx.bail("sync-query", payload)
 ```
 
-事件监听器本身是可逆 Effect，插件卸载会移除监听器。已经开始执行的异步监听器目前不会自动归属于监听器 Fiber，这是一个已知边界。
+事件监听器本身是可逆 Effect，插件卸载会移除监听器。异步结果会自动归属于监听器注册时的 Fiber 和 Effect 作用域；同步回调创建的 Effect 也归属于监听器，而不是事件发送者。进入卸载后不再派发新回调，在途回调结束后才撤销资源。`ctx.on(..., task_policy="cancel")` 可指定立即取消，`timeout=30` 可设置卸载排空宽限期。
 
 ## 5. 在途任务与安全卸载
 
 ### 5.1 当前保证
 
-Cordis 能自动排空依赖 Fiber，但不能从 Python 运行时反向发现某个 `asyncio.Task` 正在持有哪个服务。
-
-如果插件创建后台任务，必须返回一个会停止接收新任务并等待或取消存量任务的 cleanup：
+`ctx.spawn()` 把异步工作登记到当前 Fiber 或嵌套 Effect。运行时先关闭该作用域的新任务入口，等待所有在途任务结束，然后才按 LIFO 顺序执行资源 cleanup。提供者会等待依赖它的消费者完成这个过程。
 
 ```python
-import asyncio
-import contextlib
+from cordis import plugin
 
 
 @plugin(inject=["database"])
 def worker(ctx, _config):
-    tasks: set[asyncio.Task] = set()
-    accepting = True
-
     async def execute(job):
         await ctx.database.execute(job)
 
-    def submit(job):
-        if not accepting:
-            return
-        task = asyncio.create_task(execute(job))
-        tasks.add(task)
-        task.add_done_callback(tasks.discard)
-
-    ctx.on("job", submit)
-
-    async def cleanup():
-        nonlocal accepting
-        accepting = False
-        await asyncio.gather(*tuple(tasks))  # drain 策略
-
-    return cleanup
+    # 不需要手动维护 Task set 或取消回调。
+    ctx.on("job", execute, timeout=30)
+    ctx.spawn(execute("warmup"), policy="cancel", name="warmup")
 ```
 
-如果任务不应继续运行，cleanup 可以改为 cancel 策略：
+`spawn(awaitable, *, policy="drain", timeout=None, name=None)` 返回普通 `asyncio.Task`，可直接等待结果或调用 `cancel()`：
 
-```python
-async def cleanup():
-    for task in tasks:
-        task.cancel()
-    for task in tuple(tasks):
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-```
+- `drain`：卸载时等待任务自然完成，默认没有期限；
+- `cancel`：卸载时立即请求取消；
+- `drain` 配合 `timeout`：卸载后等待指定秒数，超时则请求取消；这是排空期限，不是任务总执行时限。
+
+三种方式都会等待协作取消及 `finally` 完成后才释放依赖。不同任务同时开始排空或取消，避免一个 drain 阻塞另一个任务的取消。任务失败带着所属 Fiber 写入 `ctx.errors` 并触发 `internal/error`；普通取消不视为运行时错误。`fiber.tasks` 返回未完成任务快照，已完成任务自动移出注册表。`ctx.flush()` 仍只等待生命周期稳定，不等待后台任务全部结束。
+
+在 `ctx.effect()` 内启动的任务和注册的异步监听器也归属于该 Effect，手动调用其清理句柄时会先排空这些任务。开始卸载后，旧作用域不能创建新任务、服务、监听器或子插件。
+
+运行时无法反向发现裸 `asyncio.create_task()` 的服务引用，这些任务仍需插件自己管理。受管任务不能等待自身、所属 Effect、父插件或依赖服务的卸载／重启；这种调用会导致自等待，运行时会抛出 `InactiveContextError`。应把重载请求交给作用域之外的宿主执行。
 
 ### 5.2 生产环境建议
 
-- 在 cleanup 的第一步关闭入口，例如把 `accepting` 设为 `False`；
-- drain 必须设置业务级超时，避免一个永不返回的请求永久阻塞卸载；
+- 通过 `ctx.on()` 和 `ctx.spawn()` 接入异步工作，让运行时统一关闭入口和排空；外部服务器入口仍须自行停止接收请求；
+- 为 drain 设置业务合适的 `timeout`；任务必须响应 `CancelledError`，不应吞掉取消后继续无限运行或阻塞事件循环。Python 无法强制终止这种协程；
 - 数据库事务、文件写入和消息确认应由业务服务提供明确的取消或提交语义；
-- 不要 fire-and-forget；至少保存 Task 引用并消费异常；
+- 需要执行时限时，在业务协程内使用 `asyncio.timeout()`；受管任务的异常由运行时消费，裸任务仍须自己处理；
 - 滚动升级时先启动新提供者，把新流量切过去，再排空旧提供者。
 
 仓库中的 [`examples/graceful_unload.py`](../examples/graceful_unload.py) 演示了服务重载时排空在途请求。
@@ -634,13 +619,13 @@ HMR 是运行时事务，不是数据库事务。模块 import 阶段写文件�
 
 | 优先级 | 瑕疵 | 影响 / 临时做法 |
 | --- | --- | --- |
-| P0 | 没有 `ctx.spawn()`；裸 Task 和异步 `emit()` 回调不归属 Fiber | 插件手动保存 Task，在 cleanup 中 drain/cancel |
+| 边界 | 裸 Task、线程及忽略取消的协程不会被强制终止 | 使用 `ctx.spawn()` 纳管协作式协程；其他资源由插件管理 |
 | P0 | cleanup 没有统一超时 | 业务 cleanup 自己使用 `asyncio.timeout()` |
 | P1 | Loader reconcile 不是全局事务 | 一次更新中途失败可能留下已完成的增删；发布前校验配置，失败后重新 reconcile 已知良好配置 |
 | P1 | HMR 依赖图只识别 AST 中的静态 import | `importlib` 动态导入、运行时路径修改、部分 namespace package 需要显式 reload 或完整重启 |
 | P1 | HMR 只恢复模块缓存和 Component，不撤销 import-time 外部副作用 | 保持模块顶层纯净，把副作用放进插件生命周期 |
 | P1 | 没有依赖环诊断 | 循环依赖会保持 `PENDING`；通过状态事件和 `fibers` 排查 |
-| P1 | 服务类型主要是 `Any` | 使用 Protocol、类型检查器和项目内封装补强，运行时仍做声明检查 |
+| 边界 | 字符串服务名、事件和配置文件仍是动态接口 | 类型化代码使用 `ServiceKey[T]`、Context 描述符和泛型插件；详见[类型指南](typing.md) |
 | P2 | 每个 Realm 只允许一个直接提供者 | 需要多实例时增加 broker/multiplexer 服务 |
 | P2 | `watch_file()` / `HotReloader.watch()` 只有轮询，没有 debounce、退避和错误恢复策略 | 由进程入口监督 watcher |
 | P2 | Realm 缓存和错误历史没有回收策略 | 长时间高频创建动态 Entry 时可能增长 |
@@ -649,15 +634,15 @@ HMR 是运行时事务，不是数据库事务。模块 import 阶段写文件�
 
 ## 10. TODO
 
-### P0：任务所有权与可终止卸载
+### 已完成：任务所有权与协作式卸载
 
-- [ ] 增加 `ctx.spawn(awaitable, *, policy="drain", timeout=None)`；
-- [ ] Task 自动继承当前 Fiber、收集异常并在 Fiber unload 时停止接收；
-- [ ] 支持 `drain`、`cancel` 和超时后 cancel；
-- [ ] 让异步 `emit()` 自动使用监听器所属 Fiber 的任务域；
-- [ ] 添加“提供者卸载时，在途消费者完成后才关闭服务”的竞态测试。
+- [x] 增加 `ctx.spawn(awaitable, *, policy="drain", timeout=None)`；
+- [x] Task 自动继承当前 Fiber 和嵌套 Effect、收集异常并在 unload 时停止接收；
+- [x] 支持 `drain`、`cancel` 和超时后 cancel；
+- [x] 让异步事件回调自动使用监听器所属 Fiber 的任务域；
+- [x] 添加“提供者卸载时，在途消费者完成后才关闭服务”的竞态测试。
 
-验收标准：插件不需要维护 Task set；卸载不会遗留 Task；超时不会永久卡住 Fiber；任务异常进入 `internal/error`。
+验证结果：受管任务无需手动维护 Task set，协作式任务在卸载完成前全部结束；超时后请求取消并等待 `finally`；任务异常进入 `internal/error`。取消不响应、阻塞事件循环及通用 cleanup 超时仍属于边界。
 
 ### P1：配置事务和诊断
 
@@ -681,7 +666,8 @@ HMR 是运行时事务，不是数据库事务。模块 import 阶段写文件�
 
 ### P2：类型、可观测性和资源治理
 
-- [ ] 提供基于 `Protocol`/泛型的服务键类型方案；
+- [x] 提供 `ServiceKey[T]`、Protocol/Context 描述符和泛型插件配置；
+- [x] 启用 mypy strict，验证正确用法的推断结果和错误用法的拒绝行为；
 - [ ] 增加状态转换耗时、加载次数、回滚次数和活跃任务指标；
 - [ ] 为错误历史、已移除 Entry Realm 和无监听器事件桶提供回收；
 - [ ] 增加 broker/multiplexer 参考实现，支持滚动切流和多提供者；
@@ -692,6 +678,7 @@ HMR 是运行时事务，不是数据库事务。模块 import 阶段写文件�
 ```bash
 cd python
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m unittest discover -v
+mypy
 ruff check src tests examples
 ruff format --check src tests examples
 PYTHONPATH=src python examples/graceful_unload.py

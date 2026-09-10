@@ -43,8 +43,6 @@ def make_database(timeline: list[str]):
 def make_worker(timeline: list[str]):
     @plugin(inject=["database"])
     def worker(ctx: Context, _config: Any):
-        tasks: set[asyncio.Task[None]] = set()
-        accepting = True
         version = ctx.database.version
         timeline.append(f"{version}:worker 启动")
 
@@ -52,25 +50,10 @@ def make_worker(timeline: list[str]):
             result = await ctx.database.query(job)
             timeline.append(f"结果:{result}")
 
-        def submit(job: str) -> None:
-            if not accepting:
-                timeline.append(f"拒绝:{job}")
-                return
-            task = asyncio.create_task(execute(job), name=f"demo:{job}")
-            tasks.add(task)
-            task.add_done_callback(tasks.discard)
-
-        ctx.on("job", submit)
-
-        async def cleanup() -> None:
-            nonlocal accepting
-            accepting = False
-            timeline.append(f"{version}:worker 开始排空:{len(tasks)}")
-            if tasks:
-                await asyncio.gather(*tuple(tasks))
-            timeline.append(f"{version}:worker 停止")
-
-        return cleanup
+        # 异步监听器自动归属于 worker；卸载时停止接收新事件，等待在途
+        # 查询结束。超过一秒则请求取消，并等待 finally 完成后释放资源。
+        ctx.on("job", execute, timeout=1)
+        return lambda: timeline.append(f"{version}:worker 停止")
 
     return worker
 

@@ -1,0 +1,14 @@
+# Paths are relative to this configuration file.
+[database]
+path = "var/orders.sqlite3"
+
+[validation]
+# Decimal text avoids floating-point rounding. Change to "100.00" while running.
+max_amount = "50.00"
+
+[importer]
+directory = "incoming"
+interval = 0.5
+
+[logging]
+enabled = true
