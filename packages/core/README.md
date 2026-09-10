@@ -24,6 +24,7 @@ A Meta-Framework of Spatiotemporal Composability.
   - `examples/06-callable-service.ts`：函数式可调用服务 (`[Service.invoke]`)
 
 ### Python 原生实现 (`python/src/cordis`)
+- **双端全方位对比**：[Python vs TS 架构对比与演进指南](python/docs/python-vs-typescript.md)
 - **入门到精通**：[Python 开发者完全指南与高频 Q&A](python/docs/developer-guide.md)
 - **底层走读**：[Python 核心原理代码走读与维护者手册](python/docs/internals-walkthrough.md)
 - **中文入门**：[Python 快速上手（订单导入）](python/docs/zh-CN.md)

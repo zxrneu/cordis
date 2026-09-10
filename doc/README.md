@@ -13,6 +13,7 @@
 | :--- | :--- | :--- |
 | **⭐ 开发者完全指南 & QA** | [developer-guide.md](developer-guide.md) | 从零到深入全面指南、契约与生命周期、依赖注入、高级事件、多租户、可调用服务与 10 大高频 QA。 |
 | **🛠️ 核心原理走读与维护手册** | [internals-walkthrough.md](internals-walkthrough.md) | 深度源码走读（Proxy 陷阱、Fiber 状态机、Inertia 锁）、内存模型、LIFO 清理流与四大维护铁律。 |
+| **⚖️ Python vs TS 全方位对比与不足** | [python-vs-typescript.md](../python/docs/python-vs-typescript.md) | 深度对比 TS 与 Python 双端实现、元编程模型、并发治理、Loader/HMR 差异、8 大审计缺陷与演进路线。 |
 | **01. 为什么需要 Cordis** | [01-why-cordis.md](01-why-cordis.md) | 传统 IoC/插件架构的痛点、时空可组合性（Spatiotemporal Composability）哲学、响应式依赖与全自动副作用管理。 |
 | **02. 架构设计与体系结构** | [02-architecture.md](file:///Users/zxr/coding/cordis/doc/02-architecture.md) | Monorepo 模块分层、核心对象关系拓扑（Mermaid 图解）、生命周期与控制流模型。 |
 | **03. 核心机制：Context、Fiber 与 Effect** | [03-core-concepts.md](file:///Users/zxr/coding/cordis/doc/03-core-concepts.md) | 原型链上下文派生、Fiber 6 态状态机、惯性锁（Inertia Lock）、生成器与异步 Effect 收集释放机制。 |
