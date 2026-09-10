@@ -6,8 +6,8 @@ import tempfile
 from pathlib import Path
 
 from .application import Application
-from .config import format_cents
-from .contracts import AppContext, ImportReport
+from .definitions import AppContext, ImportReport
+from .money import format_cents
 
 
 async def serve(path: Path) -> None:
@@ -25,6 +25,7 @@ async def demo() -> None:
         path = target / "config.toml"
         # Use private fixtures: manual edits to the example do not affect --demo.
         initial = """[database]
+provider = "sqlite"
 path = "var/orders.sqlite3"
 [validation]
 max_amount = "50.00"
@@ -65,6 +66,18 @@ enabled = true
                 print(
                     f"  {order.order_id} {order.customer} {format_cents(order.amount_cents)}"
                 )
+            old_store = root.store
+            print("\n[演示] 将 database.provider 从 sqlite 改成 memory", flush=True)
+            path.write_text(
+                initial.replace(
+                    'max_amount = "50.00"', 'max_amount = "100.00"'
+                ).replace('provider = "sqlite"', 'provider = "memory"'),
+                encoding="utf-8",
+            )
+            third = await asyncio.wait_for(reports.get(), timeout=5)
+            assert third.accepted == 2 and root.store is not old_store
+            assert root.store.all() == rows
+            print("[替换成功] 内存提供方使用相同契约，导入与日志消费者保持原代码。")
         print("[退出] 配置监听、目录扫描和数据库连接已清理。")
 
 
@@ -73,7 +86,7 @@ def main() -> None:
         description="Cordis CSV 订单导入与配置自动更新示例"
     )
     parser.add_argument(
-        "--demo", action="store_true", help="在临时目录自动演示一次配置修改"
+        "--demo", action="store_true", help="在临时目录演示规则更新和存储提供方切换"
     )
     parser.add_argument(
         "--config",

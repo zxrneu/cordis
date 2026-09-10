@@ -1,10 +1,12 @@
 # Paths are relative to this configuration file.
 [database]
+# Switch to "memory" to replace the store without changing consumers.
+provider = "sqlite"
 path = "var/orders.sqlite3"
 
 [validation]
 # Decimal text avoids floating-point rounding. Change to "100.00" while running.
-max_amount = "50.00"
+max_amount = "0.01"
 
 [importer]
 directory = "incoming"

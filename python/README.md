@@ -1,8 +1,8 @@
 # Cordis for Python
 
-入门文档：[使用教程](docs/tutorial.md) · [核心概念](docs/core-concepts.md) · [类型化插件开发](docs/typing.md) · [实战：配置自动更新的 CSV 导入](docs/scenarios.md)
+入门文档：[第一次使用 Cordis](docs/zh-CN.md) · [使用教程](docs/tutorial.md) · [核心概念](docs/core-concepts.md) · [类型化插件开发](docs/typing.md) · [实战：配置自动更新的 CSV 导入](docs/scenarios.md)
 
-进阶参考：[从原理、实现到应用](docs/zh-CN.md) · [与最新 DSH 的差距](docs/cordis-agent-vs-dsh.md) · [Cordis Agent](examples/cordis_agent/) · [离线架构 Demo](examples/dsh_like.py) · [安全卸载 Demo](examples/graceful_unload.py)
+进阶参考：[实现与维护参考](docs/implementation.md) · [与最新 DSH 的差距](docs/cordis-agent-vs-dsh.md) · [Cordis Agent](examples/cordis_agent/) · [离线架构 Demo](examples/dsh_like.py) · [安全卸载 Demo](examples/graceful_unload.py)
 
 本仓库是论文 [*A Programming Paradigm for Spatiotemporal Composability*](https://arxiv.org/abs/2608.25512) 中所描述运行时架构的 Python 实现：
 
@@ -86,7 +86,7 @@ asyncio.run(main())
 
 ## 声明式加载器
 
-想看配置文件修改后自动生效的完整应用，可以运行 `uv run python -m examples.order_importer --demo`。它组合 CSV 扫描、订单校验、SQLite 和日志插件，并通过实际修改 TOML 演示更新；[实战文档](docs/scenarios.md)也包含常驻监听的使用方式。
+想看配置文件修改后自动生效的完整应用，可以运行 `uv run python -m examples.order_importer --demo`。它将服务契约、提供方、调用方分开，通过修改 TOML 更新金额规则，并在 SQLite 与内存存储间切换；[实战文档](docs/scenarios.md)包含常驻监听、三角色分工和增加提供方的步骤。
 
 ```python
 from cordis import Entry, Loader

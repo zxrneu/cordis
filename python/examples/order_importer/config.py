@@ -1,47 +1,20 @@
 from __future__ import annotations
 
 import math
-import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-
-def parse_cents(value: str) -> int:
-    """Parse positive decimal money without floating-point rounding."""
-    value = value.strip()
-    if not re.fullmatch(r"[0-9]+(?:\.[0-9]{1,2})?", value):
-        raise ValueError("金额必须是最多两位小数的正数")
-    whole, _, fraction = value.partition(".")
-    cents = int(whole) * 100 + int(fraction.ljust(2, "0"))
-    if not 0 < cents <= 2**63 - 1:
-        raise ValueError("金额必须大于零且在 SQLite 整数范围内")
-    return cents
-
-
-def format_cents(value: int) -> str:
-    return f"{value // 100}.{value % 100:02d}"
-
-
-@dataclass(frozen=True)
-class DatabaseConfig:
-    path: Path
-
-
-@dataclass(frozen=True)
-class ValidationConfig:
-    max_amount_cents: int
-
-
-@dataclass(frozen=True)
-class ImporterConfig:
-    directory: Path
-    interval: float
+from .consumers.directory import ImporterConfig as ImporterConfig
+from .money import format_cents as format_cents, parse_cents
+from .providers.memory import MemoryConfig
+from .providers.sqlite import DatabaseConfig as DatabaseConfig
+from .providers.validation import ValidationConfig as ValidationConfig
 
 
 @dataclass(frozen=True)
 class AppConfig:
-    database: DatabaseConfig
+    database: DatabaseConfig | MemoryConfig
     validation: ValidationConfig
     importer: ImporterConfig
     logging: bool
@@ -83,8 +56,16 @@ def parse_config(content: bytes, base: Path) -> AppConfig:
     enabled = logging.get("enabled", True)
     if not isinstance(enabled, bool):
         raise ValueError("logging.enabled 必须是布尔值")
+    provider = database.get("provider", "sqlite")
+    store_config: DatabaseConfig | MemoryConfig
+    if provider == "sqlite":
+        store_config = DatabaseConfig((base / _string(database, "path")).resolve())
+    elif provider == "memory":
+        store_config = MemoryConfig()
+    else:
+        raise ValueError("database.provider 必须是 sqlite 或 memory")
     return AppConfig(
-        database=DatabaseConfig((base / _string(database, "path")).resolve()),
+        database=store_config,
         validation=ValidationConfig(parse_cents(_string(validation, "max_amount"))),
         importer=ImporterConfig(
             (base / _string(importer, "directory")).resolve(),

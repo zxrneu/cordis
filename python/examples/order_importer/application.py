@@ -5,9 +5,15 @@ from pathlib import Path
 
 from cordis import Entry, FiberState, Loader
 
-from .config import AppConfig, format_cents, parse_config
-from .contracts import AppContext
-from .plugins import console, database, importer, validation
+from .config import AppConfig, parse_config
+from .consumers.console import console
+from .consumers.directory import directory
+from .definitions import AppContext
+from .money import format_cents
+from .providers.csv import importer
+from .providers.memory import memory
+from .providers.sqlite import DatabaseConfig, database
+from .providers.validation import validation
 
 
 class Application:
@@ -29,12 +35,19 @@ class Application:
         config = parse_config(content, self.path.parent)
         if config == self.config:
             return False
+        if isinstance(config.database, DatabaseConfig):
+            store_entry = Entry("database", database, config.database)
+            provider_name = "sqlite"
+        else:
+            store_entry = Entry("database", memory, config.database)
+            provider_name = "memory"
         await self.loader.reconcile(
             [
                 Entry("console", console, enabled=config.logging),
-                Entry("database", database, config.database),
+                store_entry,
                 Entry("validation", validation, config.validation),
-                Entry("importer", importer, config.importer),
+                Entry("importer", importer),
+                Entry("directory", directory, config.importer),
             ]
         )
         for fiber in self.ctx.fibers:
@@ -44,7 +57,7 @@ class Application:
         self.config = config
         print(
             f"[配置已更新] 金额上限 {format_cents(config.validation.max_amount_cents)}，"
-            f"扫描间隔 {config.importer.interval:g}s，日志 {config.logging}",
+            f"扫描间隔 {config.importer.interval:g}s，日志 {config.logging}，存储 {provider_name}",
             flush=True,
         )
         self.ctx.emit("config/applied", config)

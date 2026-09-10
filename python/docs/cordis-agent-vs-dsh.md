@@ -353,7 +353,7 @@ Agent 层之外，通用 Python Cordis 还有几项会阻碍 Harness 扩展：
 | 已补齐 | `ServiceKey[T]`、Context 描述符及泛型配置 | 新插件可静态检查服务接口；旧字符串 API 与 Agent 示例的动态调用仍需逐步迁移 |
 | P2 | Realm/error/module graph 无资源治理 | 长运行、多 workspace 场景会积累状态和扫描成本 |
 
-这些问题的详细背景见[中文指南的“当前实现的瑕疵”](zh-CN.md#9-当前实现的瑕疵)。
+这些问题的详细背景见[实现与维护参考的“当前限制与风险”](implementation.md#当前限制与风险)。
 
 ## 10. 如何保持这份比较不过期
 

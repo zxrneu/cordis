@@ -4,7 +4,7 @@
 
 完整程序在 [`examples/tutorial.py`](../examples/tutorial.py)。理解运行机制可读[核心概念](core-concepts.md)，类型推断细节可读[类型化插件开发](typing.md)。
 
-需要实际业务场景和配置文件自动更新，可继续阅读[CSV 订单导入实战](scenarios.md)：它监听 TOML 与 CSV，更新校验规则并写入 SQLite。
+需要实际业务场景和配置文件自动更新，可继续阅读[CSV 订单导入实战](scenarios.md)：它监听 TOML 与 CSV，更新校验规则，并通过共享契约切换 SQLite / 内存提供方。
 
 ## 1. 安装并运行
 
