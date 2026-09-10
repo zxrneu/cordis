@@ -299,6 +299,7 @@ yield store.close
 | 你想继续做什么 | 文档 |
 | --- | --- |
 | 从头编写自己的插件 | [使用教程](tutorial.md) |
+| 查询方法参数、返回值和异常 | [API 参考](api.md) |
 | 理解 Context、Fiber、隔离域等概念 | [核心概念](core-concepts.md) |
 | 了解 Protocol、服务键和配置类型检查 | [类型化插件开发](typing.md) |
 | 扩展 CSV 导入业务或寻找其他场景 | [场景与配置自动更新](scenarios.md) |

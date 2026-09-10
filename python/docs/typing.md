@@ -1,6 +1,6 @@
 # 类型化插件开发
 
-入门请先看[使用教程](tutorial.md)，运行时关系见[核心概念](core-concepts.md)。
+入门请先看[使用教程](tutorial.md)，运行时关系见[核心概念](core-concepts.md)，完整公开接口见 [API 参考](api.md)。
 
 公开 API 的类型会沿着 `@plugin → Component[Config, Context] → ctx.use() → Fiber[Config, Context]` 保留。配置更新、服务注册／访问和 `ctx.spawn()` 的返回值都可以接受静态检查。推荐把服务接口和键放在共享的 contracts 模块中。
 
