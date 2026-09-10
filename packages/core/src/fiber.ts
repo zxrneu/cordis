@@ -399,6 +399,8 @@ export class Fiber {
   private _setEpoch(epoch: string) {
     const oldEpoch = this._runner.epoch
     if (epoch === oldEpoch) return
+    // a failed fiber only recovers through update(), which clears _error
+    if (this._error) return
     this._runner.epoch = epoch
     if (this.inertia) return
     this._updateState(() => {
@@ -473,14 +475,22 @@ export class Fiber {
     await fiber.await()
   }
 
-  update(config: any, noSave = false) {
+  update(config: any, noSave = false): Awaitable<void> {
     const fiber = this.ctx.fiber
     fiber.assertActive()
     config = resolveConfig(fiber.runtime!, config)
-    fiber.context.waterfall(fiber, 'internal/update', config, noSave, () => {
+    const result = fiber.context.waterfall(fiber, 'internal/update', config, noSave, () => {
       fiber.config = config
       fiber._error = undefined
       return fiber.restart()
     })
+    // a listener may veto the restart, in which case there is nothing to await
+    if (result === undefined) return
+    const task = Promise.resolve(result)
+    // the failure is already reported by the fiber, so mark it handled here:
+    // a caller that drops the result cannot turn it into an unhandled
+    // rejection, while `await update()` still observes it
+    task.catch(() => {})
+    return task
   }
 }
