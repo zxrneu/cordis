@@ -1,6 +1,6 @@
 /**
  * 示例 1: 基础插件与生命周期
- * 
+ *
  * 运行方式:
  *   npx tsx examples/01-basic-plugin.ts
  */
