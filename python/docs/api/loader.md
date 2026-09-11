@@ -27,7 +27,7 @@ Entry(
 | `config` | `object` | 传入插件的配置，默认 `None`；不会自动转换为 dataclass |
 | `enabled` | `bool` | 是否启用；默认 `True`，停用条目仍保留在 `entries` 中 |
 | `isolate` | `Mapping[str, bool \| str] \| tuple[str, ...]` | 按字符串服务名配置隔离域，规则见下表 |
-| `intercept` | `Mapping[str, Any]` | 按字符串服务名给当前条目设置拦截元数据 |
+| `intercept` | `Mapping[str, object]` | 按字符串服务名给当前条目设置拦截元数据，读取后需收窄类型 |
 | `children` | `tuple[Entry \| Mapping[str, Any], ...]` | 嵌套插件清单；默认为空 |
 
 必须满足以下两种形式之一，否则抛出 `ValueError`：指定 `plugin`；或不指定 plugin、提供非空 `children`。不能同时指定插件和子条目。
@@ -45,24 +45,50 @@ Entry 会复制并冻结 isolate / intercept 的外层映射，把 children 转�
 
 共享标签由当前 Loader 管理，不是跨 Loader 的全局命名空间。需要嵌套组内共享服务时，可以把隔离设置放在父组上，让子条目继承。
 
-`Entry` 是异构配置容器，静态类型不会证明它的 plugin 与 config 匹配。需要代码内的严格匹配时用 `ctx.use(component, config)`；文件配置在宿主或插件 validate 中校验。
+`Entry` 是兼容配置清单的动态容器，静态类型不会证明它的 plugin 与 config 匹配。代码内装配可使用 `component.configure(config)` 与 `loader.mount()`；外部数据先通过 `component.decode(raw, decoder)` 转换。Entry 不会自动调用 decoder。
 
 ## Loader
 
 ```text
-Loader(ctx: Context)
+Loader(ctx: ContextT)  # Loader[ContextT]
 ```
 
-以 `ctx` 作为装配入口。Loader 自身不是异步上下文管理器；可在 `finally` 中 `await loader.close()`，或者由包围它的根 Context 统一关闭运行时。
+以只读的 `ctx` 作为装配入口，保留 Context 子类类型。Loader 自身不是异步上下文管理器；可在 `finally` 中 `await loader.close()`，或者由包围它的根 Context 统一关闭运行时。
+
+### mount / unmount
+
+```python
+async def mount(
+    entry_id: str,
+    binding: BoundComponent[ConfigT, ContextT],
+) -> Fiber[ConfigT, ContextT]: ...
+
+async def unmount(entry_id: str) -> None: ...
+```
+
+先绑定配置，再将完整绑定交给 Loader：
+
+```python
+binding = worker.configure(WorkerConfig(interval=5))
+fiber = await loader.mount("worker", binding)
+await fiber.update(WorkerConfig(interval=10))
+await loader.unmount("worker")
+```
+
+mount 等待当前启动转换完成；缺少依赖时可以返回处于 `PENDING` 的 Fiber，语义与 `await fiber` 相同。启动失败会清理本次挂载、释放 id 并抛出异常。id 与现有 mount 或 Entry 冲突时，在修改前抛出 `ValueError`。unmount 可移除任一入口的条目；不存在时抛出 `KeyError`。
+
+mount 管理的条目不进入 `entries`，也不会被 `reconcile()` 的完整清单删除；`reconcile([])` 只清空声明式条目。两种入口共享 id 范围，清单与 mount 的 id 冲突会在修改前被拒绝。`close()` 清理两种入口的全部挂载。源码 HMR 仍只处理 Entry 的字符串定位符；类型化挂载通过 `reload(id)` 重启已有组件定义。
+
+类型化挂载使用 Loader 的 Context；如需隔离或拦截，可先通过 `ctx.isolate()` / `ctx.intercept()` 创建装配 Context。完整示例见 [`typed_interfaces.py`](../../examples/typed_interfaces.py)。
 
 ### entries / get
 
 ```text
 loader.entries -> tuple[Entry, ...]
-loader.get(entry_id: str) -> Fiber[Any, Any] | None
+loader.get(entry_id: str) -> FiberView[ContextT] | None
 ```
 
-`entries` 返回这个 Loader 直接管理的条目快照，包括停用项。`get()` 的行为如下：
+`entries` 返回这个 Loader 直接管理的声明式条目快照，包括停用项。`get()` 可以查询声明式条目及 mount 挂载，行为如下：
 
 | 情况 | 结果 |
 | --- | --- |
@@ -71,6 +97,8 @@ loader.get(entry_id: str) -> Fiber[Any, Any] | None
 | 不存在该 id | 抛出 `KeyError`，不是返回 `None` |
 
 嵌套组由内部 Loader 管理。父 Loader 的 `get()` 只能查询组的 id，不能用它直接查询子条目的 id。
+
+字符串 id 不能恢复插件的具体配置类型，返回视图的 config 因此为 object，不暴露 update。ctx 保留 Loader 的 Context 子类类型。代码内需要更新配置时，保留 `ctx.use()` 或 `loader.mount()` 的返回值。
 
 ### reconcile
 
@@ -132,18 +160,19 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-依次输出 `已加载`、`已更新`。生产宿主应串行调用 reconcile、reload 和 close；当前 Loader 没有统一的并发协调锁。单个 Fiber 更新回滚后，Entry 的配置记录还可能保留失败的新值，重复提交相同配置会被跳过；详见[已知限制](../implementation.md#当前限制与风险)。
+依次输出 `已加载`、`已更新`。宿主应串行协调 mount、unmount、reconcile、reload 和 close；当前 Loader 没有统一的并发协调锁。单个 Fiber 更新回滚后，Entry 的配置记录还可能保留失败的新值，重复提交相同配置会被跳过；详见[已知限制](../implementation.md#当前限制与风险)。
 
 ### reload
 
 ```python
-async def reload(entry_id: str) -> Fiber[Any, Any]: ...
+async def reload(entry_id: str) -> FiberView[ContextT]: ...
 ```
 
 重新加载指定条目，返回当前 Fiber。未知 id 抛出 `KeyError`。
 
 - plugin 是对象或 Component：通常调用同一个 Fiber 的 `restart()`，不会重新执行 Python 模块导入。
 - plugin 是字符串定位符：调用 HMR 重导入入口模块，替换 Fiber；失败时尝试恢复，见 [HMR](hmr.md)。
+- 通过 mount 挂载：重启同一个 Fiber，使用其当前配置，包括通过类型化 Fiber.update() 成功更新的配置。
 
 它面向需要重新运行的条目，不能替代 enabled 配置：当前对象插件路径会在 Fiber 缺失时直接启动条目，而字符串路径会因停用项没有启动而报错。启停统一通过 `reconcile()` 管理。
 

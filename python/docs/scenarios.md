@@ -263,6 +263,8 @@ await self.loader.reconcile([
 
 这里使用业务配置格式，所以宿主先解析成 dataclass，再调用 `reconcile()`。Cordis 原生的 `Loader.load_file()` / `watch_file()` 接受的是插件条目清单，不会自动把这份业务配置转换成 dataclass；两种格式不能直接混用。
 
+示例源码目前继续使用 Entry/reconcile 和字符串通知，不能据此认为 Entry 会检查配置配对或字符串事件会检查参数。新代码可用 configure/decode → mount 保留配置类型，用 EventKey 关联通知参数，用 QueryKey 关联单处理器请求与结果；参考[类型化接口示例](../examples/typed_interfaces.py)。若迁移本例，应同步替换通知注册方与发送方，并明确 mount 条目由 unmount/close 管理、不参与 reconcile 的目标清单；不要只替换某一处调用。具体步骤见[迁移指南](migration-typed-interfaces.md)。
+
 ## 增加自己的提供方
 
 例如，希望加入远程存储：

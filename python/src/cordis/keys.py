@@ -7,6 +7,36 @@ if TYPE_CHECKING:
     from .core import Context
 
 T = TypeVar("T")
+RequestT = TypeVar("RequestT")
+ResultT = TypeVar("ResultT")
+
+
+@dataclass(frozen=True, eq=False)
+class EventKey(Generic[T]):
+    """Invariant payload contract; dispatch uses key identity, not its label."""
+
+    name: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError("an event key needs a non-empty string name")
+
+    def __str__(self) -> str:
+        return self.name
+
+
+@dataclass(frozen=True, eq=False)
+class QueryKey(Generic[RequestT, ResultT]):
+    """Invariant request/result contract for one handler per runtime and key."""
+
+    name: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError("a query key needs a non-empty string name")
+
+    def __str__(self) -> str:
+        return self.name
 
 
 @dataclass(frozen=True)

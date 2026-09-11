@@ -19,7 +19,7 @@ dev = ["ruff>=0.14", "mypy>=1.18"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
-files = ["src", "examples/demo.py", "examples/tutorial.py", "examples/order_importer", "typing_tests/contracts.py"]
+files = ["src", "examples/demo.py", "examples/tutorial.py", "examples/typed_interfaces.py", "examples/order_importer", "typing_tests/contracts.py"]
 mypy_path = "src"
 enable_error_code = ["ignore-without-code"]
 

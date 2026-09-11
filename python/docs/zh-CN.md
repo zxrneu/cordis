@@ -251,6 +251,8 @@ await self.loader.reconcile([
 
 `Entry` 是一个配置条目，第一个参数是稳定的名字。`reconcile()` 会比较这份清单和已经运行的插件：新增条目就挂载，移除条目就卸载，已有条目的配置变化就更新。
 
+这个 CSV 示例仍采用动态清单，Entry 不会在静态检查中证明插件与配置匹配。代码内需要保留这层类型关系时，可先 `plugin.configure(config)`，再交给 `await loader.mount(id, binding)`；外部数据先用 decode 转换。mount 返回能检查 update 参数的 Fiber，状态查询返回不暴露 update 的 FiberView。通知和查询也有 EventKey/QueryKey 类型化入口，完整用法见[迁移指南](migration-typed-interfaces.md)及[可运行示例](../examples/typed_interfaces.py)。
+
 因此，金额上限变化时，数据库配置没有变化，它的实例会保留；校验插件更新，依赖它的导入服务与目录监听会重新启动。扫描间隔变化只重启目录监听，日志开关变化只影响日志插件。
 
 本例 TOML 中的 `[validation]`、`[database]` 是应用自己的配置格式。Cordis 原生 `Loader.load_file()` 使用 `[[plugins]]` 条目清单，两者通过不同的解析入口处理。需要直接使用原生格式时，看[使用教程中的 TOML 加载](tutorial.md#从-toml-加载)。
@@ -302,5 +304,6 @@ yield store.close
 | 查询方法参数、返回值和异常 | [API 参考](api.md) |
 | 理解 Context、Fiber、隔离域等概念 | [核心概念](core-concepts.md) |
 | 了解 Protocol、服务键和配置类型检查 | [类型化插件开发](typing.md) |
+| 更新旧接口，使用运行视图、事件键和配置绑定 | [类型化接口迁移](migration-typed-interfaces.md) |
 | 扩展 CSV 导入业务或寻找其他场景 | [场景与配置自动更新](scenarios.md) |
 | 阅读源码、排查更新失败或参与维护 | [实现与维护参考](implementation.md) |

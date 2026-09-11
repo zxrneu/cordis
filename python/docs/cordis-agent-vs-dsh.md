@@ -44,7 +44,7 @@ DSH 不是一个单独的 Agent Loop。官方架构把模型适配器、工具�
 | --- | --- | --- | --- |
 | Everything is a Plugin | 有 | 有 | 核心理念对齐；当前 bundle 仍硬编码在 Python 函数中 |
 | 可逆插件生命周期 | 有 | 有 | Python 已支持 LIFO cleanup、依赖驱动停启和失败回滚 |
-| 配置组合 | 部分 | bundle + profile + 多层 patch | 当前只有 `Entry` 列表和 Loader，没有产品级 profile、schema 化 patch 与配置来源优先级 |
+| 配置组合 | 部分 | bundle + profile + 多层 patch | 当前有 Entry/children/group 和类型化配置绑定，但没有产品级 profile、schema 化 patch 与配置来源优先级 |
 | Live patch / HMR | 部分 | 按 profile 决定是否 live apply | Python 有模块 HMR，但依赖静态 AST import，且不能撤销 import-time 外部副作用 |
 | Agent 生命周期 | 部分 | Agent handle、投递队列、状态、取消、拦截、作用域 | 当前只有一次 `run(text)`；没有 inbox、排队输入、取消、状态事件或维护阶段 |
 | Agent / 工具作用域 | 无 | 注册可按 Agent 可见并由 scope 拥有 | 当前一个 Context 内的工具对所有调用者全局可见 |
@@ -351,6 +351,7 @@ Agent 层之外，通用 Python Cordis 还有几项会阻碍 Harness 扩展：
 | P1 | HMR 只理解静态 import | 动态 provider、re-export 和 namespace package 可能漏重载 |
 | P1 | update hook 无 rollback 契约 | 原地配置更新失败可能留下不可见副作用 |
 | 已补齐 | `ServiceKey[T]`、Context 描述符及泛型配置 | 新插件可静态检查服务接口；旧字符串 API 与 Agent 示例的动态调用仍需逐步迁移 |
+| 已补齐 | FiberView、EventKey/QueryKey、configure/decode/mount | 状态管理、通知、查询与类型化装配有独立契约；Agent 示例尚未自动迁移，步骤见[迁移指南](migration-typed-interfaces.md) |
 | P2 | Realm/error/module graph 无资源治理 | 长运行、多 workspace 场景会积累状态和扫描成本 |
 
 这些问题的详细背景见[实现与维护参考的“当前限制与风险”](implementation.md#当前限制与风险)。

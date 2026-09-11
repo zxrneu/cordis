@@ -1,9 +1,12 @@
 from .core import (
     Component,
+    BoundComponent,
     Context,
     CordisError,
     DuplicateServiceError,
+    DuplicateQueryError,
     Fiber,
+    FiberView,
     FiberState,
     EffectHandle,
     Cleanup,
@@ -20,19 +23,24 @@ from .core import (
 )
 from .hmr import FullRestartRequired, HotReloader, ModuleGraph
 from .loader import Entry, Loader, group, import_plugin
-from .keys import ServiceKey
+from .keys import EventKey, QueryKey, ServiceKey
 
 __all__ = [
     "Component",
+    "BoundComponent",
     "Cleanup",
     "Context",
     "CordisError",
     "DuplicateServiceError",
+    "DuplicateQueryError",
     "EffectHandle",
     "EffectCallback",
     "EffectResult",
     "Entry",
+    "EventKey",
+    "QueryKey",
     "Fiber",
+    "FiberView",
     "FiberState",
     "FullRestartRequired",
     "HotReloader",

@@ -1,6 +1,6 @@
 # Cordis for Python
 
-入门文档：[开发者完全指南（入门到深入与 Q&A）](docs/developer-guide.md) · [第一次使用 Cordis](docs/zh-CN.md) · [使用教程](docs/tutorial.md) · [核心概念](docs/core-concepts.md) · [类型化插件开发](docs/typing.md) · [实战：配置自动更新的 CSV 导入](docs/scenarios.md)
+入门文档：[开发者完全指南（入门到深入与 Q&A）](docs/developer-guide.md) · [第一次使用 Cordis](docs/zh-CN.md) · [使用教程](docs/tutorial.md) · [核心概念](docs/core-concepts.md) · [类型化插件开发](docs/typing.md) · [类型化接口迁移](docs/migration-typed-interfaces.md) · [实战：配置自动更新的 CSV 导入](docs/scenarios.md)
 
 进阶参考：[Python vs TS 全方位对比与不足](docs/python-vs-typescript.md) · [核心原理代码走读与维护手册](docs/internals-walkthrough.md) · [API 参考](docs/api.md) · [实现与维护参考](docs/implementation.md) · [与最新 DSH 的差距](docs/cordis-agent-vs-dsh.md) · [Cordis Agent](examples/cordis_agent/) · [离线架构 Demo](examples/dsh_like.py) · [安全卸载 Demo](examples/graceful_unload.py)
 
@@ -12,7 +12,7 @@
 - **一致的依赖视图**：已提交的依赖视图在完整的卸载（Teardown）流程中保持可读；
 - **统一的生命周期归属**：子组件、事件、服务及嵌套 Effect 共享生命周期所有权；
 - **受管异步任务**：`ctx.spawn()` 与异步事件回调跟随所属插件或嵌套 Effect，在资源回收前排空或取消；
-- **类型化 API**：泛型 `Component` / `Fiber` 保留配置与 Context 类型，`ServiceKey[T]` 检查服务注册和读取，Context 描述符支持属性补全；
+- **类型化 API**：泛型 `Component` / `Fiber` 保留配置与 Context 类型，`FiberView` 分离状态查看与配置写入，`ServiceKey[T]` 检查服务注册和读取，`EventKey` / `QueryKey` 关联事件参数和查询结果；
 - **隔离域与拦截机制**：Context 支持隔离 Realm 与动态合并的拦截元数据；
 - **声明式加载器**：基于键控配置树与受管 Realm 进行协调管理（Reconciliation）；
 - **感知依赖的 HMR（热重载）**：事务性替换模块，在导入或激活失败时自动回滚至上一可用组件状态。
@@ -84,6 +84,8 @@ asyncio.run(main())
 
 需要静态类型保证时，使用 `ServiceKey[T]` 代替字符串服务名，并为插件配置声明 dataclass 或 TypedDict。`ctx.use()` 与 `fiber.update()` 会检查配置类型；字符串读取和配置文件继续作为动态接口。完整可运行示例见 [`examples/demo.py`](examples/demo.py)，类型契约和边界见[类型化插件开发](docs/typing.md)。
 
+Loader 也支持 `await loader.mount("worker", worker.configure(config))`，返回保留配置类型的 Fiber；外部配置先通过 `await worker.decode(raw, decoder)` 转换。状态查询返回不暴露 update 的 FiberView。类型化挂载、通知和查询的完整示例：[`examples/typed_interfaces.py`](examples/typed_interfaces.py)，运行 `uv run python -m examples.typed_interfaces`。
+
 ## 声明式加载器
 
 想看配置文件修改后自动生效的完整应用，可以运行 `uv run python -m examples.order_importer --demo`。它将服务契约、提供方、调用方分开，通过修改 TOML 更新金额规则，并在 SQLite 与内存存储间切换；[实战文档](docs/scenarios.md)包含常驻监听、三角色分工和增加提供方的步骤。
@@ -112,6 +114,8 @@ await loader.reload_changed(["my_app/plugins/shared.py"])
 ## 事件派发
 
 生命周期绑定的事件监听器支持同步派发 `emit`、并发聚合 `parallel`、短路中断 `serial`/`bail` 以及中间件风格的 `waterfall`。内置的 `internal/status` 和 `internal/error` 事件用于暴露生命周期状态转换和异常；`ctx.fibers` 与 `ctx.errors` 提供运行时的快照信息。
+
+业务通知可用 `EventKey[Payload]` 与 on/once、emit/parallel 关联参数；单处理器请求用 `QueryKey[Request, Result]` 与 handle/query，查询返回 Result 或 None。两种键按对象身份匹配，需由注册方和调用方共享。字符串事件保留原有动态派发策略。
 
 ## 异步任务与插件卸载
 

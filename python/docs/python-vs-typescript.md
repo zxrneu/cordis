@@ -2,6 +2,8 @@
 
 > 本文档系统对比 Cordis 的 TypeScript 官方实现（[`packages/core`](../../packages/core)）与 Python 原生实现（[`python/src/cordis`](../src/cordis)）。从设计哲学、类型系统、元编程、并发治理、Loader、HMR 到生态周边进行全维度透视，深入剖析 Python 版目前的局限与演进方向。
 
+Python 类型接口已同步当前仓库：FiberView、EventKey/QueryKey、BoundComponent 与 Loader.mount 均已实现。已有项目的改法见[迁移指南](migration-typed-interfaces.md)；类型改进不代表下文运行时审计问题已经修复。
+
 ---
 
 ## 目录
@@ -36,14 +38,14 @@
 | 评估维度 | TypeScript 官方实现 (`packages/core`) | Python 原生实现 (`python/src/cordis`) | Python 版现阶段评价 |
 | :--- | :--- | :--- | :---: |
 | **底层代理模型** | 原生 `Proxy` 深度拦截，强行防守 `inject` 越权 | 基于 `__getattr__` / `__getitem__` 拦截 | 🟡 **能力中等**（对象级无法代理） |
-| **类型体验 (DX)** | 模块扩充（Module Augmentation）零成本静态穿透 | `ServiceKey[T]` + 手写 `AppContext` 描述符 | 🟡 **偏繁琐**（需显式子类化） |
+| **类型体验 (DX)** | 模块扩充（Module Augmentation）零成本静态穿透 | ServiceKey、EventKey/QueryKey、泛型配置绑定与 FiberView；可选 AppContext 描述符 | 🟡 需要显式共享契约；键调用无需自定义 Context |
 | **服务抽象规范** | 标准 `Service` 基类、`[Service.init]`、Callable 机制 | 仅支持无基类函数式 `ctx.provide` | 🔴 **明显不足**（缺少标准抽象） |
 | **调用方反向溯源** | `getTraceable` + `symbols.caller` 全自动透传调用者 | 仅支持 Fiber 级 `contextvars`，无方法级 Caller | 🔴 **明显不足**（无自动调用方标记） |
 | **并发任务管理** | 纯 Promise/Disposable，缺少在途任务排空策略 | 原生 `ctx.spawn` + `TaskPolicy` (`drain`/`cancel`) | 🟢 **优于 TS**（结构化并发设计更强） |
-| **配置校验规范** | 原生集成 `@standard-schema/spec`（Zod/ArkType） | 仅支持简单无规范的 `Callable` 回调 | 🟡 **能力中等**（缺生态集成） |
-| **声明式 Loader** | `EntryTree` 树形配置、`group`、多文件拆分与回写 | 基础扁平 `reconcile`，无组管理 | 🔴 **明显不足**（非全局事务） |
+| **配置校验规范** | 原生集成 `@standard-schema/spec`（Zod/ArkType） | decode 转换原始数据，validate 校验业务配置，均支持异步 | 🟡 未内置通用 Schema 集成 |
+| **声明式 Loader** | `EntryTree` 树形配置、`group`、多文件拆分与回写 | Entry/children/group + reconcile；另有类型化 mount/unmount | 🟡 支持分组，但 reconcile 非全局事务，无内置多文件回写 |
 | **模块热重载 (HMR)**| 深度集成 Node.js ESM 加载器，全事务性置换与回滚 | 纯 Python 源码 AST 解析，替换 `sys.modules` | 🔴 **明显不足**（无法感知动态 import） |
-| **周边生态** | 官方包含 timer, logger-console, group, include 等 | 纯微内核裸核，周边插件生态为 0 | 🔴 **明显不足**（生态完全空白） |
+| **周边生态** | 官方包含 timer, logger-console, group, include 等 | 内置 group、Loader、HMR 与应用示例 | 🟡 未提供同等的独立 timer/logger/include 插件包 |
 | **边界健壮性** | 经历数万常驻节点长期生产检验（如 Koishi 生态） | 2026-09-10 审计确认 8 个底层边界 Bug 待修复 | 🔴 **明显不足**（回滚存在漏洞） |
 
 ---
@@ -66,7 +68,7 @@
   **优势**：由于是语言级原生 Proxy，即使方法被解构、赋值给临时变量，其属性存取依然被运行时 100% 监管。
 
 - **Python 版**：
-  Python 版通过在 Context 类上重写 `__getattr__` 与 `__getitem__`（[`core.py:1464`](../src/cordis/core.py#L1464)）模拟该行为。
+  Python 版通过在 Context 类上重写 `__getattr__` 与 `__getitem__`（[Context 属性和下标读取](../src/cordis/core.py#L1584)）模拟该行为。
 - **Python 版的不足**：
   Python 缺乏语言原生的透明对象级 Proxy（`__getattr__` 只能拦截不存在的属性，对已有属性无法拦截）。一旦服务实例被返回给上层，服务对象自身的方法调用链**无法被运行时自动挂载拦截钩子**，导致配置拦截（Intercepts）和动态访问器（Accessors）的灵活性大幅缩水。
 
@@ -97,15 +99,28 @@ graph TD
     end
 
     subgraph PY_Type_Experience [Python: 契约键 + 自定义子类]
-        PY_Code["DB = ServiceKey[Database]('db')<br/><br/>class AppContext(Context):<br/>    db = DB<br/><br/>必须显式标注形参类型: def plugin(ctx: AppContext)"]
+        PY_Code["DB = ServiceKey[Database]('db')<br/>ctx.service(DB)：基础 Context 也保留 Database 类型<br/><br/>可选 class AppContext(Context): db = DB<br/>提供 ctx.db 属性补全"]
     end
 ```
 
-### Python 版在此维度的不足：
-1. **开发者心智负担较重**：
-   TypeScript 借助语言级 `declare module 'cordis'`，任意第三方插件只要引入，全局的 `ctx.<service>` 就自动获得强类型提示与补全；而在 Python 中，由于不支持类接口动态合并，必须在每个项目中手动定义 `AppContext` 子类并声明描述符，一旦开发者随手写了 `def plugin(ctx: Context)`，类型提示立刻退化为 `Any`。
-2. **缺乏标准 Schema 校验框架集成**：
-   TS 版直接适配 [`@standard-schema/spec`](https://github.com/standard-schema/standard-schema)，能够无缝接入 Zod、Valibot、ArkType 等强大的校验库；Python 版目前仅提供裸 `validate: Callable[[ConfigT], ConfigT]`，未深度集成 Pydantic 等生态事实标准。
+### 3.1 模块扩充（Module Augmentation） vs 描述符子类化
+
+TypeScript 可通过模块扩充声明 Context 服务成员；Python 需要显式共享类型契约。基础 Context 的 `ctx.service(KEY)` 和 `ctx[KEY]` 已保留 ServiceKey[T] 的 T，并不要求自定义子类。需要 `ctx.db` 属性补全时再定义 AppContext 描述符；未声明的动态属性及字符串服务读取仍返回 Any。
+
+### 3.2 工业级 Schema 规范 vs 基础校验回调
+
+TS 版适配 [`@standard-schema/spec`](https://github.com/standard-schema/standard-schema)。Python 提供 `decode(raw, decoder)` 将 object 转为 ConfigT，再绑定插件；validate 接收 ConfigT 并返回 ConfigT 或 Awaitable[ConfigT]。尚未内置 Pydantic 等 Schema 适配器，应用可以通过 decoder 接入自己的校验库。
+
+### 当前已具备的类型链
+
+| 业务入口 | 保留的信息 | 动态边界 |
+| --- | --- | --- |
+| ctx.use / configure → Loader.mount | 配置与 Context 类型，返回可 update 的 Fiber | Entry/reconcile 的插件与配置仍独立存储 |
+| Context.fiber / Loader.get、reload | FiberView 保留 Context，配置只供检查 | 未知配置不提供 update；视图不是运行时沙箱 |
+| EventKey + on/emit/parallel | 一个 payload 及回调参数 | 字符串事件不关联参数类型 |
+| QueryKey + handle/query | 请求、结果和可选 None | 单处理器语义，不替代多监听器短路链 |
+
+EventKey/QueryKey 按对象身份匹配，必须共享同一个键；ServiceKey 继续按字符串名字路由。类型化 mount 目前不参与源码 HMR，动态 Entry 的字符串定位符仍是代码替换入口。
 
 ---
 
@@ -156,12 +171,12 @@ flowchart TD
     end
 ```
 
-### Python 版的优势：
-- 引入了工业级的结构化并发工具 [`ctx.spawn()`](../src/cordis/core.py#L1279)，支持 `policy="drain"`（优雅排空）与 `policy="cancel"`（即时取消），能够保证“在提供者服务关闭前，消费者的在途事务被安全排空或协作退出”。
+### 5.1 Python 的突出优势：`ctx.spawn` 与结构化受管任务
+- 引入了工业级的结构化并发工具 [`ctx.spawn()`](../src/cordis/core.py#L1363)，支持 `policy="drain"`（优雅排空）与 `policy="cancel"`（即时取消），能够保证“在提供者服务关闭前，消费者的在途事务被安全排空或协作退出”。
 
-### Python 版的不足与风险：
+### 5.2 Python 版的任务治理短板与风险
 1. **Cleanup 清理阶段缺少全局超时保护（P0 级风险）**：
-   在 [`core.py:345`](../src/cordis/core.py#L345) 中，`_dispose_actions` 清理动作栈时是无限期等待的。若某个插件的清理函数发生永久死锁（例如等待未关闭的连接池），整个进程的卸载与重载流程将被永久冻结。
+   在 [`_dispose_actions`](../src/cordis/core.py#L425) 中，`_dispose_actions` 清理动作栈时是无限期等待的。若某个插件的清理函数发生永久死锁（例如等待未关闭的连接池），整个进程的卸载与重载流程将被永久冻结。
 2. **协作取消的天然脆弱性**：
    Python 协程的取消依赖协作让出，若插件内存在同步 CPU 密集死循环或阻塞式系统调用（如未经线程化的文件读写），`cancel()` 信号无法强制打断执行。
 
@@ -169,22 +184,32 @@ flowchart TD
 
 ## 6. 声明式配置 Loader 与拓扑树 (Declarative Loader)
 
+### 6.1 TS 的 `EntryTree` 树形配置与多文件 include 动态回写
+
 - **TypeScript 版 (`@cordisjs/plugin-loader`)**：
   - 拥有 `EntryTree` 分层配置模型；
   - 原生支持分组插件 `@cordisjs/plugin-group`，支持对子系统进行整体验证与批量启停；
   - 支持 `@cordisjs/plugin-include`，能够将单体大配置文件拆分为模块化的独立 YAML 子文件，并支持运行期将配置变更动态回写保存至磁盘。
+### 6.2 Python 版 Loader 的缺陷：非全局事务与并发竞争
+
 - **Python 版 (`loader.py`) 的不足**：
   1. **缺少全局事务性（P1 缺陷）**：`reconcile()` 过程中若第 2 个插件导入报错，已删除的第 1 个插件无法回滚恢复，导致系统损坏；
   2. **配置记录与 Fiber 状态不同步**：配置校验失败时，Fiber 会自动回滚到旧版本，但 Loader 内存中的 Entry 字典依然记录为新版本，导致下一次提交同一配置被判定为“无变化”而被跳过；
   3. **并发更新缺少互斥锁**：两个并发协程同时调用 `reconcile` 会破坏内部 `_loaded` 映射表。
 
+Python 已支持 children 与 group 形成嵌套 Loader，不能概括为“仅扁平列表”。类型化 mount 另存生命周期视图，不进入 entries，也不会被 reconcile([]) 删除；使用 unmount/close 清理。配置绑定解决的是类型关系丢失，不会自动使原有 reconcile 具备全局事务。
+
 ---
 
 ## 7. 源码级模块热重载 (HMR Engine)
 
+### 7.1 TS 的 Node.js 原生 ESM Loader 劫持
+
 - **TypeScript 版 (`packages/hmr`)**：
   - 深度绑定 Node.js 18+ 原生 ESM Loader 内部机制（`--expose-internals`）；
   - 事务级内存模块置换，在替换失败时不仅能够还原模块缓存，还能完整修复父包属性引用。
+### 7.2 Python 版基于 AST 分析的局限与回滚残留
+
 - **Python 版 (`hmr.py`) 的不足**：
   1. **仅支持 AST 静态 import 识别**：无法识别代码中通过 `importlib.import_module()` 动态导入的依赖关系；
   2. **回滚存在“幽灵引用”（Bug B04）**：HMR 替换失败回滚时，只恢复了 `sys.modules`，父模块对象（如 `package.module`）依然指向失败的新模块；
@@ -209,7 +234,9 @@ TypeScript 官方生态矩阵:
 └── @cordisjs/plugin-utils           (对象追踪与工具集)
 
 Python 当前状态:
-└── cordis-python (仅包含 core, loader, hmr, keys 四个源码文件，生态周边为 0)
+├── cordis-python (core, loader, hmr, keys；统一从 cordis 导出)
+├── 内置 group、配置文件监听、受管任务、类型化通知与查询
+└── examples/ (CSV 导入、Agent、安全卸载、类型化接口等示例)
 ```
 
 **对开发者的直接影响**：

@@ -10,14 +10,24 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| [core.py](../src/cordis/core.py) | Component、Effect、Fiber、Context、服务、Realm、事件 |
-| [keys.py](../src/cordis/keys.py) | `ServiceKey[T]` 与 Context 服务描述符 |
-| [loader.py](../src/cordis/loader.py) | Entry、配置树增量协调、嵌套组、配置文件监听 |
+| [core.py](../src/cordis/core.py) | Component/BoundComponent、Fiber/FiberView、Effect、Context、服务、Realm、通知与查询 |
+| [keys.py](../src/cordis/keys.py) | ServiceKey 与服务描述符；EventKey、QueryKey 的类型契约与身份 |
+| [loader.py](../src/cordis/loader.py) | 类型化挂载、动态 Entry 清单协调、嵌套组、配置文件监听 |
 | [hmr.py](../src/cordis/hmr.py) | Python 模块依赖图、过期 Entry 检测、模块替换与恢复 |
 | [__init__.py](../src/cordis/__init__.py) | 公共 API |
 | [tests/](../tests/) | 生命周期、失败回滚、隔离、Loader 与 HMR 测试 |
 
 实现只要求 Python 3.11+，核心没有第三方依赖。YAML 配置需要可选的 PyYAML。
+
+### 类型信息经过哪些边界
+
+`Component.configure()` 返回不可变 BoundComponent；Loader.mount 在配置与插件仍关联时调用 ctx.use，返回类型化 Fiber，然后只将 FiberView 放进 `_mounted`。旧 Entry 在 `_loaded` 中保留动态插件与配置，用于文件清单和 HMR；两者共享 id 范围，但 reconcile 只协调 `_loaded`。
+
+Context 的 fiber/fibers/errors 及 Loader.get/reload 只暴露 FiberView 的只读属性和配置无关的生命周期操作。视图保留 Context 类型，不提供 update；不要把异构 Fiber 声明为 Fiber[object, Context]，否则会虚假允许任意配置写入。Fiber 和 Loader 的 ctx 属性只读，防止通过更宽的视图替换实际 Context。
+
+Component 和 BoundComponent 的 Context 参数逆变：基础 Context 插件可以挂到子类 Context。配置类型不变；EventKey、QueryKey 的类型参数也不变，防止检查器通过拓宽类型接受错误参数。`decode(raw, decoder)` 在绑定前转换原始数据，validate 继续处理 ConfigT，二者不能用 cast 代替。
+
+`_Runtime.listeners` 使用字符串或 EventKey，`queries` 使用 QueryKey 对应单个 `_Listener`。事件键按对象身份匹配，同名的不同键不共享注册。handle/query 在入口关联类型，仅在查询结果离开异构注册表时恢复 ResultT；两者复用 `_invoke`，回调在注册方的 Sink 中执行。操作指南见[迁移说明](migration-typed-interfaces.md)。
 
 ### Effect 执行器
 
@@ -83,7 +93,7 @@ def submit(self, request: ImportRequest) -> asyncio.Task[ImportReport]:
 
 三种方式都会等待协作取消及 `finally` 完成后才释放依赖。不同任务同时开始排空或取消，避免一个 drain 阻塞另一个任务的取消。任务失败带着所属 Fiber 写入 `ctx.errors` 并触发 `internal/error`；普通取消不视为运行时错误。`fiber.tasks` 返回未完成任务快照，已完成任务自动移出注册表。`ctx.flush()` 仍只等待生命周期稳定，不等待后台任务全部结束。
 
-在 `ctx.effect()` 内启动的任务和注册的异步监听器也归属于该 Effect，手动调用其清理句柄时会先排空这些任务。开始卸载后，旧作用域不能创建新任务、服务、监听器或子插件。
+在 `ctx.effect()` 内启动的任务、异步通知和查询处理器也归属于该 Effect，清理整个 Effect 时会先排空这些任务。单独清理 on/handle 返回的句柄只移除注册，已触发任务仍归注册作用域管理。开始卸载后，旧作用域不能创建新任务、服务、监听器或子插件。
 
 运行时无法反向发现裸 `asyncio.create_task()` 的服务引用，这些任务仍需插件自己管理。受管任务不能等待自身、所属 Effect、父插件或依赖服务的卸载／重启；这种调用会导致自等待，运行时会抛出 `InactiveContextError`。应把重载请求交给作用域之外的宿主执行。
 
@@ -107,6 +117,8 @@ reloaded = await loader.reload_changed(
 
 变更跨越 `externals` 边界时抛出 `FullRestartRequired`，调用者应执行进程级重启。
 
+源码 HMR 仅追踪动态 Entry 的字符串定位符；类型化 mount 通过 reload(id) 重启原组件定义。EventKey/QueryKey 依赖共享对象身份，契约模块被重新导入会生成新键；宿主应让契约模块保持稳定，或同步替换引用它的参与方。
+
 HMR 的恢复范围是模块缓存和受管插件，恢复本身也可能失败。模块 import 阶段写文件、发网络请求或修改第三方全局状态时，恢复 `sys.modules` 无法撤销这些外部变化。插件模块应尽量保持模块顶层不产生外部副作用，把资源创建放进 Component 并登记 cleanup。
 
 ## 当前限制与风险
@@ -126,7 +138,8 @@ HMR 的恢复范围是模块缓存和受管插件，恢复本身也可能失败�
 | P1 | HMR 依赖图只识别 AST 中的静态 import | `importlib` 动态导入、运行时路径修改、部分 namespace package 需要显式 reload 或完整重启 |
 | P1 | HMR 只恢复模块缓存和 Component，不撤销 import-time 外部副作用 | 保持模块顶层纯净，把副作用放进插件生命周期 |
 | P1 | 没有依赖环诊断 | 循环依赖会保持 `PENDING`；通过状态事件和 `fibers` 排查 |
-| 边界 | 字符串服务名、事件和配置文件仍是动态接口 | 类型化代码使用 `ServiceKey[T]`、Context 描述符和泛型插件；详见[类型指南](typing.md) |
+| 边界 | 字符串服务名、字符串事件和 Entry 文件清单仍是动态接口 | 类型化代码使用服务键、事件键及 configure/decode/mount；这些入口不会自动验证旧动态代码 |
+| 边界 | mount 与 reconcile 管理不同集合 | mount 不进入 entries，不被 reconcile([]) 删除，也不参与源码 HMR；统一清理用 close |
 | P2 | 每个 Realm 只允许一个直接提供者 | 需要多实例时增加 broker/multiplexer 服务 |
 | P2 | `watch_file()` / `HotReloader.watch()` 只有轮询，没有 debounce、退避和错误恢复策略 | 由进程入口监督 watcher |
 | P2 | 任务创建没有内置容量限制，Realm 缓存和错误历史没有回收策略 | 需要宿主限制并发，并为长期运行设置容量和观测策略 |
@@ -171,6 +184,9 @@ HMR 的恢复范围是模块缓存和受管插件，恢复本身也可能失败�
 ### P2：类型、可观测性和资源治理
 
 - [x] 提供 `ServiceKey[T]`、Protocol/Context 描述符和泛型插件配置；
+- [x] 用 FiberView 分离检查与配置写入，保留动态查询的 Context 类型；
+- [x] 增加 EventKey/QueryKey 与类型化通知、单处理器查询；
+- [x] 用 BoundComponent 和 configure/decode/mount 保留配置绑定关系；
 - [x] 启用 mypy strict，验证正确用法的推断结果和错误用法的拒绝行为；
 - [ ] 增加状态转换耗时、加载次数、回滚次数和活跃任务指标；
 - [ ] 为错误历史、已移除 Entry Realm 和无监听器事件桶提供回收；
@@ -195,6 +211,7 @@ uv run mypy
 uv run python -m unittest discover -v
 uv run ruff check src tests examples typing_tests
 uv run python -m examples.graceful_unload
+uv run python -m examples.typed_interfaces
 uv run python -m examples.order_importer --demo
 ```
 

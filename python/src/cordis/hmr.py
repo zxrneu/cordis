@@ -8,9 +8,9 @@ import sys
 from collections.abc import Iterable
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Generic
 
-from .core import FiberState
+from .core import ContextT, FiberState
 
 if TYPE_CHECKING:
     from .loader import Loader
@@ -105,10 +105,10 @@ class ModuleGraph:
             accepted.update(dependents)
 
 
-class HotReloader:
+class HotReloader(Generic[ContextT]):
     """Dependency-aware, transactional module reload for Loader entries."""
 
-    def __init__(self, loader: "Loader", *, externals: Iterable[str] = ()) -> None:
+    def __init__(self, loader: "Loader[ContextT]", *, externals: Iterable[str] = ()) -> None:
         self.loader = loader
         self.externals = set(externals)
 

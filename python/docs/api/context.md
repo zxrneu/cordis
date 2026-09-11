@@ -24,15 +24,17 @@ async with Context() as root:
 | --- | --- | --- |
 | `use(value, config=None)` / `plugin(...)` | `Fiber[ConfigT, ContextT]` | [挂载插件](plugins.md#contextuse--contextplugin) |
 | `inject(dependencies, callback, config=None)` | `Fiber[ConfigT, ContextT]` | [挂载有依赖的临时插件](plugins.md#contextinject) |
-| `fiber` | `Fiber[Any, Any]` | 当前所属 Fiber |
-| `fibers` | `tuple[Fiber[Any, Any], ...]` | 整个运行时的普通 Fiber 快照，不含根 Fiber |
-| `errors` | `tuple[tuple[Exception, Fiber[Any, Any] \| None], ...]` | 整个运行时的错误历史快照 |
+| `fiber` | `FiberView[Self]` | 当前所属 Fiber 的视图，保留 Context 子类类型 |
+| `fibers` | `tuple[FiberView[Context], ...]` | 整个运行时的普通 Fiber 视图快照，不含根 Fiber |
+| `errors` | `tuple[tuple[Exception, FiberView[Context] \| None], ...]` | 整个运行时的错误历史快照 |
 | `await flush()` | `None` | 等待已安排的生命周期转换稳定；不等待后台任务或未来依赖 |
 | `await close()` | `None` | 关闭整个运行时，包括所有插件、受管任务和根资源 |
 
 **派生 Context 的 `close()` 也会关闭整个运行时。** 只想卸载某一部分时，使用 `Fiber.dispose()` 或 `EffectHandle`。
 
 多次调用 `close()` 会等待同一个关闭任务，不会重复清理；关闭失败时会再次看到该任务的异常。取消某个关闭等待者不会取消已经开始的关闭流程。资源清理可以抛出 `ExceptionGroup`。
+
+Context 没有携带当前组件的配置类型，因此上述视图的 `config` 为 object，且不暴露 `update()`，属性也只读。视图支持 `dispose()`、`restart()`、`wait()` 和直接等待；`await view` / `await view.wait()` 仍返回视图。更新配置时保留 `ctx.use(component, config)` 或 `await loader.mount(...)` 返回的 `Fiber[ConfigT, ContextT]`。经视图访问 `fiber.ctx` 仍会检查服务键与方法参数。详见 [FiberView](plugins.md#fiberview)。
 
 ## ServiceKey
 
@@ -244,7 +246,7 @@ asyncio.run(main())
 
 ### EffectHandle
 
-`provide()`、`on()`、`once()` 和 `await effect()` 返回的可调用清理对象：
+`provide()`、`on()`、`once()`、`handle()` 和 `await effect()` 返回的可调用清理对象：
 
 ```python
 await handle()  # 正确：调用后等待清理
@@ -252,7 +254,7 @@ await handle()  # 正确：调用后等待清理
 
 不是 `await handle`，也不是同步执行 `handle()` 后丢弃返回值。清理具有幂等性；已经开始的清理由重复调用共同等待，记录的清理错误仍可能再次抛出。
 
-清理整个嵌套 Effect 会处理其中的任务、子插件和资源。`on()` 返回的句柄只移除监听器，不会取消此前已经触发的回调任务；这些任务仍由注册监听器时的作用域管理。
+清理整个嵌套 Effect 会处理其中的任务、子插件和资源。`on()` / `handle()` 返回的句柄只移除注册，不会取消此前已经触发的回调任务；这些任务仍由注册时的作用域管理。
 
 ### spawn / TaskPolicy
 
@@ -293,7 +295,46 @@ result = await task  # int
 
 ## 事件
 
-事件名是字符串，参数与结果属于动态接口，没有 `ServiceKey[T]` 那样的静态关联。
+通知可以使用 `EventKey[T]` 关联参数类型；查询使用 `QueryKey[RequestT, ResultT]` 关联请求与结果。字符串事件继续支持动态的多参数和派发策略。
+
+### EventKey：类型化通知
+
+```python
+MESSAGE = EventKey[Message]("message")
+ctx.on(MESSAGE, handle_message)       # Callable[[Message], None | Awaitable[None]]
+ctx.emit(MESSAGE, Message(text="hi"))
+await ctx.parallel(MESSAGE, Message(text="hi"))
+```
+
+`EventKey[T]` 可用于 `on()`、`once()`、`emit()`、`parallel()`。通知接收一个位置参数 `T`，回调没有业务返回值；多个字段可放入 dataclass。注册选项和 scope 的行为与字符串通知相同。带类型的键不用于 `serial()`、`bail()` 或 `waterfall()`。
+
+`EventKey` 与 `QueryKey` 均不可变，名称须为非空字符串，否则抛出 `ValueError`。**键按对象身份匹配，名称仅用于诊断**：两个 `EventKey[Message]("message")` 是不同通道，也不与字符串 `"message"` 互通。请从共享契约模块导入同一个键。这与按字符串名字匹配的 `ServiceKey` 不同，避免同名但不兼容的事件契约混用。类型参数用于静态检查，不自动执行运行时数据校验。
+
+### QueryKey：handle / query
+
+```python
+def handle(
+    key: QueryKey[RequestT, ResultT],
+    callback: Callable[[RequestT], ResultT | None | Awaitable[ResultT | None]],
+    *,
+    task_policy: TaskPolicy = "drain",
+    timeout: float | None = None,
+) -> EffectHandle: ...
+
+async def query(key: QueryKey[RequestT, ResultT], request: RequestT) -> ResultT | None: ...
+```
+
+同一运行时的每个查询键只允许一个处理器，重复注册抛出 `DuplicateQueryError`。处理器与通知一样，在所属 Fiber 处于 `LOADING` / `ACTIVE` 且注册作用域仍开放时可以执行。没有有效处理器或所属作用域已开始退出时，查询返回 `None`；处理器也可以返回 `None` 表示未找到结果。`False` 是有效结果，不会被跳过。
+
+```python
+FIND_USER = QueryKey[int, User]("find_user")
+ctx.handle(FIND_USER, find_user)      # 同步或异步的 (int) -> User | None
+user = await ctx.query(FIND_USER, 1)  # User | None
+```
+
+处理器在注册方 Fiber / Effect 中执行，异步任务使用注册时的退出策略，卸载会先处理在途查询再释放资源。回调异常传播给查询方；异步受管任务的异常同时记录注册方 Fiber。查询没有 scope 或 Realm 路由，也不会建立服务依赖；需要服务依赖顺序时仍应声明 `inject`。
+
+完整示例见 [`examples/typed_interfaces.py`](../../examples/typed_interfaces.py)。
 
 ### on / once
 
@@ -331,11 +372,13 @@ def on(
 | --- | --- | --- |
 | `emit(name, *args, scope=None)` | `None` | 同步调用普通监听器，安排异步回调但不等待。回调错误记入运行时，继续派发 |
 | `await parallel(name, *args, scope=None)` | `None` | 并发等待所有监听器；不返回结果列表。普通异常汇总为 `ExceptionGroup` |
-| `await serial(name, *args, scope=None)` | `Any` | 按注册顺序等待；第一个既不是 `None`、也不是 `False` 的结果使派发停止；异常直接传播 |
-| `bail(name, *args, scope=None)` | `Any` | 同步版短路；监听器返回 awaitable 时抛出 `TypeError` |
-| `waterfall(name, *args, final=..., scope=None)` | `Any` | 按中间件调用 next 链，返回链的结果；可能是 awaitable，需要调用方等待 |
+| `await serial(name, *args, scope=None)` | `object` | 按注册顺序等待；第一个既不是 `None`、也不是 `False` 的结果使派发停止；异常直接传播 |
+| `bail(name, *args, scope=None)` | `object` | 同步版短路；监听器返回 awaitable 时抛出 `TypeError` |
+| `waterfall(name, *args, final=..., scope=None)` | `object` | 按中间件调用 next 链，返回链的结果；可能是 awaitable，需要调用方等待 |
 
 `serial()` / `bail()` 没有命中时返回 `None`。短路判断按对象身份判断 `None` / `False`，所以 `0`、`""`、空容器也会被当作有效结果返回。
+
+字符串事件不携带结果类型，访问结果的成员前需要先收窄，例如 `if isinstance(result, int): result.bit_length()`。返回 object 不改变运行时值，也不自动验证监听器的结果。
 
 `parallel()`、`serial()`、`bail()`、`waterfall()` 的同步回调异常直接通过各自调用路径处理，不保证额外写入 `ctx.errors`；已经创建的异步受管任务失败会记录错误。
 
@@ -355,9 +398,9 @@ def on(
 def waterfall(
     name: str,
     *args: object,
-    final: Callable[..., Any],
+    final: Callable[..., object],
     scope: EventScope = None,
-) -> Any: ...
+) -> object: ...
 ```
 
 每个监听器收到 `(*args, next)`。`next()` 沿用当前参数，`next(*new_args)` 改变传给后续监听器的参数；不调用 next 就终止链。最后调用 `final(*args)`，final 不接收 next。

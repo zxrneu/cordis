@@ -7,12 +7,12 @@
 ## HotReloader
 
 ```text
-HotReloader(loader: Loader, *, externals: Iterable[str] = ())
+HotReloader(loader: Loader[ContextT], *, externals: Iterable[str] = ())
 ```
 
 | 参数 / 属性 | 含义 |
 | --- | --- |
-| `loader` | 被管理的 Loader；自动查找它直接管理的条目 |
+| `loader` | 被管理的 Loader；自动查找其声明式 Entry 中的字符串定位符，不处理类型化 mount |
 | `externals` | 不能跨越的模块名集合，构造时复制为 set；默认空集合 |
 
 依赖感知重载通过**字符串插件定位符**匹配条目。已直接传入的函数、Component 或对象不会自动跟随源码文件变更；要支持该路径，Entry 的 plugin 使用 `package.module:attribute`。

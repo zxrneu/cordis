@@ -9,13 +9,18 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, TypeAlias, cast
+from typing import Any, Generic, TypeAlias, cast
 
 from .core import (
     Component,
+    BoundComponent,
+    ConfigT,
     Context,
+    ContextCov,
+    ContextT,
     Fiber,
     FiberState,
+    FiberView,
     Plugin,
     PluginCallback,
     _as_component,
@@ -28,7 +33,7 @@ _PluginLike: TypeAlias = (
 )
 
 
-def _freeze_mapping(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
+def _freeze_mapping(value: Mapping[str, object] | None) -> Mapping[str, object]:
     return MappingProxyType(dict(value or {}))
 
 
@@ -39,7 +44,7 @@ class Entry:
     config: object = None
     enabled: bool = True
     isolate: Isolation | tuple[str, ...] = field(default_factory=dict)
-    intercept: Mapping[str, Any] = field(default_factory=dict)
+    intercept: Mapping[str, object] = field(default_factory=dict)
     children: tuple["Entry | Mapping[str, Any]", ...] = ()
 
     def __post_init__(self) -> None:
@@ -60,10 +65,12 @@ class Entry:
 
 
 @dataclass(slots=True)
-class _Loaded:
+class _Loaded(Generic[ContextT]):
     entry: Entry
-    ctx: Context
-    fiber: Fiber[Any, Any] | None = None
+    ctx: ContextT
+    # Legacy Entry is the explicit dynamic plugin/config boundary. Public
+    # inspection only exposes FiberView; typed mounts never enter this record.
+    fiber: Fiber[Any, ContextT] | None = None
     component: Component[Any, Any] | None = None
 
 
@@ -71,7 +78,7 @@ def import_plugin(locator: str) -> _PluginLike:
     module_name, separator, attribute = locator.partition(":")
     if not separator or not module_name or not attribute:
         raise ValueError("plugin locator must use 'package.module:attribute' syntax")
-    value: Any = importlib.import_module(module_name)
+    value: object = importlib.import_module(module_name)
     for part in attribute.split("."):
         value = getattr(value, part)
     # Importlib is the dynamic boundary; mounting validates the resolved plugin.
@@ -82,21 +89,52 @@ def _coerce_entry(raw: Entry | Mapping[str, Any]) -> Entry:
     return raw if isinstance(raw, Entry) else Entry(**raw)
 
 
-class Loader:
+class Loader(Generic[ContextCov]):
     """Incrementally reconcile a stable-id component configuration."""
 
-    def __init__(self, ctx: Context) -> None:
-        self.ctx = ctx
-        self._loaded: dict[str, _Loaded] = {}
+    def __init__(self, ctx: ContextCov) -> None:
+        self._ctx = ctx
+        self._loaded: dict[str, _Loaded[ContextCov]] = {}
+        self._mounted: dict[str, FiberView[ContextCov]] = {}
         self._local_realms: dict[tuple[str, str], object] = {}
         self._global_realms: dict[tuple[str, str], object] = {}
+
+    @property
+    def ctx(self) -> ContextCov:
+        return self._ctx
 
     @property
     def entries(self) -> tuple[Entry, ...]:
         return tuple(item.entry for item in self._loaded.values())
 
-    def get(self, entry_id: str) -> Fiber[Any, Any] | None:
+    def get(self, entry_id: str) -> FiberView[ContextCov] | None:
+        if entry_id in self._mounted:
+            return self._mounted[entry_id]
         return self._loaded[entry_id].fiber
+
+    async def mount(
+        self: Loader[ContextT], entry_id: str, binding: BoundComponent[ConfigT, ContextT]
+    ) -> Fiber[ConfigT, ContextT]:
+        """Mount a bound plugin; return its typed handle, store only its lifecycle."""
+        if entry_id in self._loaded or entry_id in self._mounted:
+            raise ValueError(f"entry {entry_id!r} is already mounted")
+        fiber = binding._mount(self.ctx)
+        self._mounted[entry_id] = fiber
+        try:
+            await fiber.wait()
+        except BaseException:
+            if self._mounted.get(entry_id) is fiber:
+                del self._mounted[entry_id]
+            await fiber.dispose()
+            raise
+        return fiber
+
+    async def unmount(self, entry_id: str) -> None:
+        """Remove either a typed mount or a declarative Entry by its id."""
+        if entry_id in self._mounted:
+            await self._mounted.pop(entry_id).dispose()
+        else:
+            await self._dispose(self._loaded.pop(entry_id))
 
     def _realms(self, entry: Entry) -> dict[str, object]:
         result: dict[str, object] = {}
@@ -112,7 +150,7 @@ class Loader:
                 )
         return result
 
-    def _entry_context(self, entry: Entry) -> Context:
+    def _entry_context(self, entry: Entry) -> ContextCov:
         return self.ctx._derive(realms=self._realms(entry), intercepts=entry.intercept)
 
     def _component(self, entry: Entry) -> Component[Any, Any]:
@@ -130,7 +168,7 @@ class Loader:
     def _config(self, entry: Entry) -> object:
         return list(entry.children) if entry.children else entry.config
 
-    async def _dispose(self, loaded: _Loaded) -> None:
+    async def _dispose(self, loaded: _Loaded[ContextCov]) -> None:
         if loaded.fiber is None:
             return
         try:
@@ -139,15 +177,15 @@ class Loader:
             loaded.fiber = None
 
     async def _start(
-        self, loaded: _Loaded, component: Component[Any, Any] | None = None
-    ) -> Fiber[Any, Any]:
+        self, loaded: _Loaded[ContextCov], component: Component[Any, Any] | None = None
+    ) -> Fiber[Any, ContextCov]:
         loaded.component = (
             component if component is not None else self._component(loaded.entry)
         )
         loaded.fiber = loaded.ctx.use(loaded.component, self._config(loaded.entry))
         return loaded.fiber
 
-    def _patch_context(self, loaded: _Loaded, entry: Entry) -> None:
+    def _patch_context(self, loaded: _Loaded[ContextCov], entry: Entry) -> None:
         realms = self._realms(entry)
         if loaded.ctx._realms_local != realms:
             self.ctx._runtime.reassign_context_realms(loaded.ctx, realms)
@@ -163,6 +201,8 @@ class Loader:
             )
             raise ValueError(f"duplicate entry ids: {', '.join(duplicates)}")
         desired = {entry.id: entry for entry in values}
+        if conflicts := self._mounted.keys() & desired.keys():
+            raise ValueError("entry ids already mounted: " + ", ".join(sorted(conflicts)))
 
         for entry_id in set(self._loaded) - set(desired):
             await self._dispose(self._loaded.pop(entry_id))
@@ -214,7 +254,11 @@ class Loader:
         if self.ctx.fiber.state is FiberState.ACTIVE:
             await self.ctx.flush()
 
-    async def reload(self, entry_id: str) -> Fiber[Any, Any]:
+    async def reload(self, entry_id: str) -> FiberView[ContextCov]:
+        if entry_id in self._mounted:
+            mounted = self._mounted[entry_id]
+            await mounted.restart()
+            return mounted
         loaded = self._loaded[entry_id]
         if not isinstance(loaded.entry.plugin, str):
             if loaded.fiber is None:
@@ -284,15 +328,17 @@ class Loader:
     async def close(self) -> None:
         results = await asyncio.gather(
             *(self._dispose(loaded) for loaded in list(self._loaded.values())),
+            *(fiber.dispose() for fiber in list(self._mounted.values())),
             return_exceptions=True,
         )
         self._loaded.clear()
+        self._mounted.clear()
         errors = [result for result in results if isinstance(result, Exception)]
         if errors:
             raise ExceptionGroup("loader cleanup failed", errors)
 
 
-_group_loaders: weakref.WeakKeyDictionary[Context, Loader] = weakref.WeakKeyDictionary()
+_group_loaders: weakref.WeakKeyDictionary[Context, Loader[Context]] = weakref.WeakKeyDictionary()
 
 
 async def _group_apply(

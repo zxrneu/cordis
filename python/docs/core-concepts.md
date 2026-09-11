@@ -65,6 +65,8 @@ Order(order_id='ORD-002', customer='Bob', amount_cents=8000)
 
 `await running.update(...)` 在这里会按新配置重新运行校验插件。`await running.restart()` 则在配置没变时也重新运行；`await running.dispose()` 永久结束这次挂载。退出最外层的 `async with` 时，剩余插件会统一清理。
 
+从 `running.ctx.fiber`、运行时列表或 Loader 字符串查询得到的是 **FiberView**。它能查看状态、等待、重启和卸载；配置类型未知，因此不提供 update。要更新配置，保留挂载时返回的 running。FiberView 是同一个 Fiber 的静态视图，不创建另一个运行实例。
+
 ## 2. 插件通过服务协作
 
 回到完整的 CSV 程序，导入一份文件需要两项能力：检查每一行是否合法，以及保存合法订单。
@@ -428,8 +430,11 @@ Effect 是插件运行时创建的作用及其生命周期管理。可逆性来�
 | `serial` | 顺序执行，返回第一个既不是 `None` 也不是 `False` 的结果 |
 | `bail` | 同步短路派发，不接受异步结果 |
 | `waterfall` | 通过 `next_` 延续调用的中间件链 |
+| `query` | 调用 QueryKey 对应的单个处理器，返回类型化结果或 None；False 是有效结果 |
 
 `on()` 返回可释放的监听器句柄；`once()` 最多执行一次回调。异步监听器通过 `task_policy` 和 `timeout` 设置任务退出策略。当前 `once()` 使用异步包装，不能与仅支持同步监听器的 `bail()` 搭配；详见[事件 API](api/context.md#事件)。
+
+EventKey 将通知 payload 与 on/once 回调参数关联，只用于 emit/parallel。QueryKey 将请求与结果关联，使用 handle 注册，每个键在同一运行时只允许一个处理器；异步查询任务也归属注册方的 Fiber / Effect。查询不声明服务依赖，不能取代 inject 提供的依赖生命周期关系。
 
 更新、卸载和关闭由宿主协调。受管任务不能等待自身、所属父作用域或依赖提供者的卸载完成，否则会形成“卸载等任务、任务等卸载”的死锁；运行时会对这些情况报错。
 
@@ -443,11 +448,17 @@ Effect 是插件运行时创建的作用及其生命周期管理。可逆性来�
 | `ServiceKey[T]` | 一个服务名关联的静态接口 `T` |
 | `Component[Config, Ctx]` | 插件接受什么配置、需要什么 Context 类型 |
 | `Fiber[Config, Ctx]` | 运行实例继续保留组件的配置与 Context 类型 |
+| `FiberView[Ctx]` | 配置未知时只读属性、执行不依赖配置类型的生命周期操作 |
+| `BoundComponent[Config, Ctx]` | 插件与配置已经绑定，交给 Loader.mount 后仍保留类型 |
+| `EventKey[T]` | 一条通知携带的参数类型 |
+| `QueryKey[Request, Result]` | 单处理器查询的请求与结果类型 |
 | `AppContext` 上的服务描述符 | 把 `ctx.service(KEY)` 包装成有类型的只读属性 |
 
 `ServiceKey[T]` 不会在运行时检查对象是否符合 `T`。类型检查器负责接口匹配，运行时负责依赖声明、可用性、隔离域和生命周期；两者互补。
 
 服务键按字符串名称进入现有服务命名空间。同名的两个 key 不会创建两个服务身份，也不会因为类型参数不同而自动隔离。共享键应由一个契约模块统一定义，例如 CSV 示例中的 `definitions.py`。
+
+EventKey 和 QueryKey 使用对象身份，同名的新键是另一个通道，且不与字符串事件互通。注册方和调用方必须导入同一个键对象；键与类型参数本身不执行运行时数据校验。
 
 字符串服务读取、字符串事件、动态导入、配置文件和异构 `Entry` 都保留动态边界。外部配置应先检查并转换成业务类型；dataclass 注解本身不会验证任意 JSON/TOML 数据。完整类型契约见[类型化插件开发](typing.md)。
 
@@ -475,15 +486,18 @@ tenant = root.isolate(STORE, IMPORTER)
 
 Loader 用稳定的 `Entry.id` 比较“已有挂载”和“目标清单”，决定新增、更新、禁用或移除。`children` 可以表达有共同父生命周期的插件组。
 
+代码内装配还可以 `component.configure(config)` 先绑定，再 `await loader.mount(id, binding)`。外部数据用 `await component.decode(raw, decoder)` 转成业务配置后绑定。mount 返回类型化 Fiber，Loader 内部只保存生命周期视图；mount 条目由 unmount/close 管理，不进入 entries 或 reconcile 的目标清单，两种入口共享 id 范围。
+
 Loader 中的 `isolate={"database": "tenant-a"}` 会让同一个 Loader 下使用同名标签的对应服务共享 Realm。`True` 表示该条目自己的私有 Realm；它与另一条目的 `True` 不相通。
 
 | 层次 | 管理对象 | 关键边界 |
 | --- | --- | --- |
 | Fiber 更新 / 重启 | 一个组件实例及受影响的生命周期 | 重用当前已导入的组件定义 |
+| Loader mount / unmount | 先绑定的类型化插件配置 | 保留配置类型；缺少依赖时仍可能停在 PENDING |
 | Loader reconcile | 一组稳定 id 的配置条目 | 逐项变更，不是整个清单的原子事务 |
 | HMR | 受静态导入关系影响的模块与插件 | 替换模块缓存并重建组件，失败时尝试恢复旧状态 |
 
-`loader.reload(id)` 对字符串定位符执行代码重载，对直接传入的 Component 或函数执行实例重启。`loader.reload_changed(paths)` 用模块依赖图计算影响范围。
+`loader.reload(id)` 对字符串定位符执行代码重载，对直接传入的 Component、函数或类型化 mount 执行实例重启，返回 FiberView。`loader.reload_changed(paths)` 用模块依赖图计算动态 Entry 的影响范围，类型化 mount 不参与源码 HMR。
 
 HMR 对模块缓存和受管组件进行恢复，不会撤销模块顶层已经产生的任意外部副作用；静态导入分析也无法完整捕获动态导入和外部长期持有的对象。`reload_changed()` 的影响范围触及配置的 `externals` 模块时，会抛出 `FullRestartRequired`，由宿主选择重启进程；低层显式重载的区别见 [HMR API](api/hmr.md)。
 

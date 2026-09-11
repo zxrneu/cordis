@@ -7,10 +7,12 @@ import math
 from collections import defaultdict
 from collections.abc import (
     AsyncIterable,
+    AsyncIterator,
     Awaitable,
     Callable,
     Generator,
     Iterable,
+    Iterator,
     Mapping,
     MutableSequence,
 )
@@ -30,12 +32,13 @@ from typing import (
     overload,
 )
 
-from .keys import ServiceKey
+from .keys import EventKey, QueryKey, RequestT, ResultT, ServiceKey
 
 
 Cleanup: TypeAlias = Callable[[], object]
 ConfigT = TypeVar("ConfigT")
 ContextT = TypeVar("ContextT", bound="Context")
+ContextCov = TypeVar("ContextCov", bound="Context", covariant=True)
 ContextContra = TypeVar("ContextContra", bound="Context", contravariant=True)
 ConfigContra = TypeVar("ConfigContra", contravariant=True)
 EffectValue: TypeAlias = (
@@ -73,6 +76,10 @@ ServiceName: TypeAlias = str | ServiceKey[Any]
 Injection: TypeAlias = Iterable[ServiceName] | Mapping[ServiceName, object]
 TaskPolicy: TypeAlias = Literal["drain", "cancel"]
 EventScope: TypeAlias = "Context | Callable[[Context], bool] | None"
+# Only the internal heterogeneous registries erase event contracts. String
+# events and typed key objects have separate identities at runtime.
+_EventName: TypeAlias = str | EventKey[Any]
+_DispatchName: TypeAlias = _EventName | QueryKey[Any, Any]
 T = TypeVar("T")
 D = TypeVar("D")
 _EMPTY = object()
@@ -98,6 +105,10 @@ class DuplicateServiceError(CordisError):
     pass
 
 
+class DuplicateQueryError(CordisError):
+    pass
+
+
 class MissingProvisionError(CordisError):
     pass
 
@@ -109,6 +120,52 @@ class FiberState(str, Enum):
     FAILED = "failed"
     UNLOADING = "unloading"
     DISPOSED = "disposed"
+
+
+class FiberView(Protocol[ContextCov]):
+    """Read-only inspection and config-independent lifecycle operations.
+
+    This is a static view of the same Fiber, not a runtime wrapper or sandbox.
+    Keep the Fiber returned by use()/mount() to update a known config type.
+    """
+
+    @property
+    def ctx(self) -> ContextCov: ...
+
+    @property
+    def config(self) -> object: ...
+
+    @property
+    def component(self) -> object: ...
+
+    @property
+    def uid(self) -> int | None: ...
+
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def state(self) -> FiberState: ...
+
+    @property
+    def inject(self) -> Mapping[str, object]: ...
+
+    @property
+    def error(self) -> Exception | None: ...
+
+    @property
+    def cleanup_error(self) -> ExceptionGroup | None: ...
+
+    @property
+    def tasks(self) -> tuple[asyncio.Task[object], ...]: ...
+
+    async def dispose(self) -> None: ...
+
+    async def restart(self) -> None: ...
+
+    async def wait(self, *, raise_error: bool = True) -> Self: ...
+
+    def __await__(self) -> Generator[object, None, Self]: ...
 
 
 def _service_name(value: ServiceName) -> str:
@@ -126,22 +183,22 @@ def _normalize_inject(value: Injection | None) -> Mapping[str, object]:
 
 
 @dataclass(frozen=True, init=False)
-class Component(Generic[ConfigT, ContextT]):
-    apply: PluginCallback[ContextT, ConfigT]
+class Component(Generic[ConfigT, ContextContra]):
+    apply: PluginCallback[ContextContra, ConfigT]
     inject: Mapping[str, object]
     provide: frozenset[str]
     name: str | None = None
     validate: Callable[[ConfigT], ConfigT | Awaitable[ConfigT]] | None = None
-    update: Callable[[ContextT, ConfigT, ConfigT], object] | None = None
+    update: Callable[[ContextContra, ConfigT, ConfigT], object] | None = None
 
     def __init__(
         self,
-        apply: PluginCallback[ContextT, ConfigT],
+        apply: PluginCallback[ContextContra, ConfigT],
         inject: Injection = (),
         provide: Iterable[ServiceName] = (),
         name: str | None = None,
         validate: Callable[[ConfigT], ConfigT | Awaitable[ConfigT]] | None = None,
-        update: Callable[[ContextT, ConfigT, ConfigT], object] | None = None,
+        update: Callable[[ContextContra, ConfigT, ConfigT], object] | None = None,
     ) -> None:
         object.__setattr__(self, "apply", apply)
         object.__setattr__(self, "inject", _normalize_inject(inject))
@@ -149,6 +206,29 @@ class Component(Generic[ConfigT, ContextT]):
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "validate", validate)
         object.__setattr__(self, "update", update)
+
+    def configure(self, config: ConfigT) -> BoundComponent[ConfigT, ContextContra]:
+        """Bind a typed configuration before entering a heterogeneous loader."""
+        return BoundComponent(self, config)
+
+    async def decode(
+        self,
+        raw: object,
+        decoder: Callable[[object], ConfigT | Awaitable[ConfigT]],
+    ) -> BoundComponent[ConfigT, ContextContra]:
+        """Decode external data before binding; validate still runs on activation."""
+        return self.configure(await _await(decoder(raw)))
+
+
+@dataclass(frozen=True)
+class BoundComponent(Generic[ConfigT, ContextContra]):
+    component: Component[ConfigT, ContextContra]
+    config: ConfigT
+
+    def _mount(
+        self: BoundComponent[ConfigT, ContextT], ctx: ContextT
+    ) -> Fiber[ConfigT, ContextT]:
+        return ctx.use(self.component, self.config)
 
 
 class _PluginDecorator(Protocol):
@@ -245,7 +325,7 @@ class _Service:
     fiber: "Fiber[Any, Any]"
     realm: object
     check: Callable[["Context"], bool] | None = None
-    adapt: Callable[[Any, Any, "Context"], Any] | None = None
+    adapt: Callable[[object, object, "Context"], object] | None = None
 
 
 @dataclass(slots=True)
@@ -265,7 +345,7 @@ class _Sink:
     actions: MutableSequence[Cleanup | _Effect]
     parent: "_Sink | None" = None
     closed: bool = False
-    tasks: dict[asyncio.Task[Any], "_TaskOptions"] = field(default_factory=dict)
+    tasks: dict[asyncio.Task[object], "_TaskOptions"] = field(default_factory=dict)
 
     @property
     def open(self) -> bool:
@@ -299,7 +379,7 @@ def _effect_error(error: Exception | asyncio.CancelledError, label: str) -> Exce
     return failure
 
 
-async def _finish_task(task: asyncio.Task[Any], options: _TaskOptions) -> None:
+async def _finish_task(task: asyncio.Task[object], options: _TaskOptions) -> None:
     if not task.done():
         if options.policy == "cancel":
             task.cancel()
@@ -314,7 +394,7 @@ async def _finish_task(task: asyncio.Task[Any], options: _TaskOptions) -> None:
 
 
 async def _stop_tasks(sink: _Sink) -> None:
-    tasks: dict[asyncio.Task[Any], _TaskOptions] = {}
+    tasks: dict[asyncio.Task[object], _TaskOptions] = {}
 
     def collect(scope: _Sink) -> None:
         scope.closed = True
@@ -377,7 +457,7 @@ async def _execute(
     callback: Callable[[], object], guard: Callable[[], bool], sink: _Sink
 ) -> None:
     token = _collector.set(sink)
-    iterator: Any = None
+    iterator: Iterator[object] | AsyncIterator[object] | None = None
     try:
         value = callback()
         if inspect.isawaitable(value) and not isinstance(value, AsyncIterable):
@@ -577,20 +657,24 @@ class Fiber(Generic[ConfigT, ContextT]):
         self._actions: list[Cleanup | _Effect] = []
         self._load_token = object()
         self._scope = _Sink(self, self._load_token, self._actions)
-        self._tasks: set[asyncio.Task[Any]] = set()
+        self._tasks: set[asyncio.Task[object]] = set()
         intercepts = {
             key: metadata
             for key, metadata in (component.inject.items() if component else ())
             if metadata is not None
         }
-        self.ctx = parent if root else parent._derive(fiber=self, intercepts=intercepts)
+        self._ctx = parent if root else parent._derive(fiber=self, intercepts=intercepts)
+
+    @property
+    def ctx(self) -> ContextT:
+        return self._ctx
 
     @property
     def inject(self) -> Mapping[str, object]:
         return self.component.inject if self.component else MappingProxyType({})
 
     @property
-    def tasks(self) -> tuple[asyncio.Task[Any], ...]:
+    def tasks(self) -> tuple[asyncio.Task[object], ...]:
         """Snapshot of this fiber's unfinished managed tasks."""
         return tuple(task for task in self._tasks if not task.done())
 
@@ -848,7 +932,7 @@ class Fiber(Generic[ConfigT, ContextT]):
             raise self.error
         return self
 
-    def __await__(self) -> Generator[Any, None, Self]:
+    def __await__(self) -> Generator[object, None, Self]:
         return self.wait().__await__()
 
 
@@ -857,7 +941,8 @@ class _Runtime:
         self.uid = 0
         self.fibers: list[Fiber[Any, Any]] = []
         self.services: dict[object, _Service] = {}
-        self.listeners: dict[str, list[_Listener]] = defaultdict(list)
+        self.listeners: dict[_EventName, list[_Listener]] = defaultdict(list)
+        self.queries: dict[QueryKey[Any, Any], _Listener] = {}
         self.errors: list[tuple[Exception, Fiber[Any, Any] | None]] = []
         self.root: Context
 
@@ -870,7 +955,7 @@ class _Runtime:
         owner = next(
             (
                 fiber
-                for fiber in [self.root.fiber, *self.fibers]
+                for fiber in [self.root._fiber, *self.fibers]
                 if current in fiber._tasks
             ),
             None,
@@ -890,8 +975,8 @@ class _Runtime:
                     "or a dependency; request the change from the host instead"
                 )
             pending.extend(service.fiber for service in fiber.committed.values())
-            if fiber is not self.root.fiber:
-                pending.append(fiber.parent.fiber)
+            if fiber is not self.root._fiber:
+                pending.append(fiber.parent._fiber)
 
     def add(self, fiber: Fiber[Any, Any]) -> None:
         self.fibers.append(fiber)
@@ -1016,12 +1101,12 @@ class _Runtime:
         if self.listeners.get("internal/error"):
             self.emit("internal/error", error, fiber)
 
-    def _listeners(self, name: str, scope: EventScope = None) -> list[_Listener]:
+    def _listeners(self, name: _EventName, scope: EventScope = None) -> list[_Listener]:
         listeners: list[_Listener] = []
         for listener in list(self.listeners.get(name, ())):
             if (
-                listener.ctx.fiber.state not in (FiberState.LOADING, FiberState.ACTIVE)
-                or listener.sink.token is not listener.ctx.fiber._load_token
+                listener.ctx._fiber.state not in (FiberState.LOADING, FiberState.ACTIVE)
+                or listener.sink.token is not listener.ctx._fiber._load_token
                 or not listener.sink.open
             ):
                 continue
@@ -1036,16 +1121,16 @@ class _Runtime:
     def _invoke(
         self,
         listener: _Listener,
-        name: str,
+        name: _DispatchName,
         args: tuple[object, ...],
         *,
         sync: bool = False,
-    ) -> Any:
+    ) -> object:
         # A callback executes in its registration scope, even when another
         # plugin emits the event. Recheck snapshots after earlier callbacks.
         if (
-            listener.ctx.fiber.state not in (FiberState.LOADING, FiberState.ACTIVE)
-            or listener.sink.token is not listener.ctx.fiber._load_token
+            listener.ctx._fiber.state not in (FiberState.LOADING, FiberState.ACTIVE)
+            or listener.sink.token is not listener.ctx._fiber._load_token
             or not listener.sink.open
         ):
             return None
@@ -1057,7 +1142,7 @@ class _Runtime:
             if sync:
                 _close_coroutine(result)
                 raise TypeError("bail listeners must be synchronous")
-            if isinstance(result, asyncio.Task) and result in listener.ctx.fiber._tasks:
+            if isinstance(result, asyncio.Task) and result in listener.ctx._fiber._tasks:
                 # A synchronous listener may return ctx.spawn(...). Preserve
                 # that task's explicit policy and avoid reporting failures twice.
                 return result
@@ -1066,20 +1151,20 @@ class _Runtime:
                 policy=listener.task_policy,
                 timeout=listener.timeout,
                 name=f"cordis:event:{name}",
-                source=name,
+                source=name if isinstance(name, str) else None,
             )
         finally:
             _collector.reset(token)
 
-    def emit(self, name: str, *args: object, scope: EventScope = None) -> None:
+    def emit(self, name: _EventName, *args: object, scope: EventScope = None) -> None:
         for listener in self._listeners(name, scope):
             try:
                 self._invoke(listener, name, args)
             except Exception as error:
                 if name == "internal/error":
-                    self.errors.append((error, listener.ctx.fiber))
+                    self.errors.append((error, listener.ctx._fiber))
                 else:
-                    self.report(error, listener.ctx.fiber)
+                    self.report(error, listener.ctx._fiber)
 
     async def flush(self) -> None:
         while True:
@@ -1096,7 +1181,7 @@ class Context:
 
     _runtime: _Runtime
     _parent: Context | None
-    _fiber: Fiber[Any, Any]
+    _fiber: Fiber[Any, Self]
     _realms_local: dict[str, object]
     _intercepts_local: dict[str, object]
     _closed: bool
@@ -1117,7 +1202,7 @@ class Context:
     def _derive(
         self,
         *,
-        fiber: Fiber[Any, Any] | None = None,
+        fiber: Fiber[Any, Self] | None = None,
         realms: Mapping[str, object] | None = None,
         intercepts: Mapping[str, object] | None = None,
     ) -> Self:
@@ -1139,15 +1224,15 @@ class Context:
         return False
 
     @property
-    def fiber(self) -> Fiber[Any, Any]:
+    def fiber(self) -> FiberView[Self]:
         return self._fiber
 
     @property
-    def fibers(self) -> tuple[Fiber[Any, Any], ...]:
+    def fibers(self) -> tuple[FiberView[Context], ...]:
         return tuple(self._runtime.fibers)
 
     @property
-    def errors(self) -> tuple[tuple[Exception, Fiber[Any, Any] | None], ...]:
+    def errors(self) -> tuple[tuple[Exception, FiberView[Context] | None], ...]:
         return tuple(self._runtime.errors)
 
     def _realm(self, name: str) -> object:
@@ -1365,19 +1450,19 @@ class Context:
     def provide(
         self,
         name: str,
-        value: object,
+        value: T,
         *,
         check: Callable[[Context], bool] | None = None,
-        adapt: Callable[[Any, Any, Context], Any] | None = None,
+        adapt: Callable[[T, object, Context], object] | None = None,
     ) -> EffectHandle: ...
 
     def provide(
         self,
-        name: ServiceName,
-        value: object,
+        name: str | ServiceKey[T],
+        value: T,
         *,
         check: Callable[["Context"], bool] | None = None,
-        adapt: Callable[[Any, Any, "Context"], Any] | None = None,
+        adapt: Callable[[T, object, "Context"], object] | None = None,
     ) -> EffectHandle:
         self._fiber._assert_effects_allowed()
         name = _service_name(name)
@@ -1387,7 +1472,16 @@ class Context:
             raise DuplicateServiceError(
                 f"service {name!r} is already provided by component {existing.fiber.name!r}"
             )
-        service = _Service(name, value, self._fiber, realm, check, adapt)
+        def adapt_value(value: object, metadata: object, ctx: Context) -> object:
+            # The heterogeneous store erases T. Restore it only at registration's
+            # adapter boundary; ServiceKey[T] checks typed writes and updates.
+            assert adapt is not None
+            return adapt(cast(T, value), metadata, ctx)
+
+        service = _Service(
+            name, value, self._fiber, realm, check,
+            adapt_value if adapt is not None else None,
+        )
         self._runtime.services[realm] = service
         if self._fiber.state is FiberState.ACTIVE:
             self._runtime.notify(self, [name])
@@ -1443,12 +1537,12 @@ class Context:
         default: object = None,
         *,
         include_inactive: bool = False,
-    ) -> Any:
+    ) -> object:
         name = _service_name(name)
         service = self._runtime.resolve(self, name, active=not include_inactive)
         return default if service is None else self._adapt(service)
 
-    def _adapt(self, service: _Service) -> Any:
+    def _adapt(self, service: _Service) -> object:
         metadata = self.metadata(service.name)
         if service.adapt:
             return service.adapt(service.value, metadata, self)
@@ -1461,7 +1555,7 @@ class Context:
     @overload
     def service(self, name: str) -> Any: ...
 
-    def service(self, name: ServiceName) -> Any:
+    def service(self, name: ServiceName) -> object:
         name = _service_name(name)
         realm = self._realm(name)
         fiber: Fiber[Any, Any] | None = self._fiber
@@ -1500,9 +1594,48 @@ class Context:
             raise AttributeError(name)
         return self.service(name)
 
+    @overload
+    def on(
+        self,
+        name: EventKey[T],
+        callback: Callable[[T], None | Awaitable[None]],
+        *,
+        prepend: bool = False,
+        global_: bool = False,
+        task_policy: TaskPolicy = "drain",
+        timeout: float | None = None,
+    ) -> EffectHandle: ...
+
+    @overload
     def on(
         self,
         name: str,
+        callback: Callable[..., object],
+        *,
+        prepend: bool = False,
+        global_: bool = False,
+        task_policy: TaskPolicy = "drain",
+        timeout: float | None = None,
+    ) -> EffectHandle: ...
+
+    def on(
+        self,
+        name: _EventName,
+        callback: Callable[..., object],
+        *,
+        prepend: bool = False,
+        global_: bool = False,
+        task_policy: TaskPolicy = "drain",
+        timeout: float | None = None,
+    ) -> EffectHandle:
+        return self._on(
+            name, callback, prepend=prepend, global_=global_,
+            task_policy=task_policy, timeout=timeout,
+        )
+
+    def _on(
+        self,
+        name: _EventName,
         callback: Callable[..., object],
         *,
         prepend: bool = False,
@@ -1528,9 +1661,33 @@ class Context:
         effect = _Effect.completed(self._fiber, [remove], f"event:{name}")
         return self._fiber._attach_effect(effect)
 
+    @overload
+    def once(
+        self,
+        name: EventKey[T],
+        callback: Callable[[T], None | Awaitable[None]],
+        *,
+        prepend: bool = False,
+        global_: bool = False,
+        task_policy: TaskPolicy = "drain",
+        timeout: float | None = None,
+    ) -> EffectHandle: ...
+
+    @overload
     def once(
         self,
         name: str,
+        callback: Callable[..., object],
+        *,
+        prepend: bool = False,
+        global_: bool = False,
+        task_policy: TaskPolicy = "drain",
+        timeout: float | None = None,
+    ) -> EffectHandle: ...
+
+    def once(
+        self,
+        name: _EventName,
         callback: Callable[..., object],
         *,
         prepend: bool = False,
@@ -1541,7 +1698,7 @@ class Context:
         handle: EffectHandle
         called = False
 
-        async def wrapped(*args: object) -> Any:
+        async def wrapped(*args: object) -> object:
             nonlocal called
             if called:
                 return None
@@ -1549,7 +1706,7 @@ class Context:
             await handle()
             return await _await(callback(*args))
 
-        handle = self.on(
+        handle = self._on(
             name,
             wrapped,
             prepend=prepend,
@@ -1559,13 +1716,31 @@ class Context:
         )
         return handle
 
-    def emit(self, name: str, *args: object, scope: EventScope = None) -> None:
+    @overload
+    def emit(
+        self, name: EventKey[T], payload: T, /, *, scope: EventScope = None
+    ) -> None: ...
+
+    @overload
+    def emit(self, name: str, *args: object, scope: EventScope = None) -> None: ...
+
+    def emit(self, name: _EventName, *args: object, scope: EventScope = None) -> None:
         self._runtime.emit(name, *args, scope=scope)
 
+    @overload
+    async def parallel(
+        self, name: EventKey[T], payload: T, /, *, scope: EventScope = None
+    ) -> None: ...
+
+    @overload
     async def parallel(
         self, name: str, *args: object, scope: EventScope = None
+    ) -> None: ...
+
+    async def parallel(
+        self, name: _EventName, *args: object, scope: EventScope = None
     ) -> None:
-        async def invoke(listener: _Listener) -> Any:
+        async def invoke(listener: _Listener) -> object:
             return await _await(self._runtime._invoke(listener, name, args))
 
         results = await asyncio.gather(
@@ -1576,14 +1751,52 @@ class Context:
         if errors:
             raise ExceptionGroup(f"event {name!r} failed", errors)
 
-    async def serial(self, name: str, *args: object, scope: EventScope = None) -> Any:
+    def handle(
+        self,
+        key: QueryKey[RequestT, ResultT],
+        callback: Callable[[RequestT], ResultT | None | Awaitable[ResultT | None]],
+        *,
+        task_policy: TaskPolicy = "drain",
+        timeout: float | None = None,
+    ) -> EffectHandle:
+        """Register the sole handler for this query key in the runtime."""
+        self._fiber._assert_effects_allowed()
+        _validate_task_options(task_policy, timeout)
+        if key in self._runtime.queries:
+            raise DuplicateQueryError(f"query {key.name!r} already has a handler")
+        listener = _Listener(
+            self, callback, self._fiber._sink(),
+            task_policy=task_policy, timeout=timeout,
+        )
+        self._runtime.queries[key] = listener
+
+        def remove() -> None:
+            if self._runtime.queries.get(key) is listener:
+                del self._runtime.queries[key]
+
+        effect = _Effect.completed(self._fiber, [remove], f"query:{key.name}")
+        return self._fiber._attach_effect(effect)
+
+    async def query(
+        self, key: QueryKey[RequestT, ResultT], request: RequestT
+    ) -> ResultT | None:
+        """Return None for no active handler/no result; False is a valid result."""
+        listener = self._runtime.queries.get(key)
+        if listener is None:
+            return None
+        result = await _await(self._runtime._invoke(listener, key, (request,)))
+        # handle() and query() share this invariant, identity-based key. Only
+        # this registry boundary restores the result erased by _Listener.
+        return cast(ResultT | None, result)
+
+    async def serial(self, name: str, *args: object, scope: EventScope = None) -> object:
         for listener in self._runtime._listeners(name, scope):
             result = await _await(self._runtime._invoke(listener, name, args))
             if result is not None and result is not False:
                 return result
         return None
 
-    def bail(self, name: str, *args: object, scope: EventScope = None) -> Any:
+    def bail(self, name: str, *args: object, scope: EventScope = None) -> object:
         for listener in self._runtime._listeners(name, scope):
             result = self._runtime._invoke(listener, name, args, sync=True)
             if result is not None and result is not False:
@@ -1594,12 +1807,12 @@ class Context:
         self,
         name: str,
         *args: object,
-        final: Callable[..., Any],
+        final: Callable[..., object],
         scope: EventScope = None,
-    ) -> Any:
+    ) -> object:
         listeners = self._runtime._listeners(name, scope)
 
-        def dispatch(index: int, values: tuple[object, ...]) -> Any:
+        def dispatch(index: int, values: tuple[object, ...]) -> object:
             if index == len(listeners):
                 return final(*values)
             return self._runtime._invoke(

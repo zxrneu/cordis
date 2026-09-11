@@ -4,6 +4,8 @@
 
 完整程序在 [`examples/tutorial.py`](../examples/tutorial.py)。理解运行机制可读[核心概念](core-concepts.md)，类型推断细节可读[类型化插件开发](typing.md)，方法签名与参数可查 [API 参考](api.md)。
 
+本教程的主程序保留字符串事件，用来演示动态派发。新增的类型化通知、查询与 Loader 绑定示例在 [`examples/typed_interfaces.py`](../examples/typed_interfaces.py)，运行 `uv run python -m examples.typed_interfaces`；已有项目可按[迁移指南](migration-typed-interfaces.md)调整。
+
 需要实际业务场景和配置文件自动更新，可继续阅读[CSV 订单导入实战](scenarios.md)：它监听 TOML 与 CSV，更新校验规则，并通过共享契约切换 SQLite / 内存提供方。
 
 ## 1. 安装并运行
@@ -143,6 +145,8 @@ if __name__ == "__main__":
 
 `ctx.use()` 返回的是插件运行实例 `Fiber`，并立即调度启动。`provider` 的类型是 `Fiber[GreeterConfig, AppContext]`，因此 `provider.update()` 也要求 `GreeterConfig`；错误的配置类型会被 mypy 拒绝。
 
+`provider.ctx.fiber`、`root.fibers` 及 Loader 的字符串查询返回 FiberView：它可以查看状态、等待、重启和卸载，但静态接口没有 update。更新配置时保留上面的 provider，不要通过状态查询重新获取写配置的句柄。
+
 这里有三个不同的等待动作：
 
 | 写法 | 等待什么 |
@@ -217,7 +221,35 @@ def ticker(ctx: Context, _config: None) -> None:
 
 有限任务可以使用默认的 `policy="drain"`，等待其结束；长期循环通常使用 `policy="cancel"`。运行时会等任务及其 `finally` 完成，再回收资源。裸 `asyncio.create_task()` 不会自动归属插件；取消也要求任务主动响应，不能保证终止忽略取消的协程或底层线程。
 
-`emit()` 会调度异步监听器但立即返回；需要等待处理完成时用 `await parallel()`。后者不返回监听器结果；需要业务返回值时，可直接调用类型化服务，或使用带短路语义的 `serial()`。事件参数目前属于动态接口，即使监听器写了类型注解，字符串事件派发也不会自动检查参数类型。
+`emit()` 会调度异步监听器但立即返回；需要等待处理完成时用 `await parallel()`。后者不返回监听器结果。字符串事件派发不会自动检查参数类型；类型化通知使用 EventKey，单处理器请求使用 QueryKey。
+
+### 使用类型化通知和查询
+
+下面的独立宿主使用专门的类型化示例。MESSAGE 携带 Message 类型，FIND_USER 关联 int 请求与 User 结果：
+
+```python
+import asyncio
+
+from cordis import Loader
+from examples.typed_interfaces import (
+    AppContext, FIND_USER, MESSAGE, Message, WorkerConfig, worker,
+)
+
+
+async def main() -> None:
+    async with AppContext() as root:
+        loader = Loader(root)
+        await loader.mount("worker", worker.configure(WorkerConfig("hello")))
+        await root.parallel(MESSAGE, Message("Cordis"))
+        user = await root.query(FIND_USER, 1)  # User | None
+        if user is not None:
+            print(user.name)
+
+
+asyncio.run(main())
+```
+
+worker 内部用 `ctx.on(MESSAGE, receive)` 和 `ctx.handle(FIND_USER, find_user)` 注册。通知回调返回 None 或 Awaitable[None]；查询可返回 User、None 或对应的 awaitable。键按对象身份匹配，必须共享同一个对象；同名字符串或另建的同名键不会收到消息。查询无有效处理器时返回 None，False 是正常结果；原有 serial/bail 则是会跳过 False 的多监听器短路策略。
 
 ## 6. 用 Loader 管理插件清单
 
@@ -254,9 +286,13 @@ asyncio.run(main())
 
 清单中新增的 id 会挂载，移除的 id 会卸载，已有 id 的配置变化会触发更新；`enabled=False` 可保留条目但停用实例。一次 `reconcile()` 是逐项协调，并非整个清单的原子事务。
 
-`Entry` 容纳不同类型的组件，配置类型为 `object`，不保留组件与配置的静态对应关系。需要这种类型保证的代码内装配优先使用 `ctx.use()`；配置文件和 Loader 入口需要额外验证输入。
+`Entry` 容纳不同类型的组件，配置类型为 object，不保留组件与配置的静态对应关系。代码内需要严格匹配时，用 `ctx.use()`，或先 `binding = greeter.configure(config)` 再 `fiber = await loader.mount("greeter", binding)`。后者保留 Fiber[GreeterConfig, AppContext]，可以直接检查 fiber.update 的参数。
+
+mount 条目不进入 loader.entries，也不会被 reconcile([]) 删除；使用 unmount(id) 或 close() 清理。两种入口的 id 不能冲突。mount 等待当前启动转换，但缺少依赖时仍可能返回 PENDING。loader.get/reload 返回 FiberView，仅用于查看状态及不需要配置类型的生命周期操作。
 
 ### 从 TOML 加载
+
+若宿主已经选定类型化插件，可以先解析文件，再 `await greeter.decode(raw, decoder)` 得到绑定对象并交给 mount；decoder 接收 object，返回 GreeterConfig（也可异步）。下面则演示另一种需求：让文件选择字符串定位符，因此继续使用动态 Entry 与边界插件。
 
 文件配置不会自动构造 dataclass。可以加一个接收 `object` 的入口，检查外部输入后再挂载类型化插件。在 `python/my_app/` 中创建空的 `__init__.py`，并保存以下 `plugins.py`：
 

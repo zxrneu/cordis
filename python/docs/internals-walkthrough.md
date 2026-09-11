@@ -16,6 +16,7 @@
   - [2.4 `Component`：无状态组件规格](#24-component无状态组件规格)
   - [2.5 `_Sink` 与 `_Effect`：副作用作用域树与上下文隔离](#25-_sink-与-_effect副作用作用域树与上下文隔离)
   - [2.6 `_Service`、`_Listener` 与 `_TaskOptions`：运行时元数据](#26-_service_listener-与-_taskoptions运行时元数据)
+  - [2.7 公开视图、键身份与类型擦除边界](#27-公开视图键身份与类型擦除边界)
 - [3. 核心机制逐行走读与执行流程](#3-核心机制逐行走读与执行流程)
   - [3.1 挂载与依赖目标计算 (`use` -> `_compute_target`)](#31-挂载与依赖目标计算-use---_compute_target)
   - [3.2 纤程驱动循环深度剖析 (`Fiber._drive`)](#32-纤程驱动循环深度剖析-fiber_drive)
@@ -24,6 +25,7 @@
   - [3.5 服务解析、Realm 隔离与 Intercept 适配](#35-服务解析realm-隔离与-intercept-适配)
   - [3.6 声明式调和状态机 (`Loader.reconcile`)](#36-声明式调和状态机-loaderreconcile)
   - [3.7 模块图 AST 静态分析与 HMR 事务回滚](#37-模块图-ast-静态分析与-hmr-事务回滚)
+  - [3.8 类型化挂载与查询的执行路径](#38-类型化挂载与查询的执行路径)
 - [4. 状态流转与关键时序图解](#4-状态流转与关键时序图解)
   - [4.1 Fiber 状态流转完整矩阵](#41-fiber-状态流转完整矩阵)
   - [4.2 级联排空与依赖隔离时序 (Sequence Diagram)](#42-级联排空与依赖隔离时序-sequence-diagram)
@@ -43,20 +45,20 @@
 
 ### 1.1 源码文件职责划分
 
-Cordis Python 核心位于 `python/src/cordis`，代码量极其精炼（约 2000 行），无外部强制依赖（仅可选 `PyYAML`）。
+Cordis Python 核心位于 `python/src/cordis`，运行时使用标准库，YAML 解析可选依赖 `PyYAML`。下文数据结构与算法片段用于解释当前实现，省略部分字段、重载和错误处理；完整定义以链接的源码为准。
 
 ```text
 src/cordis/
 ├── __init__.py    # 公共符号统一重导出与 __all__ 控制
-├── keys.py        # ServiceKey[T] 泛型类与 Context 描述符协议
-├── core.py        # 运行时微内核：Context, Fiber, Effect, Sink, _Runtime
-├── loader.py      # 声明式加载器：Entry, Loader, group, dynamic import
+├── keys.py        # ServiceKey、EventKey、QueryKey 与服务描述符
+├── core.py        # Context, Fiber/FiberView, Component/BoundComponent, Effect, _Runtime
+├── loader.py      # 类型化 mount、声明式 Entry/reconcile、group、dynamic import
 └── hmr.py         # 源码级模块热替换引擎：ModuleGraph, HotReloader
 ```
 
 ```mermaid
 graph TD
-    Keys[keys.py<br/>ServiceKey] --> Core[core.py<br/>Context / Fiber / _Runtime]
+    Keys[keys.py<br/>ServiceKey / EventKey / QueryKey] --> Core[core.py<br/>Context / Fiber / _Runtime]
     Core --> Loader[loader.py<br/>Loader / Entry / group]
     Loader --> HMR[hmr.py<br/>HotReloader / ModuleGraph]
     Core -.重导出.-> Init[__init__.py]
@@ -69,21 +71,25 @@ graph TD
 
 ```mermaid
 flowchart TB
-    subgraph DeclarativeLayer [声明与热更新层 (Declarative & HMR)]
-        HMRModule[HotReloader & ModuleGraph] --> LoaderModule[Loader.reconcile]
-        LoaderModule --> EntryDef[Entry 树状配置]
+    subgraph DeclarativeLayer ["声明与热更新层 (Declarative & HMR)"]
+        HMRModule["HotReloader & ModuleGraph"] --> LoaderModule["Loader.reconcile"]
+        LoaderModule --> EntryDef["Entry 树状配置"]
+        Binding["BoundComponent：插件与配置绑定"] --> TypedMount["Loader.mount"]
     end
 
-    subgraph InterfaceLayer [接口与契约层 (Contracts & Interfaces)]
-        EntryDef --> ComponentSpec[Component / @plugin 规格]
-        KeySpec[ServiceKey / AppContext] --> ContextAPI[Context 面向用户 API]
+    subgraph InterfaceLayer ["接口与契约层 (Contracts & Interfaces)"]
+        EntryDef --> ComponentSpec["Component / @plugin 规格"]
+        ComponentSpec --> ContextAPI
+        TypedMount --> ContextAPI
+        KeySpec["ServiceKey / EventKey / QueryKey / AppContext"] --> ContextAPI["Context 面向用户 API"]
     end
 
-    subgraph RuntimeKernel [运行时微内核 (Microkernel Core)]
-        ContextAPI --> FiberMgr[Fiber 状态机 & 驱动循环 _drive]
-        FiberMgr --> RuntimeState[_Runtime: 服务表 / 监听器表 / 纤程集]
-        FiberMgr --> ScopeEngine[_Sink & _Effect: contextvars 上下文追踪]
-        ScopeEngine --> TaskSupervisor[TaskPolicy: drain / cancel 协程管理]
+    subgraph RuntimeKernel ["运行时微内核 (Microkernel Core)"]
+        ContextAPI --> FiberMgr["Fiber 状态机 & 驱动循环 _drive"]
+        FiberMgr -.只读属性与生命周期操作.-> View["FiberView：公开检查接口"]
+        FiberMgr --> RuntimeState["_Runtime: 服务表 / 通知表 / 查询表 / 纤程集"]
+        FiberMgr --> ScopeEngine["_Sink & _Effect: contextvars 上下文追踪"]
+        ScopeEngine --> TaskSupervisor["TaskPolicy: drain / cancel 协程管理"]
     end
 ```
 
@@ -93,36 +99,38 @@ flowchart TB
 
 ### 2.1 `_Runtime`：全局中枢与注册表
 
-位于 [`core.py:855`](../src/cordis/core.py#L855)。每一个根 Context (`Context()`) 创建时，会分配一个私有的 `_Runtime` 实例。该实例被其衍生出的所有子 Context 与 Fiber 共享。
+位于 [`_Runtime`](../src/cordis/core.py#L939)。每一个根 Context (`Context()`) 创建时，会分配一个私有的 `_Runtime` 实例。该实例被其衍生出的所有子 Context 与 Fiber 共享。
 
 ```python
 class _Runtime:
     uid: int                                       # 全局单调递增 UID 发生器
     fibers: list[Fiber[Any, Any]]                  # 当前运行时接管的所有 Fiber 列表
     services: dict[object, _Service]               # 核心服务路由表：{realm: _Service}
-    listeners: dict[str, list[_Listener]]          # 事件监听表：{event_name: [_Listener, ...]}
-    errors: list[tuple[Exception, Fiber | None]]   # 未处理异常历史环形/追加记录
+    listeners: dict[str | EventKey[Any], list[_Listener]] # 通知注册表
+    queries: dict[QueryKey[Any, Any], _Listener]   # 每个查询键只有一个处理器
+    errors: list[tuple[Exception, Fiber[Any, Any] | None]] # 追加的错误历史
     root: Context                                  # 根上下文引用
 ```
 
-- **`services` 映射键不是字符串，而是 `realm`（域对象）**：这是 Cordis 实现多租户与服务隔离的物理基石。在没有显式隔离时，所有服务使用根上下文的默认 Realm。
+- **`services` 映射键不是字符串，而是 `realm`（域对象）**：未显式隔离时，根 Context 为每个服务名分配并复用一个 Realm；不是全部服务共用一个对象。
 - **`listeners` 包含所有静态与动态绑定的监听器**：每个监听器绑定有所属的 `_Sink`，卸载时通过 Sink 的生命周期直接失效。
+- **`queries` 使用身份键**：handle 注册后保留一个 `_Listener`；清理时仅移除仍属于该处理器的记录。查询没有服务 Realm 路由。
 
 ---
 
 ### 2.2 `Context`：基于原型链的环境切片
 
-位于 [`core.py:1094`](../src/cordis/core.py#L1094)。Context 采用类似 JavaScript 原型继承的链式模型。
+位于 [`Context`](../src/cordis/core.py#L1179)。Context 采用类似 JavaScript 原型继承的链式模型。
 
 ```python
 class Context:
     _runtime: _Runtime               # 共享的全局运行时内核
     _parent: Context | None          # 指向父级 Context，形成向上溯源链
-    _fiber: Fiber[Any, Any]          # 当前上下文所属的 Fiber
+    _fiber: Fiber[Any, Self]         # 私有字段擦除配置类型，保留当前 Context 类型
     _realms_local: dict[str, object] # 本地隔离域重载表: {service_name: realm_object}
     _intercepts_local: dict[str, object] # 本地拦截元数据: {service_name: metadata}
     _closed: bool                    # 根 Context 是否已关闭
-    _close_task: asyncio.Task | None # 正在进行的 close 协程任务缓存（防重入）
+    _close_task: asyncio.Task[None] | None # 正在进行的 close 协程任务缓存（防重入）
 ```
 
 #### 链式向上回溯寻址（Prototype Chain Lookup）
@@ -133,13 +141,13 @@ class Context:
 
 ### 2.3 `Fiber`：纤程控制块 (PCB)
 
-位于 [`core.py:550`](../src/cordis/core.py#L550)。代表一个组件在运行时中的一次激活执行。
+位于 [`Fiber`](../src/cordis/core.py#L630)。代表一个组件在运行时中的一次激活执行。
 
 ```python
 class Fiber(Generic[ConfigT, ContextT]):
     runtime: _Runtime                      # 内核引用
     parent: ContextT                       # 挂载此 Fiber 的父上下文
-    component: Component | None            # 静态组件定义（Root Fiber 为 None）
+    component: Component[ConfigT, ContextT] | None # 静态组件定义（Root Fiber 为 None）
     config: ConfigT                        # 当前生效的配置数据
     uid: int | None                        # 实例全局唯一 ID（被 dispose 后置为 None）
     name: str                              # 标识名称（排错日志用）
@@ -155,32 +163,39 @@ class Fiber(Generic[ConfigT, ContextT]):
     _actions: list[Cleanup | _Effect]      # 当前作用域登记的清理动作栈（LIFO）
     _load_token: object                    # 每次启动分配的唯一代币，防过期待闭包
     _scope: _Sink                          # 根效应收集桶
-    _tasks: set[asyncio.Task[Any]]         # 当前 Fiber 拥有的未结束受管后台任务集
-    ctx: Context                           # 为该 Fiber 专有派生的子上下文
+    _tasks: set[asyncio.Task[object]]      # 不同结果类型的未结束受管任务集
+    _ctx: ContextT                        # 内部存储，公开 ctx 是只读属性
 ```
 
 ---
 
 ### 2.4 `Component`：无状态组件规格
 
-位于 [`core.py:128`](../src/cordis/core.py#L128)。由 `@plugin` 或 `Component` 构造函数创建的不可变对象。
+位于 [`Component`](../src/cordis/core.py#L186)。由 `@plugin` 或 `Component` 构造函数创建的不可变对象。
 
 ```python
 @dataclass(frozen=True, init=False)
-class Component(Generic[ConfigT, ContextT]):
-    apply: PluginCallback[ContextT, ConfigT]                 # 入口回调（函数或类）
+class Component(Generic[ConfigT, ContextContra]):
+    apply: PluginCallback[ContextContra, ConfigT]            # Context 参数逆变
     inject: Mapping[str, object]                             # 依赖清单：{service_name: metadata}
     provide: frozenset[str]                                  # 对外宣告提供的服务名集合
     name: str | None                                         # 组件命名
-    validate: Callable[[ConfigT], ConfigT | Awaitable] | None # 配置校验器
-    update: Callable[[ContextT, ConfigT, ConfigT], object] | None # 原地更新钩子
+    validate: Callable[[ConfigT], ConfigT | Awaitable[ConfigT]] | None # 配置校验器
+    update: Callable[[ContextContra, ConfigT, ConfigT], object] | None # 原地更新钩子
+
+    def configure(self, config: ConfigT) -> BoundComponent[ConfigT, ContextContra]: ...
+    async def decode(
+        self, raw: object, decoder: Callable[[object], ConfigT | Awaitable[ConfigT]]
+    ) -> BoundComponent[ConfigT, ContextContra]: ...
 ```
+
+BoundComponent 是不可变的组件与配置二元组。configure 不激活插件；decode 调用 decoder 后再 configure，validate 仍在激活/更新时执行。Context 逆变允许基础 Context 插件挂到子类，配置参数保持不变。
 
 ---
 
 ### 2.5 `_Sink` 与 `_Effect`：副作用作用域树与上下文隔离
 
-位于 [`core.py:262`](../src/cordis/core.py#L262) 与 [`core.py:452`](../src/cordis/core.py#L452)。用于精确控制组件内创建的所有副作用。
+位于 [`_Sink`](../src/cordis/core.py#L342) 与 [`_Effect`](../src/cordis/core.py#L532)。用于精确控制组件内创建的所有副作用。
 
 ```python
 @dataclass(slots=True)
@@ -190,7 +205,7 @@ class _Sink:
     actions: MutableSequence[Cleanup | _Effect]     # 清理动作栈
     parent: _Sink | None = None                     # 父 Sink（嵌套 Effect 形成树状结构）
     closed: bool = False                            # 是否已关闭新动作准入
-    tasks: dict[asyncio.Task[Any], _TaskOptions]    # 归属此 Sink 的后台任务及其策略
+    tasks: dict[asyncio.Task[object], _TaskOptions] # 归属此 Sink 的后台任务及其策略
 ```
 
 - **`_collector`（全局 ContextVar）**：
@@ -213,7 +228,7 @@ class _Service:
     fiber: Fiber[Any, Any]                             # 提供该服务的 Fiber
     realm: object                                      # 所属 Realm
     check: Callable[[Context], bool] | None = None     # 可用性谓词（用于动态按条件暴露）
-    adapt: Callable[[Any, Any, Context], Any] | None = None # 服务适配/拦截包装器
+    adapt: Callable[[object, object, Context], object] | None = None # 异构存储边界
 
 @dataclass(slots=True)
 class _Listener:
@@ -230,6 +245,25 @@ class _TaskOptions:
     timeout: float | None                              # 排空时限
     stopping: asyncio.Task[None] | None = None         # 正在执行停机的任务（防重入）
 ```
+
+---
+
+### 2.7 公开视图、键身份与类型擦除边界
+
+异构存储中的配置、服务值和回调结果不具有同一个类型。维护时应区分保存这些对象的内部容器与业务调用入口：
+
+| 边界 | 内部存储 | 公开保证 |
+| --- | --- | --- |
+| Fiber 检查 | 运行时保存不同配置的 Fiber | FiberView 只读属性、支持 dispose/restart/wait，配置为 object，不暴露 update |
+| 类型化配置 | BoundComponent 保留 Component 与 ConfigT 的配对 | mount 返回 Fiber[ConfigT, ContextT]，之后才存入 `_mounted` 的视图集合 |
+| 动态配置 | `_Loaded` 保存 Entry、动态 Component 与 Fiber | get/reload 返回 FiberView；Entry 本身不证明插件与配置匹配 |
+| 服务适配 | `_Service` 的值、metadata 和适配结果为 object | provide 的泛型适配器闭包在注册边界恢复 T；服务键检查读写参数 |
+| 通知与查询 | `_Listener.callback` 接受异构调用签名 | EventKey/QueryKey 在注册和调用入口关联参数，query 在注册表出口恢复 ResultT |
+| 任务快照 | Task[object] | 单次 spawn 返回 Task[T]；查看任务集合不虚假承诺结果类型 |
+
+FiberView 是协议，不创建包装对象。await/wait 使用 Self，确保从视图等待后仍是视图。Fiber.ctx 和 Loader.ctx 都是只读属性，避免更宽的静态视图替换底层的具体 Context。
+
+EventKey/QueryKey 的 dataclass 使用 `eq=False`，继承对象身份相等和哈希；名称是诊断标签。ServiceKey 仍按字符串名字路由。不要为了统一存储而把事件键改成按名字相等，否则同名但不兼容的泛型键可能把错误数据交给处理器。
 
 ---
 
@@ -262,7 +296,7 @@ sequenceDiagram
     Ctx-->>User: 返回 Fiber 句柄
 ```
 
-#### 关键代码片段：[`core.py:618`](../src/cordis/core.py#L618) `_compute_target`
+#### 关键代码片段：[`Fiber._compute_target`](../src/cordis/core.py#L702) `_compute_target`
 ```python
 def _compute_target(self) -> tuple[int, tuple[int, ...]] | None:
     # 1. 如果组件被显式销毁，或当前处于 FAILED 状态，目标为 None
@@ -290,7 +324,7 @@ def _compute_target(self) -> tuple[int, tuple[int, ...]] | None:
 
 ### 3.2 纤程驱动循环深度剖析 (`Fiber._drive`)
 
-位于 [`core.py:720`](../src/cordis/core.py#L720)。这是整个运行时状态机的发动机。每个 Fiber 同一时刻最多只有一个 `_drive` 协程在跑（记录在 `fiber.inertia` 中）。
+位于 [`Fiber._drive`](../src/cordis/core.py#L804)。这是整个运行时状态机的发动机。每个 Fiber 同一时刻最多只有一个 `_drive` 协程在跑（记录在 `fiber.inertia` 中）。
 
 ```python
 async def _drive(self) -> None:
@@ -308,13 +342,13 @@ async def _drive(self) -> None:
                 self.committed.clear()
                 self.committed_realms.clear()
                 self._load_token = object() # 代币失效，旧闭包彻底失效
-                
+
                 # 如果是外部要求销毁 (desired == False)
                 if not self.desired:
                     self._set_state(FiberState.DISPOSED)
                     self.runtime.remove(self)
                     return
-                
+
                 # 重新评估目标
                 self.target = self._compute_target()
                 if self.target is None:
@@ -389,14 +423,14 @@ async def _drive(self) -> None:
 
 ### 3.3 效应归一化执行器 (`_execute` 与 `_collector`)
 
-位于 [`core.py:376`](../src/cordis/core.py#L376)。Cordis 使用 `_execute` 函数实现了代数效应（Algebraic Effects）的归一化处理。
+位于 [`_execute`](../src/cordis/core.py#L456)。Cordis 使用 `_execute` 函数实现了代数效应（Algebraic Effects）的归一化处理。
 
 ```python
 async def _execute(
     callback: Callable[[], object], guard: Callable[[], bool], sink: _Sink
 ) -> None:
     token = _collector.set(sink) # 1. 注入当前 Sink 到 contextvars
-    iterator: Any = None
+    iterator: Iterator[object] | AsyncIterator[object] | None = None
     try:
         value = callback()
         if inspect.isawaitable(value) and not isinstance(value, AsyncIterable):
@@ -457,13 +491,13 @@ flowchart TD
     StartUnload[Provider 进入 UNLOADING] --> Step1[1. provider_leaving: 通知运行时该服务即将离开]
     Step1 --> Step2[2. 下级所有 Consumer 收到通知, 计算 target 变为 None, 触发 UNLOADING]
     Step2 --> Step3[3. Provider 挂起: await _drain_dependents 等待 Consumer 完全退出]
-    
+
     subgraph ConsumerUnload [Consumer 卸载流程]
         C1[闭锁 Consumer Sink: closed = True] --> C2[处理 Consumer 受管任务: drain 等待或 cancel]
         C2 --> C3[LIFO 逆序弹出并执行 Consumer 的 Cleanups]
         C3 --> C4[Consumer 状态流转为 PENDING 或 DISPOSED]
     end
-    
+
     Step3 --> ConsumerUnload
     ConsumerUnload --> Step4[4. 下级消费者全部结算完成, Provider 恢复执行 _recover]
     Step4 --> Step5[5. Provider 闭锁自身 Sink, 排空/取消自身任务]
@@ -471,7 +505,7 @@ flowchart TD
     Step6 --> Done[停机结束]
 ```
 
-#### 关键清理函数：[`core.py:345`](../src/cordis/core.py#L345) `_dispose_actions`
+#### 关键清理函数：[`_dispose_actions`](../src/cordis/core.py#L425) `_dispose_actions`
 ```python
 async def _dispose_actions(sink: _Sink, label: str) -> None:
     # 第一步：先停掉所有协程任务，确保没有任何代码在并发访问即将被释放的资源
@@ -498,7 +532,7 @@ async def _dispose_actions(sink: _Sink, label: str) -> None:
 
 ### 3.5 服务解析、Realm 隔离与 Intercept 适配
 
-#### 服务解析核心：[`core.py:904`](../src/cordis/core.py#L904) `_Runtime.resolve`
+#### 服务解析核心：[`_Runtime.resolve`](../src/cordis/core.py#L989) `_Runtime.resolve`
 ```python
 def resolve(self, ctx: Context, name: str, *, active: bool = True) -> _Service | None:
     # 1. 计算上下文在当前服务名下的 Realm 键
@@ -521,20 +555,23 @@ def resolve(self, ctx: Context, name: str, *, active: bool = True) -> _Service |
     return service
 ```
 
-#### 服务消费防越权：[`core.py:1464`](../src/cordis/core.py#L1464) `Context.service`
+#### 服务消费防越权：[`Context.service`](../src/cordis/core.py#L1558) `Context.service`
+
+下方是实现签名，结果为 object；公开重载中 ServiceKey[T] 读取仍返回 T，字符串读取保留 Any。内部收紧不会让动态字符串自动获得服务接口类型。
+
 ```python
-def service(self, name: ServiceName) -> Any:
+def service(self, name: ServiceName) -> object:
     name = _service_name(name)
     realm = self._realm(name)
-    fiber: Fiber | None = self._fiber
-    
+    fiber: Fiber[Any, Any] | None = self._fiber
+
     # 沿 Fiber 继承链向上检查：
     while fiber is not None:
         # 1. 是否存在已提交的依赖？
         service = fiber.committed.get(name)
         if service is not None and fiber.committed_realms.get(name) is realm:
             return self._adapt(service) # 通过适配器/拦截器包装后返回
-        
+
         # 2. 如果插件声明了依赖该服务，但 committed 为空 -> 说明服务不可用！
         if name in fiber.inject:
             raise InactiveServiceError(
@@ -551,12 +588,15 @@ def service(self, name: ServiceName) -> Any:
 
 ### 3.6 声明式调和状态机 (`Loader.reconcile`)
 
-位于 [`loader.py:157`](../src/cordis/loader.py#L157)。负责将一批声明式的 `Entry` 清单，调和（Reconcile）到运行中的 Fiber 集群：
+位于 [`Loader.reconcile`](../src/cordis/loader.py#L195)。负责将一批声明式的 `Entry` 清单，调和（Reconcile）到运行中的 Fiber 集群：
 
 ```python
 async def reconcile(self, entries: Iterable[Entry | Mapping[str, Any]]) -> None:
     values = [_coerce_entry(raw) for raw in entries]
+    # 完整实现先拒绝重复 id。
     desired = {entry.id: entry for entry in values}
+    if conflicts := self._mounted.keys() & desired.keys():
+        raise ValueError("entry ids already mounted: " + ", ".join(sorted(conflicts)))
 
     # 1. 删除阶段：移除不再存在的 Entry
     for entry_id in set(self._loaded) - set(desired):
@@ -593,7 +633,7 @@ async def reconcile(self, entries: Iterable[Entry | Mapping[str, Any]]) -> None:
             await self._dispose(loaded)
             await self._start(loaded, resolved.get(entry.id))
             continue
-        
+
         # 配置对比与增量更新
         config = self._config(entry)
         if self._config(previous) != config:
@@ -617,18 +657,46 @@ flowchart TD
     Affected --> MatchEntry[匹配到受影响的 Loader Entry]
     MatchEntry --> Backup[备份 sys.modules 与字节码缓存]
     Backup --> ReloadModule[清除缓存并重新 importlib.import_module]
-    
+
     ReloadModule --> Success{导入是否成功?}
     Success -- 成功 --> Reconcile[loader.reconcile 重新装载 Fiber]
     Success -- 失败 --> RollbackMod[回滚恢复 sys.modules 缓存]
-    
+
     Reconcile --> StartSuccess{新插件启动成功?}
     StartSuccess -- 成功 --> Commit[HMR 替换完成]
     StartSuccess -- 失败 --> RollbackFib[回滚恢复旧版本 Component 重新启动]
 ```
 
-#### AST 解析细节：[`hmr.py:54`](../src/cordis/hmr.py#L54)
+#### AST 解析细节：[`ModuleGraph._imports`](../src/cordis/hmr.py#L54)
 `ModuleGraph` 不执行模块代码（避免导入副作用），而是使用 `ast.parse` 扫描 `ast.Import` 与 `ast.ImportFrom`，计算相对导入的层级（`node.level`），精确还原依赖树。
+
+---
+
+### 3.8 类型化挂载与查询的执行路径
+
+类型化挂载与动态清单共享 Fiber 生命周期，入口有所区别：
+
+```mermaid
+flowchart LR
+    Raw["原始数据 object"] --> Decode["Component.decode：decoder 转成 ConfigT"]
+    Decode --> Bind["BoundComponent：组件与配置绑定"]
+    Config["已有 ConfigT"] --> Configure["Component.configure"]
+    Configure --> Bind
+    Bind --> Mount["Loader.mount：检查 id 冲突"]
+    Mount --> Use["BoundComponent._mount → ctx.use"]
+    Use --> Fiber["Fiber：返回类型化句柄，等待当前转换"]
+    Fiber --> Store["_mounted 只保存 FiberView"]
+```
+
+实现中先将 FiberView 存入 `_mounted`，再等待 fiber.wait；启动异常或调用方取消时移除本次记录并 dispose 后重新抛出。缺少依赖时 wait 仍可返回 PENDING。`unmount()` 移除指定条目，`close()` 清理 `_mounted` 和 `_loaded`；`reconcile()` 只处理后者，并在修改前拒绝与 mount 的 id 冲突。
+
+handle 在当前 Fiber 的 Sink 中注册查询处理器，重复键抛出 DuplicateQueryError。query 找到处理器后调用 `_Runtime._invoke`，复用通知的状态、load token 和 sink.open 检查，并把异步结果作为注册方任务管理。有效状态包括 LOADING 和 ACTIVE；无有效处理器返回 None，False 不触发短路跳过。查询不建立 committed 服务依赖。
+
+typed key 即使名为 `internal/error` 也只是普通身份键。异步调用的 source 只有字符串事件才保留字符串值，避免把同名业务键误当作内部错误事件并抑制错误上报。
+
+源码 HMR 仍以 `_loaded` 中的字符串定位符为入口，不扫描类型化 mount。重导入契约模块会生成新的 EventKey/QueryKey；需要共享键的模块必须使用同一版本的契约对象。
+
+验证这些边界时使用 [`test_typed_interfaces.py`](../tests/test_typed_interfaces.py) 检查运行时行为，以及 [`contracts.py`](../typing_tests/contracts.py) / [`invalid.py`](../typing_tests/invalid.py) 检查类型推断和错误用法拒绝。不能只看 mypy 是否通过实现源码，公开兜底 Any 也可能让错误调用通过。
 
 ---
 
@@ -668,29 +736,29 @@ sequenceDiagram
     P_Fib->>P_Fib: _set_state(UNLOADING)
     P_Fib->>RT: provider_leaving(self)
     RT->>C_Fib: notify(["db"]) -> fiber.refresh()
-    
+
     Note over C_Fib: 消费者计算 Target 变为 None<br/>进入 UNLOADING
     C_Fib->>C_Fib: _set_state(UNLOADING)
     C_Fib->>C_Fib: _scope.closed = True (拒绝新任务)
-    
+
     P_Fib->>P_Fib: await _drain_dependents() (挂起等待 C_Fib)
-    
+
     Note over C_Task: 消费者受管任务继续运行直到自然结束
     C_Task-->>C_Fib: Task 正常执行完毕
-    
+
     C_Fib->>C_Sink: 逆序执行消费者 cleanups
     C_Sink-->>C_Fib: 消费者资源释放完成
     C_Fib->>C_Fib: _set_state(PENDING)
-    
+
     Note over P_Fib: _drain_dependents() 唤醒！
     P_Fib->>P_Sink: 逆序执行提供者 cleanups (关闭旧 DB 连接)
     P_Sink-->>P_Fib: 提供者旧资源释放完成
-    
+
     Note over P_Fib: P_Fib 重新切入 LOADING，建立新 DB 连接
     P_Fib->>P_Fib: _set_state(ACTIVE)
     P_Fib->>RT: provider_active(self)
     RT->>C_Fib: notify(["db"]) -> fiber.refresh()
-    
+
     Note over C_Fib: 消费者检测到新 DB 已经就绪！<br/>重新切入 LOADING 并激活
     C_Fib->>C_Fib: _set_state(ACTIVE)
     P_Fib-->>Host: update() 返回成功
@@ -716,11 +784,11 @@ sequenceDiagram
     Sink->>Sink: actions.append(cleanup_A)
     Fib->>Task: ctx.spawn(worker_task)
     Sink->>Sink: tasks[task] = options
-    
+
     Note over Fib: 执行到一半抛出异常 ValueError!
     Fib->>Fib: 捕获异常，进入回滚逻辑
     Fib->>Sink: _dispose_actions(_scope)
-    
+
     par 并发停止未完任务
         Sink->>Task: task.cancel()
         Task-->>Sink: 等待 task 完成 finally
@@ -728,7 +796,7 @@ sequenceDiagram
         Sink->>Res: 执行 cleanup_A()
         Res-->>Sink: 资源 A 释放完成
     end
-    
+
     Fib->>Fib: committed.clear()
     Fib->>Fib: _set_state(FAILED)
     Fib->>Fib: runtime.report(error, self)
@@ -753,7 +821,7 @@ $$\forall t \in [\text{LOADING}, \text{UNLOADING\_END}], \quad \text{Fiber.commi
 
 $$\text{CurrentTask} \in \text{Fiber.tasks} \implies \text{CurrentTask CANNOT wait for Fiber teardown}$$
 
-- **代码实现**：[`core.py:868`](../src/cordis/core.py#L868) `assert_can_wait_for`。
+- **代码实现**：[`_Runtime.assert_can_wait_for`](../src/cordis/core.py#L953) `assert_can_wait_for`。
 - **解释**：受管任务不能调用 `await fiber.dispose()` 或 `await fiber.restart()`，也不能等待自身所依赖的父级/提供者 Fiber 的停机。
 - **原因**：停机操作会 `await` 该受管任务结束；若任务自身又在 `await` 停机完成，形成自反死锁（Self-Deadlock）。
 - **维护要求**：新增等待方法（如新的 join/flush API）时，必须显式调用 `assert_can_wait_for` 校验当前任务归属。
@@ -785,20 +853,20 @@ $$\text{Target mutated during LOADING} \implies \text{Complete step with inertia
 2026-09-10 审计确认了 8 个深层边界缺陷（参见 [`docs/bug-audit-2026-09-10.md`](bug-audit-2026-09-10.md)），维护者在修改相关模块时需特别注意：
 
 #### B01：换 Realm 破坏卸载依赖视图 (P1)
-- **位置**：[`core.py:997`](../src/cordis/core.py#L997)、[`core.py:1464`](../src/cordis/core.py#L1464)
+- **位置**：[`_Runtime.reassign_context_realms`](../src/cordis/core.py#L1056)、[`Context.service`](../src/cordis/core.py#L1558)
 - **机理**：`reassign_context_realms` 立即修改了上下文的 Realm，但消费者的 `committed_realms` 记录的是旧 Realm。随后执行 cleanup 读取服务时，`service()` 方法要求上下文当前 Realm 与 `committed_realms` 严格一致，导致抛出 `InactiveServiceError`。
 - **修复方向**：允许卸载/清理阶段读取快照中记录的历史 Realm。
 
 #### B02：dispose 与初始化失败并发竞态 (P2)
-- **位置**：[`core.py:755`](../src/cordis/core.py#L755)、[`core.py:785`](../src/cordis/core.py#L785)
+- **位置**：[`Fiber._drive`](../src/cordis/core.py#L804)、[`Fiber.dispose`](../src/cordis/core.py#L869)
 - **机理**：当 `dispose()` 在组件处于 `LOADING` 且正在等待外部事件时被调用，`desired` 被置为 `False`；随后初始化继续执行并抛出异常，进入 `except` 分支并将状态设为 `FAILED`，跳过了 `DISPOSED` 的迁移，导致 Fiber 残留在 `runtime.fibers` 中。
 
 #### B03：生成器初始化中断被误判为 MissingProvisionError (P1)
-- **位置**：[`core.py:702`](../src/cordis/core.py#L702)、[`core.py:754`](../src/cordis/core.py#L754)
+- **位置**：[`Fiber._check_provides`](../src/cordis/core.py#L781)、[`Fiber._drive`](../src/cordis/core.py#L804)
 - **机理**：生成器插件在 `yield` 之前如果因为超时取消或外部中断退出，`_execute` 提前结束，随后 `_check_provides()` 盲目断言服务是否存在。因插件中途退出尚未执行 `ctx.provide()`，误报为“声明了但未提供服务”，掩盖了真实的取消异常。
 
 #### B04 / B05：HMR 回滚与取消缺陷 (P1)
-- **位置**：[`hmr.py:228`](../src/cordis/hmr.py#L228)
+- **位置**：[`HotReloader._restore_modules`](../src/cordis/hmr.py#L234)
 - **机理**：B04 回滚只恢复了 `sys.modules`，没有恢复父包模块对象上的属性（如 `parent_pkg.child_mod` 仍指向旧引用）；B05 在等待重载时如果外部 Task 被 cancel，`except BaseException` 没有完整执行恢复逻辑。
 
 ---
@@ -832,5 +900,6 @@ uv run python docs/repros/bug_audit_20260910.py --strict -v
 cd python
 uv run mypy                                   # 严格模式类型检查
 uv run ruff check src tests examples          # 代码风格与语法检查
-uv run python -m unittest discover -v         # 73 项全量单元测试
+uv run python -m unittest discover -v         # 全量运行时与类型契约测试
+uv run python -m examples.typed_interfaces    # 类型化挂载、通知和查询
 ```

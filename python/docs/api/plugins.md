@@ -54,6 +54,23 @@ Component[ConfigT, ContextT](
 
 可读取 `apply`、`inject`、`provide`、`name`、`validate`、`update`。`inject` 规范化为以字符串服务名为键的只读映射，`provide` 规范化为 `frozenset[str]`。
 
+### configure / decode / BoundComponent
+
+```python
+def configure(config: ConfigT) -> BoundComponent[ConfigT, ContextT]: ...
+
+async def decode(
+    raw: object,
+    decoder: Callable[[object], ConfigT | Awaitable[ConfigT]],
+) -> BoundComponent[ConfigT, ContextT]: ...
+```
+
+`component.configure(config)` 在类型化入口绑定插件与配置，返回不可变的 `BoundComponent`，不会激活插件或调用 validate。通过 `await loader.mount(id, binding)` 挂载后仍得到 `Fiber[ConfigT, ContextT]`，详见 [Loader.mount](loader.md#mount--unmount)。
+
+外部数据先用 `await component.decode(raw, decoder)` 转换，再得到相同的绑定对象。decoder 可同步或异步，只在这次 decode 调用中执行一次；异常直接传播，尚未创建挂载。`validate` 仍处理已转换的 `ConfigT`，在激活或更新时按原规则调用。
+
+`BoundComponent.component` 与 `.config` 只读，配置对象本身不会被深拷贝或冻结。配置类型不变；Context 参数逆变，接收基础 Context 的插件可在其子类中运行，要求特定子类的插件不能挂到基础 Context。
+
 ### Plugin
 
 `Plugin[ContextT, ConfigT]` 是描述对象式插件的 Protocol，泛型顺序与 Component 不同：
@@ -111,13 +128,13 @@ ctx.inject(dependencies, callback, config=None) -> Fiber[ConfigT, ContextT]
 
 ## Fiber
 
-由 `ctx.use()`、`ctx.inject()` 或 `Loader.get()` 获取。应用代码不需要直接构造 Fiber；它的构造函数依赖内部 Runtime。
+由 `ctx.use()`、`ctx.inject()` 或 `await Loader.mount()` 获取类型化 Fiber；`Loader.get()` 返回 [FiberView](#fiberview)。应用代码不需要直接构造 Fiber；它的构造函数依赖内部 Runtime。
 
 ### 常用属性
 
 | 属性 | 类型 | 含义 |
 | --- | --- | --- |
-| `ctx` | `ContextT` | 本次挂载传入插件的 Context |
+| `ctx` | `ContextT` | 本次挂载传入插件的 Context，只读 |
 | `parent` | `ContextT` | 调用 `use()` 的父 Context |
 | `component` | `Component[ConfigT, ContextT] \| None` | 插件定义；根 Fiber 为 `None` |
 | `config` | `ConfigT` | 当前记录的配置，包括校验器规范化后的值 |
@@ -127,7 +144,7 @@ ctx.inject(dependencies, callback, config=None) -> Fiber[ConfigT, ContextT]
 | `inject` | `Mapping[str, object]` | 规范化后的依赖声明 |
 | `error` | `Exception \| None` | 初始化错误；受管后台任务失败查看 `ctx.errors` |
 | `cleanup_error` | `ExceptionGroup \| None` | 最近卸载阶段收集的清理错误 |
-| `tasks` | `tuple[asyncio.Task[Any], ...]` | 本 Fiber 尚未完成的受管任务快照，包括嵌套 Effect 的任务 |
+| `tasks` | `tuple[asyncio.Task[object], ...]` | 本 Fiber 尚未完成的受管任务快照，包括嵌套 Effect 的任务；单次 spawn 返回值仍保留 Task[T] |
 
 这些属性供读取和诊断。生命周期操作使用以下方法；不要直接写 `state` 或原地修改 `config` 来更新插件。
 
@@ -181,6 +198,14 @@ def refresh() -> None: ...
 高级接口：重新计算当前依赖与目标状态，必要时安排转换；立即返回，不等待。它不会替代 `restart()` 清除失败状态。通常使用 `ctx.notify(...)` 通知服务可用性变化，无需直接调用它。
 
 受管任务不能等待自身、父插件或依赖服务的卸载、重启等转换，否则会形成自等待并抛出 `InactiveContextError`。这些管理操作由宿主发起。
+
+## FiberView
+
+`FiberView[ContextT]` 是动态管理入口的只读属性协议。`ctx.fiber`、`ctx.fibers`、`ctx.errors` 的错误归属及 `Loader.get()` / `reload()` 返回它；读取配置得到 object，读取 Context 保留可知的 Context 类型。
+
+可读取 `ctx`、`config`、`component`、`uid`、`name`、`state`、`inject`、`error`、`cleanup_error` 和 `tasks`；可调用 `dispose()`、`restart()`、`wait()` 并直接 `await view`。等待返回的仍是视图，不能借此获得无约束的 `update()`。需要更新配置时保存 `ctx.use()` 或 `Loader.mount()` 返回的类型化 Fiber；`Fiber.ctx` 本身也只读。
+
+视图不创建包装对象，运行时仍是同一个 Fiber。它约束静态接口，不深度冻结配置，也不是禁止未检查 Python 代码访问 Fiber 的运行时屏障。
 
 ## FiberState
 

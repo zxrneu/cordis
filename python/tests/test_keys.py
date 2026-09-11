@@ -118,6 +118,27 @@ class KeyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(ctx.count, 8)
             await loader.close()
 
+    async def test_adapter_uses_current_value_and_reading_context(self):
+        seen = []
+
+        def adapt(value: int, metadata: object, consumer: Context) -> int:
+            assert isinstance(metadata, int)
+            seen.append((value, metadata, consumer))
+            return value + metadata
+
+        async with Context() as ctx:
+            ctx.provide(COUNT, 1, adapt=adapt)
+            view = ctx.intercept(COUNT, 3)
+            self.assertEqual(view[COUNT], 4)
+            ctx.set(COUNT, 5)
+            self.assertEqual(view[COUNT], 8)
+            self.assertEqual(seen, [(1, 3, view), (5, 3, view)])
+
+            # String services retain their dynamic result type, including an
+            # adapter that returns a different type from the stored value.
+            ctx.provide("label", 7, adapt=lambda value, _metadata, _ctx: str(value))
+            self.assertEqual(ctx.get("label"), "7")
+
     async def test_generic_component_can_be_constructed_explicitly(self):
         component = Component[CounterConfig, AppContext](counter.apply, provide=[COUNT])
         async with AppContext() as ctx:

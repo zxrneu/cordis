@@ -6,7 +6,10 @@ from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from typing import Protocol, TypedDict, assert_type
 
-from cordis import Component, Context, EffectHandle, Fiber, ServiceKey, plugin
+from cordis import (
+    BoundComponent, Component, Context, EffectHandle, Entry, EventKey, Fiber,
+    FiberView, Loader, QueryKey, ServiceKey, plugin,
+)
 
 
 class Greeter(Protocol):
@@ -15,6 +18,25 @@ class Greeter(Protocol):
 
 GREETER = ServiceKey[Greeter]("greeter")
 COUNT = ServiceKey[int]("count")
+MESSAGE = EventKey[str]("message")
+FIND_USER = QueryKey[int, str]("find_user")
+ALLOWED = QueryKey[int, bool]("allowed")
+
+
+def handle_message(message: str) -> None:
+    pass
+
+
+async def handle_message_async(message: str) -> None:
+    pass
+
+
+def find_user(user_id: int) -> str | None:
+    return str(user_id)
+
+
+async def find_user_async(user_id: int) -> str | None:
+    return str(user_id)
 
 
 class AppContext(Context):
@@ -48,6 +70,16 @@ def consumer(ctx: AppContext, _config: None) -> None:
 
 def validate(config: GreeterConfig) -> GreeterConfig:
     return config
+
+
+def decode_config(raw: object) -> GreeterConfig:
+    if not isinstance(raw, str):
+        raise ValueError("expected a prefix string")
+    return {"prefix": raw}
+
+
+async def decode_config_async(raw: object) -> GreeterConfig:
+    return decode_config(raw)
 
 
 @plugin(validate=validate)
@@ -148,6 +180,58 @@ async def verify() -> None:
         assert_type(ctx.provide(COUNT, 1), EffectHandle)
         ctx.set(COUNT, 2)
         assert_type(ctx.spawn(asyncio.sleep(0, result=42)), asyncio.Task[int])
+        assert_type(ctx.fiber, FiberView[AppContext])
+        assert_type(await ctx.fiber, FiberView[AppContext])
+        assert_type(await ctx.fiber.wait(), FiberView[AppContext])
+        assert_type(ctx.fiber.ctx, AppContext)
+        assert_type(ctx.fiber.ctx[COUNT], int)
+        assert_type(ctx.fiber.config, object)
+        assert_type(ctx.fiber.tasks, tuple[asyncio.Task[object], ...])
+        assert_type(ctx.fibers, tuple[FiberView[Context], ...])
+        assert_type(
+            ctx.errors, tuple[tuple[Exception, FiberView[Context] | None], ...]
+        )
+        for mounted in ctx.fibers:
+            assert_type(mounted.ctx, Context)
+            assert_type(mounted.ctx[COUNT], int)
+        loader = Loader(ctx)
+        loaded = loader.get("greeter")
+        assert_type(loaded, FiberView[AppContext] | None)
+        if loaded is not None:
+            assert_type(loaded.ctx, AppContext)
+            assert_type(loaded.ctx[COUNT], int)
+        assert_type(await loader.reload("greeter"), FiberView[AppContext])
+        binding = greeter.configure(config)
+        assert_type(binding, BoundComponent[GreeterConfig, AppContext])
+        assert_type(await greeter.decode("hi", decode_config), BoundComponent[GreeterConfig, AppContext])
+        assert_type(await greeter.decode("hi", decode_config_async), BoundComponent[GreeterConfig, AppContext])
+        mounted_typed = await loader.mount("bound", binding)
+        assert_type(mounted_typed, Fiber[GreeterConfig, AppContext])
+        await mounted_typed.update(config)
+        assert_type(await loader.mount("base", validated.configure(config)), Fiber[GreeterConfig, AppContext])
+        await loader.unmount("bound")
+        entry = Entry("greeter", greeter, config, intercept={"count": 1})
+        assert_type(entry.intercept["count"], object)
+        metadata = entry.intercept["count"]
+        if isinstance(metadata, int):
+            assert_type(metadata.bit_length(), int)
+        answer = ctx.bail("answer")
+        assert_type(answer, object)
+        if isinstance(answer, int):
+            assert_type(answer.bit_length(), int)
+        assert_type(await ctx.serial("answer"), object)
+        assert_type(ctx.waterfall("answer", final=lambda: 1), object)
+        assert_type(ctx.on(MESSAGE, handle_message), EffectHandle)
+        assert_type(ctx.on(MESSAGE, handle_message_async), EffectHandle)
+        assert_type(ctx.once(MESSAGE, handle_message), EffectHandle)
+        ctx.emit(MESSAGE, "hello")
+        await ctx.parallel(MESSAGE, "hello")
+        assert_type(ctx.handle(FIND_USER, find_user), EffectHandle)
+        assert_type(ctx.handle(FIND_USER, find_user_async), EffectHandle)
+        assert_type(await ctx.query(FIND_USER, 1), str | None)
+        ctx.handle(ALLOWED, lambda user_id: False)
+        assert_type(await ctx.query(ALLOWED, 1), bool | None)
+        ctx.provide("numeric", 1, adapt=lambda value, metadata, ctx: value + 1)
         assert_type(await ctx.effect(resource), EffectHandle)
         assert_type(await ctx.effect(async_resource), EffectHandle)
 

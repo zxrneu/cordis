@@ -103,11 +103,14 @@ Cordis 的运行逻辑紧紧围绕三要素运转：
 classDiagram
     class Context {
         +use(component, config) Fiber
+        +fiber: FiberView
         +provide(key, service) EffectHandle
         +inject(dependencies, callback) Fiber
         +spawn(awaitable, policy, timeout) Task
         +on(event, callback) EffectHandle
         +emit(event, *args)
+        +handle(key, callback) EffectHandle
+        +query(key, request) Result
         +isolate(*names) Context
         +intercept(name, metadata) Context
     }
@@ -117,6 +120,8 @@ classDiagram
         +provide: frozenset
         +validate: Callable
         +update: Callable
+        +configure(config) BoundComponent
+        +decode(raw, decoder) BoundComponent
     }
     class Fiber {
         +state: FiberState
@@ -130,6 +135,22 @@ classDiagram
         +name: str
         +__get__(ctx): T
     }
+    class FiberView {
+        +state: FiberState
+        +config: object
+        +restart()
+        +dispose()
+        +wait()
+    }
+    class Loader {
+        +mount(id, binding) Fiber
+        +get(id) FiberView
+        +unmount(id)
+        +reconcile(entries)
+    }
+    Component --> BoundComponent : configure / decode
+    Loader --> BoundComponent : mount
+    Fiber ..|> FiberView : 只读属性协议
     Context "1" o-- "1" Fiber : 绑定/派生
     Context --> Component : use / 装配
     Fiber --> Component : 运行实例
@@ -150,11 +171,15 @@ classDiagram
 - 可选包含 `validate`（配置校验逻辑）和 `update`（配置原地更新钩子）。
 - **同一个 Component 可以被多次 `use()`**，每一次挂载都生成一个独立的运行实例。
 
+代码内交给 Loader 装配时，先 `component.configure(config)` 得到 BoundComponent，再 `await loader.mount(id, binding)`。外部配置先 `await component.decode(raw, decoder)` 转为业务配置；两种方式都保留配置与 Context 的类型关系，尚未挂载时不会执行 validate 或初始化。
+
 ### 2.3 Fiber（纤程）：活态生命周期句柄
 
 `Fiber` 是 `Component` 挂载到 `Context` 后生成的动态运行实例：
 - 拥有独立的状态机（`FiberState`）：`PENDING`、`LOADING`、`ACTIVE`、`FAILED`、`UNLOADING`、`DISPOSED`。
-- 是操作插件生命周期的唯一句柄：通过 `await fiber` 等待就绪，调用 `await fiber.update(new_cfg)` 热更配置，调用 `await fiber.dispose()` 主动卸载。
+- `ctx.use()` 与 `Loader.mount()` 返回 Fiber[ConfigT, ContextT]：调用 update 时检查 ConfigT，dispose 时卸载。`await fiber` 等待当前生命周期转换，缺少依赖时仍可返回 PENDING。
+
+`ctx.fiber`、运行时列表、错误归属和 `loader.get/reload` 返回 FiberView。它的属性只读，支持等待、重启和卸载，静态接口没有 update。业务更新应保存挂载返回的类型化 Fiber；视图不是运行时包装或配置深拷贝。迁移例子见[类型化运行接口迁移](migration-typed-interfaces.md)。
 
 ### 2.4 Service 与 ServiceKey：强类型契约
 
@@ -405,7 +430,7 @@ def worker_plugin(ctx: Context, _config: None) -> None:
 
 ### 3.7 事件总线全景：广播、并行、短路与流水线
 
-Cordis 内置了极其灵活的高级事件调度体系，所有事件监听器都会随着插件卸载而**自动解除绑定**：
+Cordis 的通知和查询注册随所属插件或 Effect 清理。类型化通知使用 EventKey，单处理器查询使用 QueryKey；字符串事件继续支持多参数和动态派发策略：
 
 | 方法 | 调度方式 | 适用场景 |
 | :--- | :--- | :--- |
@@ -414,8 +439,39 @@ Cordis 内置了极其灵活的高级事件调度体系，所有事件监听器�
 | `await ctx.serial(name, *args)` | **串行短路（Sequential Fallback）** | 顺序执行异步监听器，一旦某个监听器返回非 `None`/非 `False` 即刻终止并返回该值。 |
 | `ctx.bail(name, *args)` | **同步短路（Sync Fast-Path）** | 必须由同步函数处理，首个命中有效结果的监听器截断后续分发。 |
 | `ctx.waterfall(name, *args, final=...)` | **流水线/洋葱圈（Pipeline）** | 类似 Express/Koa 中间件链，每个监听器接收 `next` 闭包并传递修改后的参数。 |
+| `await ctx.query(key, request)` | **类型化单处理器查询** | QueryKey 关联请求与结果，返回 Result 或 None；False 是正常结果。 |
 
-#### 事件示例
+#### 类型化通知与查询
+
+下面的定义放在共享契约模块，调用方与注册方导入同一组键：
+
+```python
+from cordis import Context, EventKey, QueryKey
+
+ORDER_CREATED = EventKey[str]("order/created")
+FIND_ORDER = QueryKey[str, int]("order/amount")
+
+
+async def example(ctx: Context) -> None:
+    def announce(order_id: str) -> None:
+        print(f"订单 {order_id} 创建")
+
+    async def find_amount(order_id: str) -> int | None:
+        return 5000 if order_id == "ORD-001" else None
+
+    ctx.on(ORDER_CREATED, announce)
+    ctx.handle(FIND_ORDER, find_amount)
+    await ctx.parallel(ORDER_CREATED, "ORD-001")
+    amount = await ctx.query(FIND_ORDER, "ORD-001")
+    if amount is not None:
+        print(amount / 100)
+```
+
+EventKey 用于 on/once 与 emit/parallel，只有一个 payload 参数，回调没有业务返回值；多个字段可放进 dataclass。QueryKey 通过 handle 注册，单个运行时每个键只允许一个处理器，重复注册抛出 DuplicateQueryError。无有效处理器时 query 返回 None。
+
+这两种键按对象身份匹配，同名的新键及字符串事件都不会互通；与 ServiceKey 的字符串名路由不同。异步通知、查询任务均归注册方作用域，支持 task_policy 和卸载 timeout。查询不建立服务依赖，也不提供 Realm 路由。完整可运行示例见 [`typed_interfaces.py`](../examples/typed_interfaces.py)。
+
+#### 字符串事件示例
 ```python
 from cordis import Context
 
@@ -431,6 +487,8 @@ ctx.on("order/verify", lambda order: "用户被封禁" if order["user"] == "blac
 reason = ctx.bail("order/verify", {"amount": 5000, "user": "normal"})
 print("校验拦截:", reason)  # 输出: 金额超限
 ```
+
+serial、bail、waterfall 的结果为 object；读取结果成员前要收窄。字符串事件仍可运行，但检查器不能关联名称和参数类型。QueryKey 的单处理器与 False 返回规则不同，不能直接替换原有多监听器短路链。
 
 ---
 
@@ -627,7 +685,7 @@ ctx.provide("logger", BaseLogger(), adapt=adapt_logger)
 
 ### 4.8 声明式配置增量调和：`Loader.reconcile`
 
-`Loader` 是驱动 Cordis 应用实现“动态配置中心”的关键。它借鉴了声明式 UI（如 React Fiber）的 **Reconcile（调和）** 思想：
+`Loader` 同时提供类型化挂载和动态清单管理。代码内装配用 `await loader.mount(id, component.configure(config))`，保存返回 Fiber 来检查后续 update 的配置；外部数据可先 `await component.decode(raw, decoder)`。需要完整配置清单、停用项、children 分组和字符串定位符时使用 reconcile：
 
 ```python
 from cordis import Entry, Loader
@@ -645,10 +703,14 @@ await loader.reconcile([
 调和算法执行流程：
 1. **删除（Prune）**：存在于旧列表但不存在于新列表中的 Entry，执行 `await fiber.dispose()`。
 2. **新增（Mount）**：新出现在列表中的 Entry，解析其 locator 字符串并执行 `ctx.use()`。
-3. **原地更新（Update）**：如果插件未变但 `config` 发生变化，调用 `await fiber.update(new_config)`。
+3. **配置更新（Update）**：如果插件未变但 `config` 发生变化，调用 `await fiber.update(new_config)`；默认重启插件，自定义 update hook 才执行原地更新。
 4. **属性热更（Patch）**：增量同步 `isolate` 隔离配置与 `intercept` 拦截参数。
 
+Entry 不保留插件与配置的静态关联，原始配置仍需边界校验。mount 条目不进入 entries，不被 reconcile([]) 删除；unmount(id) 与 close() 可以清理两种入口的条目。id 冲突在修改前拒绝，其他清单更新仍是增量执行，不能保证全局事务。管理操作应由宿主串行协调。
+
 ### 4.9 源码级模块热替换：`HMR` 与 `ModuleGraph`
+
+源码 HMR 只处理动态 Entry 的字符串定位符。类型化 mount 的 reload(id) 重启已有组件定义；两种入口的 get/reload 均返回 FiberView。事件键所在的共享契约模块应保持稳定，或与所有通信参与方共同更新，避免重导入产生新键身份。
 
 Cordis 包含真正针对 Python 代码文件的源码级热替换引擎（[`src/cordis/hmr.py`](../src/cordis/hmr.py)）：
 1. **AST 静态分析**：`ModuleGraph` 在启动时扫描模块源码的 AST 抽象语法树，精准解析 `import` 与 `from ... import ...`，建立模块之间的有向无环依赖图。
@@ -819,4 +881,5 @@ InactiveContextError: a managed task cannot wait for teardown of its own scope o
 - [API 完整参考手册](api.md)
 - [核心概念深度图解](core-concepts.md)
 - [类型化插件开发与 Mypy 规范](typing.md)
+- [FiberView、事件键与 Loader 绑定迁移](migration-typed-interfaces.md)
 - [运行时实现与维护参考](implementation.md)
