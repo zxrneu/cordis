@@ -5,12 +5,138 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from cordis import Context, Entry, FiberState, FullRestartRequired, HotReloader, Loader
+from cordis import (
+    Context,
+    Entry,
+    FiberState,
+    FullRestartRequired,
+    HotReloader,
+    Loader,
+    plugin,
+)
 from . import test_regressions
 
 
 class HMRFailurePaths(unittest.IsolatedAsyncioTestCase):
     asyncSetUp = test_regressions.HMRAudit.asyncSetUp
+
+    async def test_consumer_failure_rolls_back_provider_and_recovers_consumers(self):
+        seen = []
+
+        @plugin(inject=["version"], provide=["derived"])
+        def consumer(ctx, config):
+            seen.append(ctx.version)
+            if ctx.version == "v2":
+                raise ValueError("consumer rejects v2")
+            ctx.provide("derived", ctx.version)
+
+        @plugin(inject=["derived"])
+        def downstream(ctx, config):
+            self.assertEqual(ctx.derived, "v1")
+
+        async with Context() as root:
+            loader = Loader(root)
+            await loader.reconcile([
+                Entry("app", f"{self.module}:app"),
+                Entry("consumer", consumer),
+                Entry("downstream", downstream),
+            ])
+            old_module = sys.modules[self.module]
+            self.path.write_text(test_regressions.module_source("v2"), encoding="utf-8")
+            with self.assertRaisesRegex(ExceptionGroup, "hot reload failed"):
+                await loader.reload("app")
+            self.assertEqual(root.get("version"), "v1")
+            self.assertEqual(root.get("derived"), "v1")
+            self.assertEqual(seen, ["v1", "v2", "v1"])
+            self.assertIs(sys.modules[self.module], old_module)
+            for entry_id in ("app", "consumer", "downstream"):
+                self.assertEqual(loader.get(entry_id).state, FiberState.ACTIVE)
+
+    async def test_transitive_consumer_outside_loader_is_recovered(self):
+        @plugin(inject=["version"], provide=["derived"])
+        def intermediate(ctx, config):
+            ctx.provide("derived", ctx.version)
+
+        @plugin(inject=["derived"])
+        def consumer(ctx, config):
+            if ctx.derived == "v2":
+                raise ValueError("downstream rejects v2")
+
+        async with Context() as root:
+            loader = Loader(root)
+            await loader.reconcile([Entry("app", f"{self.module}:app")])
+            middle = await root.use(intermediate)
+            last = await root.use(consumer)
+            self.path.write_text(test_regressions.module_source("v2"), encoding="utf-8")
+            with self.assertRaisesRegex(ExceptionGroup, "hot reload failed"):
+                await loader.reload("app")
+            self.assertEqual(root.get("version"), "v1")
+            self.assertEqual(middle.state, FiberState.ACTIVE)
+            self.assertEqual(last.state, FiberState.ACTIVE)
+
+    async def test_unrelated_existing_failure_does_not_block_reload(self):
+        def broken(ctx, config):
+            raise ValueError("existing failure")
+
+        async with Context() as root:
+            failed = root.use(broken)
+            with self.assertRaisesRegex(ValueError, "existing failure"):
+                await failed
+            error = failed.error
+            loader = Loader(root)
+            await loader.reconcile([Entry("app", f"{self.module}:app")])
+            self.path.write_text(test_regressions.module_source("v2"), encoding="utf-8")
+            await loader.reload("app")
+            self.assertEqual(root.get("version"), "v2")
+            self.assertIs(failed.error, error)
+            self.assertEqual(failed.state, FiberState.FAILED)
+
+    async def test_newly_available_consumer_failure_restores_pending_state(self):
+        self.path.write_text(
+            test_regressions.module_source("v1").replace(
+                "ctx.provide('version', VERSION)",
+                "ctx.provide('version', VERSION, check=lambda ctx: False)",
+            ),
+            encoding="utf-8",
+        )
+
+        @plugin(inject=["version"])
+        def consumer(ctx, config):
+            raise ValueError("newly activated consumer failed")
+
+        async with Context() as root:
+            loader = Loader(root)
+            await loader.reconcile([Entry("app", f"{self.module}:app")])
+            fiber = await root.use(consumer)
+            self.assertEqual(fiber.state, FiberState.PENDING)
+            self.path.write_text(test_regressions.module_source("v2"), encoding="utf-8")
+            with self.assertRaisesRegex(ExceptionGroup, "hot reload failed"):
+                await loader.reload("app")
+            self.assertEqual(fiber.state, FiberState.PENDING)
+            self.assertIsNone(fiber.error)
+
+    async def test_consumer_recovery_failure_is_reported(self):
+        attempts = []
+
+        @plugin(inject=["version"])
+        def consumer(ctx, config):
+            attempts.append(ctx.version)
+            if len(attempts) > 1:
+                raise ValueError("consumer failed: " + ctx.version)
+
+        async with Context() as root:
+            loader = Loader(root)
+            await loader.reconcile([Entry("app", f"{self.module}:app")])
+            fiber = await root.use(consumer)
+            self.path.write_text(test_regressions.module_source("v2"), encoding="utf-8")
+            with self.assertRaisesRegex(
+                ExceptionGroup, "hot reload and rollback both failed"
+            ) as raised:
+                await loader.reload("app")
+            self.assertEqual(attempts, ["v1", "v2", "v1"])
+            self.assertEqual(root.get("version"), "v1")
+            self.assertIn(fiber.error, raised.exception.exceptions)
+            self.assertEqual(str(fiber.error), "consumer failed: v1")
 
     async def asyncTearDown(self):
         for name in list(sys.modules):

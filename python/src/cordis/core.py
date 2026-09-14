@@ -1105,20 +1105,18 @@ class _Runtime:
                 return None
         return service
 
-    def provided_names(self, fiber: Fiber[Any, Any]) -> set[str]:
-        return {
-            service.name for service in self.services.values() if service.fiber is fiber
-        }
-
     def notify(self, ctx: "Context", names: Iterable[str]) -> list[Fiber[Any, Any]]:
-        names = set(names)
+        return self._notify_realms((name, ctx._realm(name)) for name in set(names))
+
+    def _notify_realms(
+        self, realms: Iterable[tuple[str, object]]
+    ) -> list[Fiber[Any, Any]]:
+        realms = tuple(realms)
         affected: list[Fiber[Any, Any]] = []
         for fiber in self.fibers.copy():
-            if not names.intersection(fiber.inject):
-                continue
             if not any(
-                fiber.ctx._realm(name) is ctx._realm(name)
-                for name in names
+                fiber.ctx._realm(name) is realm
+                for name, realm in realms
                 if name in fiber.inject
             ):
                 continue
@@ -1140,17 +1138,23 @@ class _Runtime:
         return result
 
     def provider_leaving(self, fiber: Fiber[Any, Any]) -> None:
-        names = self.provided_names(fiber)
-        if names:
-            self.notify(fiber.ctx, names)
+        # A fiber may publish through derived contexts, including several
+        # realms for the same name. Notify the actual registration realms.
+        self._notify_realms(
+            (service.name, service.realm)
+            for service in self.services.values()
+            if service.fiber is fiber
+        )
         for child in self.fibers.copy():
             if child.parent._fiber is fiber:
                 child.refresh()
 
     def provider_active(self, fiber: Fiber[Any, Any]) -> None:
-        names = self.provided_names(fiber)
-        if names:
-            self.notify(fiber.ctx, names)
+        self._notify_realms(
+            (service.name, service.realm)
+            for service in self.services.values()
+            if service.fiber is fiber
+        )
         for child in self.fibers.copy():
             if child.parent._fiber is fiber:
                 child.refresh()
@@ -1345,7 +1349,10 @@ class Context:
         if realm is not None and len(names) != 1:
             raise ValueError("an explicit realm can isolate exactly one service")
         return self._derive(
-            realms={_service_name(name): realm or object() for name in names}
+            realms={
+                _service_name(name): object() if realm is None else realm
+                for name in names
+            }
         )
 
     def intercept(self, name: ServiceName, metadata: object) -> Self:

@@ -8,9 +8,9 @@ import sys
 from collections.abc import Iterable
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Generic
+from typing import TYPE_CHECKING, Any, Generic
 
-from .core import ContextT, FiberState
+from .core import ContextT, Fiber, FiberState
 
 if TYPE_CHECKING:
     from .loader import Loader
@@ -238,6 +238,28 @@ class HotReloader(Generic[ContextT]):
         old_components = {
             entry_id: self.loader._loaded[entry_id].component for entry_id in entry_ids
         }
+        # Capture committed dependencies before teardown clears them. Include
+        # consumers outside this Loader and descendants of affected components.
+        affected = self._affected_fibers(
+            loaded.fiber for loaded in loaded_items if loaded.fiber is not None
+        )
+        previous_errors = {
+            fiber: fiber.error for fiber in self.loader.ctx._runtime.fibers
+        }
+
+        def new_failures() -> dict[Fiber[Any, Any], Exception]:
+            affected.update(
+                self._affected_fibers(
+                    loaded.fiber for loaded in loaded_items if loaded.fiber is not None
+                )
+            )
+            return {
+                fiber: fiber.error
+                for fiber in affected
+                if fiber.state is FiberState.FAILED
+                and fiber.error is not None
+                and fiber.error is not previous_errors.get(fiber)
+            }
 
         await asyncio.to_thread(importlib.invalidate_caches)
         cached_files = [
@@ -275,15 +297,9 @@ class HotReloader(Generic[ContextT]):
                 if loaded.entry.enabled:
                     await self.loader._start(loaded, component)
             await self.loader.ctx.flush()
-            failures = [
-                loaded.fiber.error
-                for loaded in loaded_items
-                if loaded.fiber is not None
-                and loaded.fiber.state is FiberState.FAILED
-                and loaded.fiber.error is not None
-            ]
+            failures = new_failures()
             if failures:
-                raise ExceptionGroup("hot reload failed", failures)
+                raise ExceptionGroup("hot reload failed", list(failures.values()))
         except BaseException as reload_error:
             disposed = await asyncio.gather(
                 *(self.loader._dispose(loaded) for loaded in loaded_items),
@@ -302,19 +318,52 @@ class HotReloader(Generic[ContextT]):
                 except Exception as error:
                     rollback_errors.append(error)
             await self.loader.ctx.flush()
-            rollback_errors.extend(
-                loaded.fiber.error
-                for loaded in loaded_items
-                if loaded.fiber is not None
-                and loaded.fiber.state is FiberState.FAILED
-                and loaded.fiber.error is not None
-            )
+            # FAILED consumers do not reactivate on provider notifications.
+            # Restart only pre-existing consumers newly failed by this reload;
+            # replaced fibers and their disposed children must stay disposed.
+            for fiber in previous_errors:
+                if (
+                    fiber in affected
+                    and fiber.desired
+                    and fiber.state is FiberState.FAILED
+                    and fiber.error is not previous_errors[fiber]
+                ):
+                    try:
+                        await fiber.restart()
+                    except Exception:
+                        # Collect the final error below, once the graph settles.
+                        pass
+            await self.loader.ctx.flush()
+            rollback_errors.extend(new_failures().values())
             if rollback_errors:
                 raise BaseExceptionGroup(
                     "hot reload and rollback both failed",
                     [reload_error, *rollback_errors],
                 ) from reload_error
             raise reload_error
+
+    def _affected_fibers(
+        self, roots: Iterable[Fiber[Any, Any]]
+    ) -> set[Fiber[Any, Any]]:
+        affected = set(roots)
+        runtime = self.loader.ctx._runtime
+        while True:
+            dependents = {
+                fiber
+                for fiber in runtime.fibers
+                if fiber.parent._fiber in affected
+                or any(service.fiber in affected for service in fiber.committed.values())
+                # Pending/failed consumers have no committed dependency view.
+                # Match registrations without evaluating availability predicates.
+                or any(
+                    service is not None and service.fiber in affected
+                    for name in fiber.inject
+                    for service in (runtime.services.get(fiber.ctx._realm(name)),)
+                )
+            }
+            if dependents <= affected:
+                return affected
+            affected.update(dependents)
 
     async def watch(
         self,
