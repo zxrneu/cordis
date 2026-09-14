@@ -1,0 +1,20 @@
+# 配置文件支持绝对路径或相对于本配置文件的相对路径
+
+[database]
+# 存储提供方: 可在运行中修改为 "memory" 或 "sqlite" 观察热替换
+provider = "sqlite"
+path = "var/orders.sqlite3"
+
+[validation]
+# 金额上限: 可在运行中修改为 "100.00"，观察先前被拒订单自动补录
+max_amount = "50.00"
+
+[importer]
+# 待扫描的 CSV 存放目录
+directory = "incoming"
+# 轮询扫描间隔 (秒)
+interval = 0.5
+
+[logging]
+# 控制台日志开关: 修改为 false 可动态关闭打印
+enabled = true

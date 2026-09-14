@@ -53,8 +53,8 @@ async function main() {
 
   // 派生两个相互隔离的上下文分枝
   // 每个分枝下的 'storage' 服务均拥有独立的 Realm 标记
-  const tenantA = root.isolate('storage')
-  const tenantB = root.isolate('storage')
+  const tenantA: Context = root.isolate('storage')
+  const tenantB: Context = root.isolate('storage')
 
   console.log('-> 为租户 A 挂载专属 StorageService (SQLite 模拟)...')
   tenantA.plugin(StorageService, 'Tenant-A-SQLite')
