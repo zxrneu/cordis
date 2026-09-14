@@ -422,6 +422,30 @@ async def _await(value: T | Awaitable[T]) -> T:
     return cast(T, await value) if inspect.isawaitable(value) else value
 
 
+async def _settle(awaitable: Awaitable[T], *, name: str) -> T:
+    """Finish a mutation, including its recovery, before propagating cancellation."""
+
+    async def run() -> T:
+        return await awaitable
+
+    task = asyncio.create_task(run(), name=name)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError as cancelled:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        try:
+            task.result()
+        except BaseException as error:
+            raise cancelled from error
+        raise
+
+
 async def _dispose_actions(sink: _Sink, label: str) -> None:
     # All work in this effect tree must settle before any resources are undone,
     # including resources registered after a background task was started.
@@ -458,6 +482,8 @@ async def _execute(
 ) -> None:
     token = _collector.set(sink)
     iterator: Iterator[object] | AsyncIterator[object] | None = None
+    exhausted = False
+    failure: Exception | asyncio.CancelledError | None = None
     try:
         value = callback()
         if inspect.isawaitable(value) and not isinstance(value, AsyncIterable):
@@ -482,6 +508,7 @@ async def _execute(
                 try:
                     item = await anext(iterator)
                 except StopAsyncIteration:
+                    exhausted = True
                     break
                 _collect_value(item, sink)
             return
@@ -492,6 +519,7 @@ async def _execute(
                 try:
                     item = next(iterator)
                 except StopIteration:
+                    exhausted = True
                     break
                 _collect_value(item, sink)
             return
@@ -509,14 +537,30 @@ async def _execute(
                 return
 
         _collect_value(value, sink)
+    except (Exception, asyncio.CancelledError) as error:
+        failure = error
+        raise
     finally:
-        if iterator is not None and not guard():
-            close = getattr(iterator, "aclose", None) or getattr(
-                iterator, "close", None
-            )
-            if close:
-                await _await(close())
-        _collector.reset(token)
+        try:
+            if iterator is not None and not exhausted:
+                close = getattr(iterator, "aclose", None) or getattr(
+                    iterator, "close", None
+                )
+                if close:
+                    try:
+                        await _await(close())
+                    except (Exception, asyncio.CancelledError) as close_error:
+                        if failure is not None:
+                            raise ExceptionGroup(
+                                "effect initialization and iterator closing failed",
+                                [
+                                    _effect_error(failure, "effect initialization"),
+                                    _effect_error(close_error, "iterator closing"),
+                                ],
+                            ) from failure
+                        raise
+        finally:
+            _collector.reset(token)
 
 
 class EffectHandle:
@@ -541,6 +585,7 @@ class _Effect:
         self._disposal: asyncio.Task[None] | None = None
         self.error: Exception | None = None
         self.handle = EffectHandle(self)
+        self.before_dispose: Callable[[], None] | None = None
 
     def attach(self, parent: _Sink) -> None:
         if self.parent is parent:
@@ -592,6 +637,14 @@ class _Effect:
         return self.handle
 
     async def dispose(self) -> None:
+        self._assert_can_dispose()
+        if self._disposal is None:
+            self._disposal = asyncio.create_task(self._dispose())
+        await asyncio.shield(self._disposal)
+
+    def _assert_can_dispose(self) -> None:
+        if self._disposal is not None and self._disposal.done():
+            return
         if asyncio.current_task() in self.fiber._tasks:
             scope = _collector.get()
             while scope is not None:
@@ -600,9 +653,13 @@ class _Effect:
                         "a managed task cannot dispose its own effect scope"
                     )
                 scope = scope.parent
-        if self._disposal is None:
-            self._disposal = asyncio.create_task(self._dispose())
-        await asyncio.shield(self._disposal)
+        if self.before_dispose is not None:
+            self.before_dispose()
+        # Run guards in the requesting task, before spawning a cleanup task
+        # which would otherwise hide the managed caller's identity.
+        for action in self.actions:
+            if isinstance(action, _Effect):
+                action._assert_can_dispose()
 
     async def _dispose(self) -> None:
         if (
@@ -651,6 +708,8 @@ class Fiber(Generic[ConfigT, ContextT]):
         self.target: tuple[int, tuple[int, ...]] | None | object = _EMPTY
         self.committed: dict[str, _Service] = {}
         self.committed_realms: dict[str, object] = {}
+        self._committed_contexts: dict[Context, dict[str, object]] = {}
+        self._parent_effect: _Effect | None = None
         self.inertia: asyncio.Task[None] | None = None
         self.error: Exception | None = None
         self.cleanup_error: ExceptionGroup | None = None
@@ -663,7 +722,9 @@ class Fiber(Generic[ConfigT, ContextT]):
             for key, metadata in (component.inject.items() if component else ())
             if metadata is not None
         }
-        self._ctx = parent if root else parent._derive(fiber=self, intercepts=intercepts)
+        self._ctx = (
+            parent if root else parent._derive(fiber=self, intercepts=intercepts)
+        )
 
     @property
     def ctx(self) -> ContextT:
@@ -777,6 +838,20 @@ class Fiber(Generic[ConfigT, ContextT]):
             realms[name] = self.ctx._realm(name)
         self.committed = committed
         self.committed_realms = realms
+        context: Context | None = self.ctx
+        self._committed_contexts = {}
+        while context is not None:
+            self._committed_contexts[context] = dict(context._realms_local)
+            context = context._parent
+
+    def _committed_realm(self, ctx: Context, name: str) -> object:
+        context: Context | None = ctx
+        while context is not None:
+            realms = self._committed_contexts.get(context, context._realms_local)
+            if name in realms:
+                return realms[name]
+            context = context._parent
+        return ctx._realm(name)
 
     def _check_provides(self) -> None:
         assert self.component is not None
@@ -809,6 +884,7 @@ class Fiber(Generic[ConfigT, ContextT]):
                     await self._recover()
                     self.committed.clear()
                     self.committed_realms.clear()
+                    self._committed_contexts.clear()
                     self._load_token = object()
                     if not self.desired:
                         self._set_state(FiberState.DISPOSED)
@@ -829,13 +905,18 @@ class Fiber(Generic[ConfigT, ContextT]):
                 self.cleanup_error = None
                 try:
                     self.config = await self._validate_config(self.config)
+                    if self.target != target or not self.desired:
+                        self._set_state(FiberState.UNLOADING)
+                        self.runtime.provider_leaving(self)
+                        continue
                     self._commit()
                     await _execute(
                         self._component_callback(),
                         lambda: self.target == target and self.desired,
                         self._scope,
                     )
-                    self._check_provides()
+                    if self.target == target and self.desired:
+                        self._check_provides()
                 except (Exception, asyncio.CancelledError) as exception:
                     load_error = _effect_error(exception, f"component {self.name!r}")
                     try:
@@ -847,9 +928,14 @@ class Fiber(Generic[ConfigT, ContextT]):
                         )
                     self.committed.clear()
                     self.committed_realms.clear()
+                    self._committed_contexts.clear()
                     self.error = load_error
                     self.target = None
-                    self._set_state(FiberState.FAILED)
+                    self._set_state(
+                        FiberState.FAILED if self.desired else FiberState.DISPOSED
+                    )
+                    if not self.desired:
+                        self.runtime.remove(self)
                     self.runtime.report(load_error, self)
                     return
 
@@ -899,6 +985,16 @@ class Fiber(Generic[ConfigT, ContextT]):
         await self.wait()
 
     async def update(self, config: ConfigT, *, rollback: bool = True) -> None:
+        self.runtime.assert_can_wait_for(self)
+        if not self.desired or self.state is FiberState.DISPOSED:
+            raise InactiveContextError(
+                f"cannot update disposed component {self.name!r}"
+            )
+        await _settle(
+            self._update(config, rollback=rollback), name=f"cordis:update:{self.name}"
+        )
+
+    async def _update(self, config: ConfigT, *, rollback: bool) -> None:
         config = await self._validate_config(config)
         if config == self.config:
             return
@@ -985,6 +1081,12 @@ class _Runtime:
         if fiber in self.fibers:
             self.fibers.remove(fiber)
         fiber.uid = None
+        if fiber._parent_effect is not None:
+            # Keep a failed cleanup registered so the parent's later shutdown
+            # still reports it. Successful manual disposal releases ownership.
+            if fiber.cleanup_error is None:
+                fiber._parent_effect.detach()
+            fiber._parent_effect = None
 
     def resolve(
         self, ctx: "Context", name: str, *, active: bool = True
@@ -1086,13 +1188,6 @@ class _Runtime:
                 del self.services[source]
             self.services[target] = service
             service.realm = target
-            for fiber in self.fibers:
-                if (
-                    fiber.ctx._is_descendant_of(ctx)
-                    and fiber.committed.get(service.name) is service
-                    and fiber.committed_realms.get(service.name) is source
-                ):
-                    fiber.committed_realms[service.name] = target
         for fiber in self.fibers.copy():
             fiber.refresh()
 
@@ -1142,7 +1237,10 @@ class _Runtime:
             if sync:
                 _close_coroutine(result)
                 raise TypeError("bail listeners must be synchronous")
-            if isinstance(result, asyncio.Task) and result in listener.ctx._fiber._tasks:
+            if (
+                isinstance(result, asyncio.Task)
+                and result in listener.ctx._fiber._tasks
+            ):
                 # A synchronous listener may return ctx.spawn(...). Preserve
                 # that task's explicit policy and avoid reporting failures twice.
                 return result
@@ -1314,6 +1412,8 @@ class Context:
             await fiber.dispose()
 
         effect = _Effect.completed(self._fiber, [remove], f"component:{fiber.name}")
+        effect.before_dispose = lambda: self._runtime.assert_can_wait_for(fiber)
+        fiber._parent_effect = effect
         self._fiber._attach_effect(effect)
         fiber.refresh()
         return fiber
@@ -1472,6 +1572,7 @@ class Context:
             raise DuplicateServiceError(
                 f"service {name!r} is already provided by component {existing.fiber.name!r}"
             )
+
         def adapt_value(value: object, metadata: object, ctx: Context) -> object:
             # The heterogeneous store erases T. Restore it only at registration's
             # adapter boundary; ServiceKey[T] checks typed writes and updates.
@@ -1479,7 +1580,11 @@ class Context:
             return adapt(cast(T, value), metadata, ctx)
 
         service = _Service(
-            name, value, self._fiber, realm, check,
+            name,
+            value,
+            self._fiber,
+            realm,
+            check,
             adapt_value if adapt is not None else None,
         )
         self._runtime.services[realm] = service
@@ -1495,6 +1600,13 @@ class Context:
                 )
 
         effect = _Effect.completed(self._fiber, [remove], f"provide:{name}")
+
+        def check_dependents() -> None:
+            for dependent in self._runtime.fibers:
+                if any(value is service for value in dependent.committed.values()):
+                    self._runtime.assert_can_wait_for(dependent)
+
+        effect.before_dispose = check_dependents
         return self._fiber._attach_effect(effect)
 
     @overload
@@ -1557,7 +1669,10 @@ class Context:
 
     def service(self, name: ServiceName) -> object:
         name = _service_name(name)
-        realm = self._realm(name)
+        # Resolve within the reader's activation view. New derived contexts may
+        # still explicitly override a realm; ancestor reassignment cannot alter
+        # resources visible to in-flight work and cleanup from the old activation.
+        realm = self._fiber._committed_realm(self, name)
         fiber: Fiber[Any, Any] | None = self._fiber
         while fiber is not None:
             service = fiber.committed.get(name)
@@ -1569,7 +1684,7 @@ class Context:
                 )
             if fiber is self._runtime.root._fiber:
                 break
-            if fiber.parent._realm(name) is not realm:
+            if self._fiber._committed_realm(fiber.parent, name) is not realm:
                 break
             fiber = fiber.parent._fiber
         if self._fiber is self._runtime.root._fiber:
@@ -1629,8 +1744,12 @@ class Context:
         timeout: float | None = None,
     ) -> EffectHandle:
         return self._on(
-            name, callback, prepend=prepend, global_=global_,
-            task_policy=task_policy, timeout=timeout,
+            name,
+            callback,
+            prepend=prepend,
+            global_=global_,
+            task_policy=task_policy,
+            timeout=timeout,
         )
 
     def _on(
@@ -1765,8 +1884,11 @@ class Context:
         if key in self._runtime.queries:
             raise DuplicateQueryError(f"query {key.name!r} already has a handler")
         listener = _Listener(
-            self, callback, self._fiber._sink(),
-            task_policy=task_policy, timeout=timeout,
+            self,
+            callback,
+            self._fiber._sink(),
+            task_policy=task_policy,
+            timeout=timeout,
         )
         self._runtime.queries[key] = listener
 
@@ -1789,7 +1911,9 @@ class Context:
         # this registry boundary restores the result erased by _Listener.
         return cast(ResultT | None, result)
 
-    async def serial(self, name: str, *args: object, scope: EventScope = None) -> object:
+    async def serial(
+        self, name: str, *args: object, scope: EventScope = None
+    ) -> object:
         for listener in self._runtime._listeners(name, scope):
             result = await _await(self._runtime._invoke(listener, name, args))
             if result is not None and result is not False:

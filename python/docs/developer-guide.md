@@ -706,7 +706,7 @@ await loader.reconcile([
 3. **配置更新（Update）**：如果插件未变但 `config` 发生变化，调用 `await fiber.update(new_config)`；默认重启插件，自定义 update hook 才执行原地更新。
 4. **属性热更（Patch）**：增量同步 `isolate` 隔离配置与 `intercept` 拦截参数。
 
-Entry 不保留插件与配置的静态关联，原始配置仍需边界校验。mount 条目不进入 entries，不被 reconcile([]) 删除；unmount(id) 与 close() 可以清理两种入口的条目。id 冲突在修改前拒绝，其他清单更新仍是增量执行，不能保证全局事务。管理操作应由宿主串行协调。
+Entry 不保留插件与配置的静态关联，原始配置仍需边界校验。mount 条目不进入 entries，不被 reconcile([]) 删除；unmount(id) 与 close() 可以清理两种入口的条目。id 冲突与候选导入、配置预检在修改前拒绝；应用失败时恢复受影响旧条目。同一 Loader 的管理操作共用锁，取消会等待提交或恢复完成。外部副作用不在恢复保证内，详见 [Loader API](api/loader.md)。
 
 ### 4.9 源码级模块热替换：`HMR` 与 `ModuleGraph`
 

@@ -284,7 +284,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-清单中新增的 id 会挂载，移除的 id 会卸载，已有 id 的配置变化会触发更新；`enabled=False` 可保留条目但停用实例。一次 `reconcile()` 是逐项协调，并非整个清单的原子事务。
+清单中新增的 id 会挂载，移除的 id 会卸载，已有 id 的配置变化会触发更新；`enabled=False` 可保留条目但停用实例。reconcile 在修改前预检，失败时尝试恢复旧条目；同一 Loader 的管理操作串行执行，详见 [Loader API](api/loader.md)。
 
 `Entry` 容纳不同类型的组件，配置类型为 object，不保留组件与配置的静态对应关系。代码内需要严格匹配时，用 `ctx.use()`，或先 `binding = greeter.configure(config)` 再 `fiber = await loader.mount("greeter", binding)`。后者保留 Fiber[GreeterConfig, AppContext]，可以直接检查 fiber.update 的参数。
 

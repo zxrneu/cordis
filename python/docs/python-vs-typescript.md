@@ -23,12 +23,12 @@ Python 类型接口已同步当前仓库：FiberView、EventKey/QueryKey、Bound
   - [5.2 Python 版的任务治理短板与风险](#52-python-版的任务治理短板与风险)
 - [6. 声明式配置 Loader 与拓扑树 (Declarative Loader)](#6-声明式配置-loader-与拓扑树-declarative-loader)
   - [6.1 TS 的 `EntryTree` 树形配置与多文件 include 动态回写](#61-ts-的-entrytree-树形配置与多文件-include-动态回写)
-  - [6.2 Python 版 Loader 的缺陷：非全局事务与并发竞争](#62-python-版-loader-的缺陷非全局事务与并发竞争)
+  - [6.2 Python 版 Loader 的恢复与并发边界](#62-python-版-loader-的恢复与并发边界)
 - [7. 源码级模块热重载 (HMR Engine)](#7-源码级模块热重载-hmr-engine)
   - [7.1 TS 的 Node.js 原生 ESM Loader 劫持](#71-ts-的-nodejs-原生-esm-loader-劫持)
-  - [7.2 Python 版基于 AST 分析的局限与回滚残留](#72-python-版基于-ast-分析的局限与回滚残留)
+  - [7.2 Python 版基于 AST 分析的局限与恢复范围](#72-python-版基于-ast-分析的局限与恢复范围)
 - [8. 官方生态与周边插件矩阵差距 (Ecosystem Gap)](#8-官方生态与周边插件矩阵差距-ecosystem-gap)
-- [9. Python 版已确认的 8 个核心边界缺陷 (Audited Bugs B01~B08)](#9-python-版已确认的-8-个核心边界缺陷-audited-bugs-b01b08)
+- [9. 已修复的核心边界缺陷 (B01~B08)](#9-已修复的核心边界缺陷-b01b08)
 - [10. Python 版本的演进路线图 (Roadmap)](#10-python-版本的演进路线图-roadmap)
 
 ---
@@ -46,7 +46,7 @@ Python 类型接口已同步当前仓库：FiberView、EventKey/QueryKey、Bound
 | **声明式 Loader** | `EntryTree` 树形配置、`group`、多文件拆分与回写 | Entry/children/group + reconcile；另有类型化 mount/unmount | 🟡 支持分组，但 reconcile 非全局事务，无内置多文件回写 |
 | **模块热重载 (HMR)**| 深度集成 Node.js ESM 加载器，全事务性置换与回滚 | 纯 Python 源码 AST 解析，替换 `sys.modules` | 🔴 **明显不足**（无法感知动态 import） |
 | **周边生态** | 官方包含 timer, logger-console, group, include 等 | 内置 group、Loader、HMR 与应用示例 | 🟡 未提供同等的独立 timer/logger/include 插件包 |
-| **边界健壮性** | 经历数万常驻节点长期生产检验（如 Koishi 生态） | 2026-09-10 审计确认 8 个底层边界 Bug 待修复 | 🔴 **明显不足**（回滚存在漏洞） |
+| **边界健壮性** | 经历数万常驻节点长期生产检验（如 Koishi 生态） | 审计 B01–B08 与 K01–K02 已于 2026-09-13 修复 | 🟡 已有回归覆盖，仍需长期运行验证 |
 
 ---
 
@@ -68,7 +68,7 @@ Python 类型接口已同步当前仓库：FiberView、EventKey/QueryKey、Bound
   **优势**：由于是语言级原生 Proxy，即使方法被解构、赋值给临时变量，其属性存取依然被运行时 100% 监管。
 
 - **Python 版**：
-  Python 版通过在 Context 类上重写 `__getattr__` 与 `__getitem__`（[Context 属性和下标读取](../src/cordis/core.py#L1584)）模拟该行为。
+  Python 版通过在 Context 类上重写 `__getattr__` 与 `__getitem__`（[Context 属性和下标读取](../src/cordis/core.py#L1707)）模拟该行为。
 - **Python 版的不足**：
   Python 缺乏语言原生的透明对象级 Proxy（`__getattr__` 只能拦截不存在的属性，对已有属性无法拦截）。一旦服务实例被返回给上层，服务对象自身的方法调用链**无法被运行时自动挂载拦截钩子**，导致配置拦截（Intercepts）和动态访问器（Accessors）的灵活性大幅缩水。
 
@@ -172,11 +172,11 @@ flowchart TD
 ```
 
 ### 5.1 Python 的突出优势：`ctx.spawn` 与结构化受管任务
-- 引入了工业级的结构化并发工具 [`ctx.spawn()`](../src/cordis/core.py#L1363)，支持 `policy="drain"`（优雅排空）与 `policy="cancel"`（即时取消），能够保证“在提供者服务关闭前，消费者的在途事务被安全排空或协作退出”。
+- 引入了工业级的结构化并发工具 [`ctx.spawn()`](../src/cordis/core.py#L1463)，支持 `policy="drain"`（优雅排空）与 `policy="cancel"`（即时取消），能够保证“在提供者服务关闭前，消费者的在途事务被安全排空或协作退出”。
 
 ### 5.2 Python 版的任务治理短板与风险
 1. **Cleanup 清理阶段缺少全局超时保护（P0 级风险）**：
-   在 [`_dispose_actions`](../src/cordis/core.py#L425) 中，`_dispose_actions` 清理动作栈时是无限期等待的。若某个插件的清理函数发生永久死锁（例如等待未关闭的连接池），整个进程的卸载与重载流程将被永久冻结。
+   在 [`_dispose_actions`](../src/cordis/core.py#L449) 中，`_dispose_actions` 清理动作栈时是无限期等待的。若某个插件的清理函数发生永久死锁（例如等待未关闭的连接池），整个进程的卸载与重载流程将被永久冻结。
 2. **协作取消的天然脆弱性**：
    Python 协程的取消依赖协作让出，若插件内存在同步 CPU 密集死循环或阻塞式系统调用（如未经线程化的文件读写），`cancel()` 信号无法强制打断执行。
 
@@ -190,14 +190,12 @@ flowchart TD
   - 拥有 `EntryTree` 分层配置模型；
   - 原生支持分组插件 `@cordisjs/plugin-group`，支持对子系统进行整体验证与批量启停；
   - 支持 `@cordisjs/plugin-include`，能够将单体大配置文件拆分为模块化的独立 YAML 子文件，并支持运行期将配置变更动态回写保存至磁盘。
-### 6.2 Python 版 Loader 的缺陷：非全局事务与并发竞争
+### 6.2 Python 版 Loader 的恢复与并发边界
 
-- **Python 版 (`loader.py`) 的不足**：
-  1. **缺少全局事务性（P1 缺陷）**：`reconcile()` 过程中若第 2 个插件导入报错，已删除的第 1 个插件无法回滚恢复，导致系统损坏；
-  2. **配置记录与 Fiber 状态不同步**：配置校验失败时，Fiber 会自动回滚到旧版本，但 Loader 内存中的 Entry 字典依然记录为新版本，导致下一次提交同一配置被判定为“无变化”而被跳过；
-  3. **并发更新缺少互斥锁**：两个并发协程同时调用 `reconcile` 会破坏内部 `_loaded` 映射表。
+Python 已修复候选导入前删除旧条目、Entry 提前记录失败配置和并发修改问题：先预检，保存旧状态，串行应用，失败后恢复受影响挂载。组内启动失败与提供者变更导致的消费者失败也会传播。见 [Loader API](api/loader.md)。
 
-Python 已支持 children 与 group 形成嵌套 Loader，不能概括为“仅扁平列表”。类型化 mount 另存生命周期视图，不进入 entries，也不会被 reconcile([]) 删除；使用 unmount/close 清理。配置绑定解决的是类型关系丢失，不会自动使原有 reconcile 具备全局事务。
+这些恢复不提供数据库式隔离，也不能撤销任意外部副作用。children/group 支持嵌套 Loader；类型化 mount 独立管理，不被 reconcile([]) 删除。不同 Loader 的更新仍需宿主协调。
+
 
 ---
 
@@ -208,13 +206,12 @@ Python 已支持 children 与 group 形成嵌套 Loader，不能概括为“仅�
 - **TypeScript 版 (`packages/hmr`)**：
   - 深度绑定 Node.js 18+ 原生 ESM Loader 内部机制（`--expose-internals`）；
   - 事务级内存模块置换，在替换失败时不仅能够还原模块缓存，还能完整修复父包属性引用。
-### 7.2 Python 版基于 AST 分析的局限与回滚残留
+### 7.2 Python 版基于 AST 分析的局限与恢复范围
 
-- **Python 版 (`hmr.py`) 的不足**：
-  1. **仅支持 AST 静态 import 识别**：无法识别代码中通过 `importlib.import_module()` 动态导入的依赖关系；
-  2. **回滚存在“幽灵引用”（Bug B04）**：HMR 替换失败回滚时，只恢复了 `sys.modules`，父模块对象（如 `package.module`）依然指向失败的新模块；
-  3. **任务取消导致回滚遗漏（Bug B05）**：在等待 HMR 重载完成时若外部任务被取消，异常处理会跳过回滚逻辑，导致旧插件已被卸载而新插件未能启动，系统陷入服务真空；
-  4. **全量源码扫描开销大**：大型工程中每次文件变更都需要对所有已加载模块的源码执行 AST 解析，存在较高的 I/O 与 CPU 延迟。
+Python 的 B04/B05 已修复：模块缓存和父包属性一起恢复，操作取消会等提交或回滚收尾。接受的包会扩展到缓存子模块，并在 reload_changed 中检查 external 边界。
+
+剩余边界是 AST 不能完整识别动态 import、全进程源码扫描成本、导入时外部副作用，以及外层 Loader 不自动遍历 group 子 Loader。见 [HMR API](api/hmr.md)。
+
 
 ---
 
@@ -245,9 +242,9 @@ Python 当前状态:
 
 ---
 
-## 9. Python 版已确认的 8 个核心边界缺陷 (Audited Bugs B01~B08)
+## 9. 已修复的核心边界缺陷 (B01~B08)
 
-根据 2026-09-10 官方审计报告 [`python/docs/bug-audit-2026-09-10.md`](bug-audit-2026-09-10.md)，Python 版现存 8 个已通过独立脚本复现的底层 Bug（TS 版在对应场景均具备更健壮的防御机制）：
+下表保留 [2026-09-10 审计](bug-audit-2026-09-10.md)的历史缺陷描述；**现已全部修复**，不代表当前行为，也不能据此推断 TS 在未经同等测试的场景下没有缺陷。当前修复与验证见[修复记录](bug-fixes-2026-09-13.md)。
 
 | 缺陷编号 | 严重度 | 缺陷名称与机理 | 实际影响 |
 | :---: | :---: | :--- | :--- |
@@ -264,26 +261,11 @@ Python 当前状态:
 
 ## 10. Python 版本的演进路线图 (Roadmap)
 
-基于上述对比，建议 Python 版后续按以下优先级演进升级：
+审计的 10 项缺陷、Loader 串行协调与失败恢复已经完成。后续工作集中在：
 
-```mermaid
-gantt
-    title Cordis Python 演进路线规划
-    dateFormat  YYYY-MM
-    section 紧急修复 (P0)
-    修复 B01/B03 依赖视图与中断判定   :crit, p0_1, 2026-10, 15d
-    修复 B04/B05 HMR 回滚与取消机制   :crit, p0_2, after p0_1, 15d
-    section 抽象与健壮性 (P1)
-    引入标准 Service 抽象基类         :p1_1, 2026-11, 20d
-    Loader 事务化与并发互斥锁         :p1_2, after p1_1, 20d
-    cleanup 全局超时保护 (asyncio.timeout) :p1_3, after p1_2, 15d
-    section 生态补齐 (P2)
-    开发 cordis-plugin-timer 定时器插件 :p2_1, 2026-12, 20d
-    开发 cordis-plugin-logger 日志插件 :p2_2, after p2_1, 20d
-```
+1. cleanup 期限、容量和长期运行诊断。
+2. 动态依赖声明、嵌套 Loader 的 HMR 范围与 watcher 恢复策略。
+3. 依赖环、整组就绪和 Realm 冲突预检。
+4. 服务抽象与标准插件生态。
 
-### 具体行动建议：
-1. **优先修复审计缺陷**：集中精力解决 B01、B03、B04、B05，消除停机时依赖访问失败与热更回滚破损；
-2. **抽象标准化**：设计 Python 版的 `class Service` 规范，让服务的声明、生命周期与可用性检查统一内聚；
-3. **事务型 Loader**：为 `Loader.reconcile` 加入 `asyncio.Lock`，并在应用变更前进行配置预校验，确保失败能够完整原子回滚；
-4. **周边生态建设**：将定时器与日志服务从业务代码中剥离，形成标准的 Python 周边包。
+完整状态见[实现与维护参考](implementation.md#维护清单)。

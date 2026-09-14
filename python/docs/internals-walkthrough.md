@@ -99,7 +99,7 @@ flowchart TB
 
 ### 2.1 `_Runtime`：全局中枢与注册表
 
-位于 [`_Runtime`](../src/cordis/core.py#L939)。每一个根 Context (`Context()`) 创建时，会分配一个私有的 `_Runtime` 实例。该实例被其衍生出的所有子 Context 与 Fiber 共享。
+位于 [`_Runtime`](../src/cordis/core.py#L1035)。每一个根 Context (`Context()`) 创建时，会分配一个私有的 `_Runtime` 实例。该实例被其衍生出的所有子 Context 与 Fiber 共享。
 
 ```python
 class _Runtime:
@@ -120,7 +120,7 @@ class _Runtime:
 
 ### 2.2 `Context`：基于原型链的环境切片
 
-位于 [`Context`](../src/cordis/core.py#L1179)。Context 采用类似 JavaScript 原型继承的链式模型。
+位于 [`Context`](../src/cordis/core.py#L1277)。Context 采用类似 JavaScript 原型继承的链式模型。
 
 ```python
 class Context:
@@ -141,7 +141,7 @@ class Context:
 
 ### 2.3 `Fiber`：纤程控制块 (PCB)
 
-位于 [`Fiber`](../src/cordis/core.py#L630)。代表一个组件在运行时中的一次激活执行。
+位于 [`Fiber`](../src/cordis/core.py#L687)。代表一个组件在运行时中的一次激活执行。
 
 ```python
 class Fiber(Generic[ConfigT, ContextT]):
@@ -157,6 +157,8 @@ class Fiber(Generic[ConfigT, ContextT]):
     target: tuple[int, tuple[int, ...]] | None | object # 目标状态元组
     committed: dict[str, _Service]         # 激活瞬间锁定的依赖服务快照！
     committed_realms: dict[str, object]    # 激活瞬间锁定的依赖服务所属 Realm 快照！
+    _committed_contexts: dict[Context, dict[str, object]] # 本次激活的祖先 Realm 覆盖
+    _parent_effect: _Effect | None         # 成功 dispose 后 detach，释放父级引用
     inertia: asyncio.Task[None] | None     # 正在运行的 _drive 驱动协程任务
     error: Exception | None                # 启动失败时捕获的异常
     cleanup_error: ExceptionGroup | None   # 清理阶段捕获的异常组
@@ -195,7 +197,7 @@ BoundComponent 是不可变的组件与配置二元组。configure 不激活插�
 
 ### 2.5 `_Sink` 与 `_Effect`：副作用作用域树与上下文隔离
 
-位于 [`_Sink`](../src/cordis/core.py#L342) 与 [`_Effect`](../src/cordis/core.py#L532)。用于精确控制组件内创建的所有副作用。
+位于 [`_Sink`](../src/cordis/core.py#L342) 与 [`_Effect`](../src/cordis/core.py#L576)。用于精确控制组件内创建的所有副作用。
 
 ```python
 @dataclass(slots=True)
@@ -296,7 +298,7 @@ sequenceDiagram
     Ctx-->>User: 返回 Fiber 句柄
 ```
 
-#### 关键代码片段：[`Fiber._compute_target`](../src/cordis/core.py#L702) `_compute_target`
+#### 关键代码片段：[`Fiber._compute_target`](../src/cordis/core.py#L763) `_compute_target`
 ```python
 def _compute_target(self) -> tuple[int, tuple[int, ...]] | None:
     # 1. 如果组件被显式销毁，或当前处于 FAILED 状态，目标为 None
@@ -324,161 +326,29 @@ def _compute_target(self) -> tuple[int, tuple[int, ...]] | None:
 
 ### 3.2 纤程驱动循环深度剖析 (`Fiber._drive`)
 
-位于 [`Fiber._drive`](../src/cordis/core.py#L804)。这是整个运行时状态机的发动机。每个 Fiber 同一时刻最多只有一个 `_drive` 协程在跑（记录在 `fiber.inertia` 中）。
+位于 [`Fiber._drive`](../src/cordis/core.py#L879)。这是整个运行时状态机的发动机。每个 Fiber 同一时刻最多只有一个 `_drive` 协程在跑（记录在 `fiber.inertia` 中）。
 
-```python
-async def _drive(self) -> None:
-    try:
-        while True:
-            # -------------------------------------------------------------
-            # 阶段 1: 卸载流转 (UNLOADING)
-            # -------------------------------------------------------------
-            if self.state is FiberState.UNLOADING:
-                # 1.1 级联停机：必须先等待所有下级消费者全部停机！
-                await self._drain_dependents()
-                # 1.2 资源清理：停止本作用域的任务，执行所有 cleanups
-                await self._recover()
-                # 1.3 关键：清理完成后，才清除已提交依赖快照
-                self.committed.clear()
-                self.committed_realms.clear()
-                self._load_token = object() # 代币失效，旧闭包彻底失效
+当前 `_drive` 按以下顺序推进（具体实现见上方源码链接）：
 
-                # 如果是外部要求销毁 (desired == False)
-                if not self.desired:
-                    self._set_state(FiberState.DISPOSED)
-                    self.runtime.remove(self)
-                    return
+1. 旧激活卸载时先等待依赖方，排空任务、执行逆操作，再清除 committed 服务、Realm 与 Context 覆盖快照。
+2. 已撤销 desired 的 Fiber 进入 DISPOSED 并移出运行时；没有依赖目标的 Fiber 等待下一次 refresh。
+3. 初始化先异步校验配置，校验返回后重新检查目标与 desired；过时目标不再提交依赖或运行插件。
+4. 提交本次依赖后运行 `_execute`；仅目标未变且 desired 仍为真时检查声明服务。正常目标变化中断不会误报 MissingProvisionError。
+5. 初始化失败会回滚并记录错误；desired 为真时进入 FAILED，否则直接 DISPOSED 并移除。成功且目标仍有效时进入 ACTIVE。
 
-                # 重新评估目标
-                self.target = self._compute_target()
-                if self.target is None:
-                    self._set_state(FiberState.PENDING)
-                    return
-                # 目标仍存在，说明是重启或热更，切入 LOADING
-                self._set_state(FiberState.LOADING)
+`_commit` 除保存服务引用和 Realm，还保存 Fiber Context 及祖先的 `_realms_local`。`_committed_realm` 使旧工作与 cleanup 在换域后仍读原依赖；激活后新派生 Context 的显式隔离仍生效。
 
-            if self.state is not FiberState.LOADING:
-                return
-
-            # -------------------------------------------------------------
-            # 阶段 2: 加载流转 (LOADING)
-            # -------------------------------------------------------------
-            target = self.target
-            self._load_token = object()
-            self._scope = _Sink(self, self._load_token, self._actions)
-            self.cleanup_error = None
-            try:
-                # 2.1 校验配置
-                self.config = await self._validate_config(self.config)
-                # 2.2 依赖提交锁定 (Committed View 固化)
-                self._commit()
-                # 2.3 执行插件 apply 函数并收集副作用
-                await _execute(
-                    self._component_callback(),
-                    lambda: self.target == target and self.desired,
-                    self._scope,
-                )
-                # 2.4 校验是否兑现了 provide 承诺
-                self._check_provides()
-            except (Exception, asyncio.CancelledError) as exception:
-                # 加载失败，执行回滚
-                load_error = _effect_error(exception, f"component {self.name!r}")
-                try:
-                    await _dispose_actions(self._scope, f"component:{self.name}")
-                except ExceptionGroup as cleanup_error:
-                    load_error = ExceptionGroup(
-                        f"component {self.name!r} failed and rollback also failed",
-                        [load_error, cleanup_error],
-                    )
-                self.committed.clear()
-                self.committed_realms.clear()
-                self.error = load_error
-                self.target = None
-                self._set_state(FiberState.FAILED)
-                self.runtime.report(load_error, self)
-                return
-
-            # -------------------------------------------------------------
-            # 阶段 3: 惯性目标比对 (Inertia Check)
-            # -------------------------------------------------------------
-            if self.target == target and self.desired:
-                # 目标未变且仍期望存在 -> 成功进入 ACTIVE
-                self.error = None
-                self._set_state(FiberState.ACTIVE)
-                self.runtime.provider_active(self) # 通知等待此服务的下级组件
-                return
-
-            # 如果在执行加载期间，目标又变了（例如并发收到新配置）
-            # 惯性使然：不抛弃错误，而是立即切入 UNLOADING 回滚后重试
-            self._set_state(FiberState.UNLOADING)
-            self.runtime.provider_leaving(self)
-    finally:
-        self.inertia = None
-        # 如果最终落入 PENDING 或 FAILED，再次调用 refresh 确保无遗漏事件
-        if self.state in (FiberState.PENDING, FiberState.FAILED):
-            self.refresh()
-```
 
 ---
 
 ### 3.3 效应归一化执行器 (`_execute` 与 `_collector`)
 
-位于 [`_execute`](../src/cordis/core.py#L456)。Cordis 使用 `_execute` 函数实现了代数效应（Algebraic Effects）的归一化处理。
+位于 [`_execute`](../src/cordis/core.py#L480)。Cordis 使用 `_execute` 函数实现了代数效应（Algebraic Effects）的归一化处理。
 
-```python
-async def _execute(
-    callback: Callable[[], object], guard: Callable[[], bool], sink: _Sink
-) -> None:
-    token = _collector.set(sink) # 1. 注入当前 Sink 到 contextvars
-    iterator: Iterator[object] | AsyncIterator[object] | None = None
-    try:
-        value = callback()
-        if inspect.isawaitable(value) and not isinstance(value, AsyncIterable):
-            value = await value
+`_execute` 设置 `_collector`，归一化普通回调、上下文管理器、生命周期对象以及同步/异步迭代器，并将逆操作登记到当前 Sink。
 
-        # 2. 模式匹配：Async Context Manager
-        if hasattr(value, "__aenter__") and hasattr(value, "__aexit__"):
-            await value.__aenter__()
-            sink.actions.append(lambda: value.__aexit__(None, None, None))
-            return
+迭代器每次步进前检查 guard，仅捕获 StopIteration/StopAsyncIteration 时标记 exhausted。非法 yield、初始化异常或 guard 中断都通过 finally 关闭尚未耗尽的迭代器，使生成器 finally 执行；即使 close/aclose 也失败，最外层 finally 仍重置 `_collector`。初始化错误和关闭错误同时发生时以 ExceptionGroup 保存两者，避免关闭异常掩盖根因。
 
-        # 3. 模式匹配：Sync Context Manager
-        if hasattr(value, "__enter__") and hasattr(value, "__exit__"):
-            value.__enter__()
-            sink.actions.append(lambda: value.__exit__(None, None, None))
-            return
-
-        # 4. 模式匹配：Generator / Async Generator
-        if isinstance(value, AsyncIterable):
-            iterator = value.__aiter__()
-            while guard(): # 每次 yield 步进前检查 guard 守卫
-                try:
-                    item = await anext(iterator)
-                except StopAsyncIteration:
-                    break
-                _collect_value(item, sink)
-            return
-
-        # 5. 模式匹配：Lifecycle Protocol (start / stop / close)
-        if not callable(value):
-            start = getattr(value, "start", None)
-            stop = getattr(value, "stop", None) or getattr(value, "close", None)
-            if callable(stop):
-                sink.actions.append(stop)
-            if callable(start):
-                await _execute(start, guard, sink)
-            return
-
-        # 6. 普通清理回调 (Callable / EffectHandle)
-        _collect_value(value, sink)
-    finally:
-        # 如果生成器中途因 guard 失败退出，强制触发 close
-        if iterator is not None and not guard():
-            close = getattr(iterator, "aclose", None) or getattr(iterator, "close", None)
-            if close:
-                await _await(close())
-        _collector.reset(token) # 还原 ContextVar
-```
 
 ---
 
@@ -505,7 +375,7 @@ flowchart TD
     Step6 --> Done[停机结束]
 ```
 
-#### 关键清理函数：[`_dispose_actions`](../src/cordis/core.py#L425) `_dispose_actions`
+#### 关键清理函数：[`_dispose_actions`](../src/cordis/core.py#L449) `_dispose_actions`
 ```python
 async def _dispose_actions(sink: _Sink, label: str) -> None:
     # 第一步：先停掉所有协程任务，确保没有任何代码在并发访问即将被释放的资源
@@ -532,7 +402,7 @@ async def _dispose_actions(sink: _Sink, label: str) -> None:
 
 ### 3.5 服务解析、Realm 隔离与 Intercept 适配
 
-#### 服务解析核心：[`_Runtime.resolve`](../src/cordis/core.py#L989) `_Runtime.resolve`
+#### 服务解析核心：[`_Runtime.resolve`](../src/cordis/core.py#L1091) `_Runtime.resolve`
 ```python
 def resolve(self, ctx: Context, name: str, *, active: bool = True) -> _Service | None:
     # 1. 计算上下文在当前服务名下的 Realm 键
@@ -555,14 +425,14 @@ def resolve(self, ctx: Context, name: str, *, active: bool = True) -> _Service |
     return service
 ```
 
-#### 服务消费防越权：[`Context.service`](../src/cordis/core.py#L1558) `Context.service`
+#### 服务消费防越权：[`Context.service`](../src/cordis/core.py#L1665) `Context.service`
 
 下方是实现签名，结果为 object；公开重载中 ServiceKey[T] 读取仍返回 T，字符串读取保留 Any。内部收紧不会让动态字符串自动获得服务接口类型。
 
 ```python
 def service(self, name: ServiceName) -> object:
     name = _service_name(name)
-    realm = self._realm(name)
+    realm = self._fiber._committed_realm(self, name)
     fiber: Fiber[Any, Any] | None = self._fiber
 
     # 沿 Fiber 继承链向上检查：
@@ -588,61 +458,16 @@ def service(self, name: ServiceName) -> object:
 
 ### 3.6 声明式调和状态机 (`Loader.reconcile`)
 
-位于 [`Loader.reconcile`](../src/cordis/loader.py#L195)。负责将一批声明式的 `Entry` 清单，调和（Reconcile）到运行中的 Fiber 集群：
+入口为 [`Loader.reconcile`](../src/cordis/loader.py#L253)，内部划分为以下步骤：
 
-```python
-async def reconcile(self, entries: Iterable[Entry | Mapping[str, Any]]) -> None:
-    values = [_coerce_entry(raw) for raw in entries]
-    # 完整实现先拒绝重复 id。
-    desired = {entry.id: entry for entry in values}
-    if conflicts := self._mounted.keys() & desired.keys():
-        raise ValueError("entry ids already mounted: " + ", ".join(sorted(conflicts)))
+1. `_run` 在调用任务中检查自等待与同 Loader 重入，再获取实例锁。持锁期间通过 `_settle` 等待完整操作；取消调用者也必须等待收尾后才释放锁。
+2. `_prepare` 检查重复 id、导入所有启用候选并递归预检组内条目。并行导入使用 gather(return_exceptions=True)，失败时也等待其他导入线程完成。
+3. `_reconcile` 校验顶层变更配置，保存旧 Entry、Component、挂载状态与 Context 覆盖；`_apply` 再增量删除、更新和挂载，成功后记录新配置。
+4. ACTIVE 父 Context 下等待 flush，并比较本轮与旧错误，传播新增启动失败；包括组内失败和未修改条目因提供者变化而产生的失败。
+5. 失败时清理 touched 条目、恢复旧设置并重新挂载受影响旧实例。未受影响条目保留原 Fiber；恢复失败与原错误聚合报告。hook 主动取消同样进入恢复。
 
-    # 1. 删除阶段：移除不再存在的 Entry
-    for entry_id in set(self._loaded) - set(desired):
-        await self._dispose(self._loaded.pop(entry_id))
+此处恢复是受管状态恢复，不提供变更期间的数据库式隔离，也不能撤销任意外部副作用。缺少依赖可以稳定在 PENDING。
 
-    # 2. 预解析阶段：并发导入新增/变更的 Python 模块
-    imports = {
-        entry.id: asyncio.to_thread(self._component, entry)
-        for entry in values
-        if entry.enabled and (...)
-    }
-    resolved = dict(zip(imports, await asyncio.gather(*imports.values()))) if imports else {}
-
-    # 3. 调和阶段：逐项对比状态
-    for entry in values:
-        loaded = self._loaded.get(entry.id)
-        if loaded is None:
-            # 新增插件：挂载并根据 enabled 决定是否启动
-            ...
-            continue
-
-        previous = loaded.entry
-        self._patch_context(loaded, entry) # 更新 Realm 与 Intercept
-        loaded.entry = entry
-
-        if not entry.enabled:
-            await self._dispose(loaded)
-            continue
-        if loaded.fiber is None:
-            await self._start(loaded, resolved.get(entry.id))
-            continue
-        if previous.plugin != entry.plugin:
-            # 插件实现变更：完全替换重启
-            await self._dispose(loaded)
-            await self._start(loaded, resolved.get(entry.id))
-            continue
-
-        # 配置对比与增量更新
-        config = self._config(entry)
-        if self._config(previous) != config:
-            await loaded.fiber.update(config)
-
-    # 4. 驱动等待：刷新并等待所有受影响 Fiber 稳定
-    if self.ctx.fiber.state is FiberState.ACTIVE:
-        await self.ctx.flush()
-```
 
 ---
 
@@ -655,19 +480,19 @@ flowchart TD
     FileChange[检测到文件变更: file.py] --> Graph[ModuleGraph 从 AST 解析 import 依赖图]
     Graph --> Affected[计算反向依赖爆炸半径: affected]
     Affected --> MatchEntry[匹配到受影响的 Loader Entry]
-    MatchEntry --> Backup[备份 sys.modules 与字节码缓存]
+    MatchEntry --> Backup[扩展包子模块、检查 externals，备份模块与父包属性]
     Backup --> ReloadModule[清除缓存并重新 importlib.import_module]
 
     ReloadModule --> Success{导入是否成功?}
-    Success -- 成功 --> Reconcile[loader.reconcile 重新装载 Fiber]
-    Success -- 失败 --> RollbackMod[回滚恢复 sys.modules 缓存]
+    Success -- 成功 --> Reconcile[清理旧挂载并启动候选 Fiber]
+    Success -- 失败 --> RollbackMod[恢复模块与父包属性，移除新增模块]
 
     Reconcile --> StartSuccess{新插件启动成功?}
     StartSuccess -- 成功 --> Commit[HMR 替换完成]
     StartSuccess -- 失败 --> RollbackFib[回滚恢复旧版本 Component 重新启动]
 ```
 
-#### AST 解析细节：[`ModuleGraph._imports`](../src/cordis/hmr.py#L54)
+#### AST 解析细节：[`ModuleGraph._imports`](../src/cordis/hmr.py#L119)
 `ModuleGraph` 不执行模块代码（避免导入副作用），而是使用 `ast.parse` 扫描 `ast.Import` 与 `ast.ImportFrom`，计算相对导入的层级（`node.level`），精确还原依赖树。
 
 ---
@@ -688,7 +513,7 @@ flowchart LR
     Fiber --> Store["_mounted 只保存 FiberView"]
 ```
 
-实现中先将 FiberView 存入 `_mounted`，再等待 fiber.wait；启动异常或调用方取消时移除本次记录并 dispose 后重新抛出。缺少依赖时 wait 仍可返回 PENDING。`unmount()` 移除指定条目，`close()` 清理 `_mounted` 和 `_loaded`；`reconcile()` 只处理后者，并在修改前拒绝与 mount 的 id 冲突。
+实现中先将 FiberView 存入 `_mounted`，再等待 fiber.wait；启动异常时移除本次记录并 dispose 后重新抛出。外层 `_run` 让调用方取消等待提交或恢复完成；成功的挂载可能仍被保留，可按 id 查询。缺少依赖时 wait 仍可返回 PENDING。`unmount()` 移除指定条目，`close()` 清理 `_mounted` 和 `_loaded`；`reconcile()` 只处理后者，并在修改前拒绝与 mount 的 id 冲突。
 
 handle 在当前 Fiber 的 Sink 中注册查询处理器，重复键抛出 DuplicateQueryError。query 找到处理器后调用 `_Runtime._invoke`，复用通知的状态、load token 和 sink.open 检查，并把异步结果作为注册方任务管理。有效状态包括 LOADING 和 ACTIVE；无有效处理器返回 None，False 不触发短路跳过。查询不建立 committed 服务依赖。
 
@@ -821,7 +646,7 @@ $$\forall t \in [\text{LOADING}, \text{UNLOADING\_END}], \quad \text{Fiber.commi
 
 $$\text{CurrentTask} \in \text{Fiber.tasks} \implies \text{CurrentTask CANNOT wait for Fiber teardown}$$
 
-- **代码实现**：[`_Runtime.assert_can_wait_for`](../src/cordis/core.py#L953) `assert_can_wait_for`。
+- **代码实现**：[`_Runtime.assert_can_wait_for`](../src/cordis/core.py#L1049) `assert_can_wait_for`。
 - **解释**：受管任务不能调用 `await fiber.dispose()` 或 `await fiber.restart()`，也不能等待自身所依赖的父级/提供者 Fiber 的停机。
 - **原因**：停机操作会 `await` 该受管任务结束；若任务自身又在 `await` 停机完成，形成自反死锁（Self-Deadlock）。
 - **维护要求**：新增等待方法（如新的 join/flush API）时，必须显式调用 `assert_can_wait_for` 校验当前任务归属。
@@ -850,24 +675,21 @@ $$\text{Target mutated during LOADING} \implies \text{Complete step with inertia
 
 ### 6.1 审计缺陷 (B01-B08) 代码机理深度剖析
 
-2026-09-10 审计确认了 8 个深层边界缺陷（参见 [`docs/bug-audit-2026-09-10.md`](bug-audit-2026-09-10.md)），维护者在修改相关模块时需特别注意：
+2026-09-10 审计中的 B01–B08 与 K01–K02 已修复，历史复现见[审计记录](bug-audit-2026-09-10.md)，当前验证见[修复记录](bug-fixes-2026-09-13.md)。维护时需保留以下不变量：
 
-#### B01：换 Realm 破坏卸载依赖视图 (P1)
-- **位置**：[`_Runtime.reassign_context_realms`](../src/cordis/core.py#L1056)、[`Context.service`](../src/cordis/core.py#L1558)
-- **机理**：`reassign_context_realms` 立即修改了上下文的 Realm，但消费者的 `committed_realms` 记录的是旧 Realm。随后执行 cleanup 读取服务时，`service()` 方法要求上下文当前 Realm 与 `committed_realms` 严格一致，导致抛出 `InactiveServiceError`。
-- **修复方向**：允许卸载/清理阶段读取快照中记录的历史 Realm。
+| 缺陷 | 当前防线 |
+| --- | --- |
+| B01 | `_commit` 保存 Context 覆盖快照，`service` 用本次激活的 Realm 查旧依赖 |
+| B02 | 初始化失败分支检查 desired，已撤销实例进入 DISPOSED 并移除 |
+| B03 | 配置校验后重查目标；过时初始化不执行 provision 完整性检查 |
+| B04 | `_ModuleSnapshot` 同时恢复模块缓存与父包绑定，移除新引入模块 |
+| B05 | `_settle` 让管理调用取消等待提交/回滚，线程导入也不能遗留在锁外 |
+| B06 | 成功移除 Fiber 时 detach 父 Effect，释放闭包引用；失败清理仍保留以便父级报告 |
+| B07 | 未耗尽迭代器总会关闭，双重错误聚合，collector 总会复位 |
+| B08 | Effect 在原调用 Task 中递归检查自等待，再创建 shielded 清理 Task |
+| K01/K02 | 预检先于删除，成功后提交 Entry，失败恢复旧条目并允许重试 |
 
-#### B02：dispose 与初始化失败并发竞态 (P2)
-- **位置**：[`Fiber._drive`](../src/cordis/core.py#L804)、[`Fiber.dispose`](../src/cordis/core.py#L869)
-- **机理**：当 `dispose()` 在组件处于 `LOADING` 且正在等待外部事件时被调用，`desired` 被置为 `False`；随后初始化继续执行并抛出异常，进入 `except` 分支并将状态设为 `FAILED`，跳过了 `DISPOSED` 的迁移，导致 Fiber 残留在 `runtime.fibers` 中。
 
-#### B03：生成器初始化中断被误判为 MissingProvisionError (P1)
-- **位置**：[`Fiber._check_provides`](../src/cordis/core.py#L781)、[`Fiber._drive`](../src/cordis/core.py#L804)
-- **机理**：生成器插件在 `yield` 之前如果因为超时取消或外部中断退出，`_execute` 提前结束，随后 `_check_provides()` 盲目断言服务是否存在。因插件中途退出尚未执行 `ctx.provide()`，误报为“声明了但未提供服务”，掩盖了真实的取消异常。
-
-#### B04 / B05：HMR 回滚与取消缺陷 (P1)
-- **位置**：[`HotReloader._restore_modules`](../src/cordis/hmr.py#L234)
-- **机理**：B04 回滚只恢复了 `sys.modules`，没有恢复父包模块对象上的属性（如 `parent_pkg.child_mod` 仍指向旧引用）；B05 在等待重载时如果外部 Task 被 cancel，`except BaseException` 没有完整执行恢复逻辑。
 
 ---
 
@@ -886,10 +708,10 @@ root.on("internal/error", lambda err, fiber: print(f"💥 [内部异常] {fiber.
 
 ```bash
 cd python
-# 验证已知缺陷模式（10 expected failures）
+# 11 项普通回归测试，无 expectedFailure
 uv run python docs/repros/bug_audit_20260910.py -v
 
-# 严格模式（直接暴露错误堆栈，用于编写修复代码）
+# 兼容原 strict 参数，运行相同的普通断言
 uv run python docs/repros/bug_audit_20260910.py --strict -v
 ```
 

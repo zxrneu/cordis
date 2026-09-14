@@ -164,14 +164,18 @@ async def wait(*, raise_error: bool = True) -> Self: ...
 async def update(config: ConfigT, *, rollback: bool = True) -> None: ...
 ```
 
-先校验新配置；校验后与当前配置 `==` 时直接返回。建议用不可变 dataclass，在更新时构造新值。
+已销毁或已撤销 desired 的 Fiber 在校验和修改配置前抛出 InactiveContextError；自等待检查也在操作开始前执行。随后校验新配置；校验后与当前配置 `==` 时直接返回。建议用不可变 dataclass，在更新时构造新值。
 
 - **默认路径**：保存新配置，卸载旧实例并重新激活。启动失败且 `rollback=True` 时，尝试用旧配置重新启动；即使恢复成功，也会抛出本次更新的失败原因。
 - **原地更新路径**：插件处于 `ACTIVE` 且提供了 `update` hook 时，调用 `update(ctx, previous, next)`，成功后保存新配置，不自动重启消费者。
 
 `rollback=False` 只关闭默认重启路径的恢复尝试。自定义 hook 必须自行恢复它修改的对象或外部状态，`rollback=True` 不会自动撤销 hook 的副作用。新配置的运行时激活可能再次调用 validate。
 
+update 开始后，取消调用方会等更新提交或默认路径回滚完成后再抛出 CancelledError，重复取消也不会遗弃恢复。取消不等于撤销成功更新；可读取 config 确认结果。
+
 更新成功也不意味着所有依赖方已经激活；需要时调用 `root.flush()` 并检查相关 Fiber。对已经 disposed 的实例应重新 `use()`，不要通过 `update()` 恢复它。
+
+成功 dispose 会释放父 Effect 对该 Fiber 的所有权引用；清理失败仍保留诊断关系，父级关闭时可再次报告该错误。初始化生成器在非法 yield、错误或目标中断时会关闭；关闭也失败时保留两个错误。
 
 ### restart
 

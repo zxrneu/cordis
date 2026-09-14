@@ -20,6 +20,71 @@ class FullRestartRequired(RuntimeError):
     pass
 
 
+def _expand_modules(accepted: set[str]) -> set[str]:
+    expanded = set(accepted)
+    names = list(sys.modules)
+    for name in accepted:
+        module = sys.modules.get(name)
+        if module is not None and hasattr(module, "__path__"):
+            expanded.update(key for key in names if key.startswith(name + "."))
+    return expanded
+
+
+class _ModuleSnapshot:
+    """Import-cache entries and import-managed parent attributes for rollback."""
+
+    def __init__(self, accepted: set[str]) -> None:
+        self.accepted = _expand_modules(accepted)
+        self.roots = {name.partition(".")[0] for name in self.accepted}
+        self.before = {
+            name: module
+            for name, module in list(sys.modules.items())
+            if name.partition(".")[0] in self.roots
+        }
+        self.attributes = {
+            name: dict(vars(module))
+            for name, module in self.before.items()
+            if isinstance(module, ModuleType)
+        }
+
+    def evict(self) -> None:
+        for name in sorted(
+            self.accepted, key=lambda value: value.count("."), reverse=True
+        ):
+            module = sys.modules.pop(name, None)
+            parent, _, child = name.rpartition(".")
+            package = sys.modules.get(parent)
+            if (
+                package is not None
+                and child in vars(package)
+                and vars(package)[child] is module
+            ):
+                delattr(package, child)
+
+    def restore(self) -> None:
+        introduced = {
+            name
+            for name in sys.modules
+            if name.partition(".")[0] in self.roots and name not in self.before
+        }
+        touched = self.accepted | introduced
+        for name in touched:
+            if name in self.before:
+                sys.modules[name] = self.before[name]
+            else:
+                sys.modules.pop(name, None)
+        for name in touched:
+            parent, _, child = name.rpartition(".")
+            package = sys.modules.get(parent)
+            if package is None:
+                continue
+            previous = self.attributes.get(parent, {})
+            if child in previous:
+                setattr(package, child, previous[child])
+            elif child in vars(package):
+                delattr(package, child)
+
+
 def _source_path(module: ModuleType) -> Path | None:
     filename = getattr(module, "__file__", None)
     if not filename:
@@ -108,16 +173,22 @@ class ModuleGraph:
 class HotReloader(Generic[ContextT]):
     """Dependency-aware, transactional module reload for Loader entries."""
 
-    def __init__(self, loader: "Loader[ContextT]", *, externals: Iterable[str] = ()) -> None:
+    def __init__(
+        self, loader: "Loader[ContextT]", *, externals: Iterable[str] = ()
+    ) -> None:
         self.loader = loader
         self.externals = set(externals)
 
     async def reload_changed(self, changed: Iterable[str | Path]) -> tuple[str, ...]:
+        changed = tuple(changed)
+        return await self.loader._run(lambda: self._reload_changed(changed))
+
+    async def _reload_changed(self, changed: Iterable[str | Path]) -> tuple[str, ...]:
         graph = await asyncio.to_thread(ModuleGraph)
         changed_modules = await asyncio.to_thread(graph.modules_for, tuple(changed))
         if not changed_modules:
             return ()
-        accepted = graph.affected(changed_modules)
+        accepted = _expand_modules(graph.affected(changed_modules))
         blocked = accepted.intersection(self.externals)
         if blocked:
             raise FullRestartRequired(
@@ -132,7 +203,7 @@ class HotReloader(Generic[ContextT]):
         ]
         if not stale:
             return ()
-        await self.reload_entries(stale, accepted=accepted)
+        await self._reload_entries(stale, accepted=accepted)
         return tuple(stale)
 
     async def reload_entries(
@@ -140,6 +211,14 @@ class HotReloader(Generic[ContextT]):
         entry_ids: Iterable[str],
         *,
         accepted: set[str] | None = None,
+    ) -> None:
+        entry_ids = tuple(entry_ids)
+        await self.loader._run(
+            lambda: self._reload_entries(entry_ids, accepted=accepted)
+        )
+
+    async def _reload_entries(
+        self, entry_ids: Iterable[str], *, accepted: set[str] | None = None
     ) -> None:
         entry_ids = list(dict.fromkeys(entry_ids))
         loaded_items = [self.loader._loaded[entry_id] for entry_id in entry_ids]
@@ -149,6 +228,8 @@ class HotReloader(Generic[ContextT]):
             if isinstance(loaded.entry.plugin, str)
         }
         accepted = set(accepted or roots)
+        snapshot = _ModuleSnapshot(accepted)
+        accepted = snapshot.accepted
         backup_modules: dict[str, ModuleType] = {
             name: module
             for name in accepted
@@ -167,8 +248,7 @@ class HotReloader(Generic[ContextT]):
         await asyncio.gather(
             *(asyncio.to_thread(path.unlink, missing_ok=True) for path in cached_files)
         )
-        for name in sorted(accepted, key=lambda value: value.count("."), reverse=True):
-            sys.modules.pop(name, None)
+        snapshot.evict()
 
         try:
             replacements = {
@@ -178,14 +258,18 @@ class HotReloader(Generic[ContextT]):
                 )
                 for entry_id in entry_ids
             }
-        except Exception:
-            self._restore_modules(accepted, backup_modules)
+        except BaseException:
+            snapshot.restore()
             raise
 
         try:
-            await asyncio.gather(
-                *(self.loader._dispose(loaded) for loaded in loaded_items)
+            disposals = await asyncio.gather(
+                *(self.loader._dispose(loaded) for loaded in loaded_items),
+                return_exceptions=True,
             )
+            errors = [error for error in disposals if isinstance(error, BaseException)]
+            if errors:
+                raise BaseExceptionGroup("hot reload cleanup failed", errors)
             for entry_id, component in replacements.items():
                 loaded = self.loader._loaded[entry_id]
                 if loaded.entry.enabled:
@@ -200,13 +284,15 @@ class HotReloader(Generic[ContextT]):
             ]
             if failures:
                 raise ExceptionGroup("hot reload failed", failures)
-        except Exception as reload_error:
-            await asyncio.gather(
+        except BaseException as reload_error:
+            disposed = await asyncio.gather(
                 *(self.loader._dispose(loaded) for loaded in loaded_items),
                 return_exceptions=True,
             )
-            self._restore_modules(accepted, backup_modules)
-            rollback_errors: list[Exception] = []
+            snapshot.restore()
+            rollback_errors: list[BaseException] = [
+                error for error in disposed if isinstance(error, BaseException)
+            ]
             for entry_id in entry_ids:
                 loaded = self.loader._loaded[entry_id]
                 if not loaded.entry.enabled:
@@ -224,17 +310,11 @@ class HotReloader(Generic[ContextT]):
                 and loaded.fiber.error is not None
             )
             if rollback_errors:
-                raise ExceptionGroup(
+                raise BaseExceptionGroup(
                     "hot reload and rollback both failed",
                     [reload_error, *rollback_errors],
                 ) from reload_error
             raise reload_error
-
-    @staticmethod
-    def _restore_modules(accepted: set[str], backup: dict[str, ModuleType]) -> None:
-        for name in accepted:
-            sys.modules.pop(name, None)
-        sys.modules.update(backup)
 
     async def watch(
         self,

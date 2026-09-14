@@ -120,9 +120,11 @@ async def reconcile(entries: Iterable[Entry | Mapping[str, Any]]) -> None: ...
 | intercept 改变 | 更新元数据，后续读取使用新适配结果；单独改变它不重启插件 |
 | 没有相关变化 | 保留已有挂载 |
 
-重复 id 会在修改前抛出 `ValueError`。其他步骤是增量执行的，**整份清单不是原子事务**：例如旧条目可能已移除，随后导入新插件失败。
+重复 id、非法 Entry 结构和启用候选的导入错误在修改前拒绝；组内条目的结构和导入也会预检。顶层新增或变更组件的 validate 在修改前运行，并记录规范化配置；激活时可能再次校验，因此校验器应可重复调用。
 
-返回也不代表所有插件都激活成功。宿主需要检查关键 Fiber，例如下面这个完整示例：
+应用前保存旧 Entry、Component 和上下文设置。更新成功后才记录新配置；应用或启动失败时，清理本轮受影响挂载并恢复旧条目，未受影响条目保持原 Fiber。恢复包括被移除项、此前成功更新项，以及因提供者变化而失败的消费者和组内插件。恢复成功仍抛出原错误，恢复失败则聚合报告。外部副作用和自定义 hook 的原地修改不保证可撤销，也不提供变更期间的数据库式隔离。
+
+父 Context 为 ACTIVE 时会等待本轮转换并传播新增启动失败；缺少依赖仍可返回 PENDING，父 Context 处于 LOADING 时子激活会延后。业务要求就绪时，仍应检查关键 Fiber：
 
 ```python
 import asyncio
@@ -160,7 +162,9 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-依次输出 `已加载`、`已更新`。宿主应串行协调 mount、unmount、reconcile、reload 和 close；当前 Loader 没有统一的并发协调锁。单个 Fiber 更新回滚后，Entry 的配置记录还可能保留失败的新值，重复提交相同配置会被跳过；详见[已知限制](../implementation.md#当前限制与风险)。
+依次输出 `已加载`、`已更新`。同一 Loader 的 mount、unmount、reconcile、reload、HMR 和 close 共用锁。排队期间取消不会应用变更；操作开始后取消会等提交或恢复完成，再抛出 CancelledError，重复取消也不会遗弃收尾。成功提交后收到取消不代表变更被撤销，可用 get/entries 查询结果。不同 Loader 的操作由宿主协调。
+
+管理操作必须能等待目标 Fiber；受管任务卸载自身或依赖、初始化期间递归修改同一 Loader，会在等待前抛出 InactiveContextError，避免自锁。更新失败后 Entry 保留旧配置，再次提交相同失败配置仍会重试。
 
 ### reload
 

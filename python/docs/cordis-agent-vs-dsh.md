@@ -346,7 +346,7 @@ Agent 层之外，通用 Python Cordis 还有几项会阻碍 Harness 扩展：
 | --- | --- | --- |
 | 已补齐 | `ctx.spawn()` / Fiber 与 Effect task scope | Agent 工具、流式请求和后台 Job 可接入；裸 Task 不会自动纳管 |
 | P0 | cleanup 无统一 timeout/deadline | 一个坏插件能永久卡住 reload 或进程退出 |
-| P1 | Loader reconcile 非全局事务 | 多 Entry patch 中途失败可能形成新旧配置混合态 |
+| 边界 | Loader 有预检、串行更新和失败恢复 | 无数据库式隔离；恢复自身失败会报告，外部副作用需应用补偿 |
 | P1 | 无依赖环诊断 | 能力互相等待时只表现为永久 `PENDING` |
 | P1 | HMR 只理解静态 import | 动态 provider、re-export 和 namespace package 可能漏重载 |
 | P1 | update hook 无 rollback 契约 | 原地配置更新失败可能留下不可见副作用 |

@@ -112,7 +112,7 @@ decoder 可同步或异步，每次 decode 执行一次；错误在挂载前抛�
 | reload(id) | 用最新配置重启同一个组件定义 | 对象定义重启；字符串定位符执行源码 HMR |
 | reload_changed(paths) | 不参与源码 HMR | 根据字符串定位符和静态导入关系匹配 |
 
-两种入口共享 id 范围，冲突在修改前被拒绝；查不到 id 时 get/unmount/reload 抛出 KeyError。mount 会等待当前启动转换并传播初始化错误，失败后清理本次挂载；缺少依赖时仍可能返回 PENDING。宿主应串行协调 mount、unmount、reconcile、reload 和 close。
+两种入口共享 id 范围，冲突在修改前被拒绝；查不到 id 时 get/unmount/reload 抛出 KeyError。mount 会等待当前启动转换并传播初始化错误，失败后清理本次挂载；缺少依赖时仍可能返回 PENDING。同一 Loader 的 mount、unmount、reconcile、reload 和 close 已串行协调；操作开始后取消会等待提交或恢复完成，成功挂载可能仍然存在。
 
 ## 验证迁移
 

@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import importlib
 import json
 import tomllib
 import weakref
 from collections.abc import Awaitable, Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Generic, TypeAlias, cast
+from typing import Any, Generic, TypeAlias, TypeVar, cast
 
 from .core import (
     Component,
@@ -21,15 +22,29 @@ from .core import (
     Fiber,
     FiberState,
     FiberView,
+    InactiveContextError,
     Plugin,
     PluginCallback,
     _as_component,
+    _await,
+    _settle,
 )
 
 
 Isolation = Mapping[str, bool | str]
+T = TypeVar("T")
 _PluginLike: TypeAlias = (
     Component[Any, Any] | PluginCallback[Any, Any] | Plugin[Any, Any]
+)
+
+
+@dataclass
+class _Mutation:
+    active: bool = True
+
+
+_mutations: contextvars.ContextVar[tuple[tuple[object, _Mutation], ...]] = (
+    contextvars.ContextVar("cordis_loader_mutations", default=())
 )
 
 
@@ -48,11 +63,18 @@ class Entry:
     children: tuple["Entry | Mapping[str, Any]", ...] = ()
 
     def __post_init__(self) -> None:
+        if not isinstance(self.id, str) or not self.id:
+            raise ValueError("entry id must be a non-empty string")
+        if not isinstance(self.enabled, bool):
+            raise TypeError("entry enabled must be a boolean")
         isolate = (
             dict.fromkeys(self.isolate, True)
             if not isinstance(self.isolate, Mapping)
             else dict(self.isolate)
         )
+        for name, label in isolate.items():
+            if not isinstance(name, str) or not isinstance(label, (bool, str)):
+                raise TypeError(f"invalid isolate setting: {name!r}: {label!r}")
         object.__setattr__(self, "isolate", MappingProxyType(isolate))
         object.__setattr__(self, "intercept", _freeze_mapping(self.intercept))
         object.__setattr__(self, "children", tuple(self.children))
@@ -98,6 +120,30 @@ class Loader(Generic[ContextCov]):
         self._mounted: dict[str, FiberView[ContextCov]] = {}
         self._local_realms: dict[tuple[str, str], object] = {}
         self._global_realms: dict[tuple[str, str], object] = {}
+        self._lock = asyncio.Lock()
+
+    async def _run(self, operation: Callable[[], Awaitable[T]]) -> T:
+        if any(loader is self and state.active for loader, state in _mutations.get()):
+            raise InactiveContextError("cannot recursively mutate the same Loader")
+        # Check in the caller, before the operation moves into a shielded task.
+        for loaded in self._loaded.values():
+            if loaded.fiber is not None:
+                self.ctx._runtime.assert_can_wait_for(loaded.fiber)
+        for mounted in self._mounted.values():
+            self.ctx._runtime.assert_can_wait_for(mounted.ctx._fiber)
+        async with self._lock:
+
+            async def run() -> T:
+                state = _Mutation()
+                token = _mutations.set((*_mutations.get(), (self, state)))
+                try:
+                    return await operation()
+                finally:
+                    state.active = False
+                    _mutations.reset(token)
+
+            # Worker imports and rollback settle before releasing this lock.
+            return await _settle(run(), name="cordis:loader")
 
     @property
     def ctx(self) -> ContextCov:
@@ -113,9 +159,18 @@ class Loader(Generic[ContextCov]):
         return self._loaded[entry_id].fiber
 
     async def mount(
-        self: Loader[ContextT], entry_id: str, binding: BoundComponent[ConfigT, ContextT]
+        self: Loader[ContextT],
+        entry_id: str,
+        binding: BoundComponent[ConfigT, ContextT],
     ) -> Fiber[ConfigT, ContextT]:
         """Mount a bound plugin; return its typed handle, store only its lifecycle."""
+        return await self._run(lambda: self._mount(entry_id, binding))
+
+    async def _mount(
+        self: Loader[ContextT],
+        entry_id: str,
+        binding: BoundComponent[ConfigT, ContextT],
+    ) -> Fiber[ConfigT, ContextT]:
         if entry_id in self._loaded or entry_id in self._mounted:
             raise ValueError(f"entry {entry_id!r} is already mounted")
         fiber = binding._mount(self.ctx)
@@ -131,6 +186,9 @@ class Loader(Generic[ContextCov]):
 
     async def unmount(self, entry_id: str) -> None:
         """Remove either a typed mount or a declarative Entry by its id."""
+        await self._run(lambda: self._unmount(entry_id))
+
+    async def _unmount(self, entry_id: str) -> None:
         if entry_id in self._mounted:
             await self._mounted.pop(entry_id).dispose()
         else:
@@ -193,6 +251,32 @@ class Loader(Generic[ContextCov]):
         loaded.ctx._intercepts_local.update(entry.intercept)
 
     async def reconcile(self, entries: Iterable[Entry | Mapping[str, Any]]) -> None:
+        values = list(entries)
+        await self._run(lambda: self._reconcile(values))
+
+    async def _prepare(self, values: list[Entry]) -> dict[str, Component[Any, Any]]:
+        ids = [entry.id for entry in values]
+        if len(ids) != len(set(ids)):
+            duplicates = sorted({value for value in ids if ids.count(value) > 1})
+            raise ValueError(f"duplicate entry ids: {', '.join(duplicates)}")
+        # Import and validate every candidate before removing any live entry.
+        # Waiting for all imports prevents a failed sibling leaving late imports
+        # mutating module state after this operation has already returned.
+        enabled = [entry for entry in values if entry.enabled]
+        results = await asyncio.gather(
+            *(asyncio.to_thread(self._component, entry) for entry in enabled),
+            return_exceptions=True,
+        )
+        resolved: dict[str, Component[Any, Any]] = {}
+        for entry, result in zip(enabled, results):
+            if isinstance(result, BaseException):
+                raise result
+            resolved[entry.id] = result
+            if entry.children:
+                await self._prepare([_coerce_entry(child) for child in entry.children])
+        return resolved
+
+    async def _reconcile(self, entries: Iterable[Entry | Mapping[str, Any]]) -> None:
         values = [_coerce_entry(raw) for raw in entries]
         ids = [entry.id for entry in values]
         if len(ids) != len(set(ids)):
@@ -202,29 +286,107 @@ class Loader(Generic[ContextCov]):
             raise ValueError(f"duplicate entry ids: {', '.join(duplicates)}")
         desired = {entry.id: entry for entry in values}
         if conflicts := self._mounted.keys() & desired.keys():
-            raise ValueError("entry ids already mounted: " + ", ".join(sorted(conflicts)))
-
-        for entry_id in set(self._loaded) - set(desired):
-            await self._dispose(self._loaded.pop(entry_id))
-
-        imports = {
-            entry.id: asyncio.to_thread(self._component, entry)
-            for entry in values
-            if entry.enabled
-            and (
-                entry.id not in self._loaded
-                or self._loaded[entry.id].entry.plugin != entry.plugin
-                or self._loaded[entry.id].component is None
+            raise ValueError(
+                "entry ids already mounted: " + ", ".join(sorted(conflicts))
             )
+
+        resolved = await self._prepare(values)
+        prepared = []
+        for entry in values:
+            previous = self._loaded.get(entry.id)
+            component = resolved.get(entry.id)
+            if (
+                component is not None
+                and component.validate is not None
+                and (previous is None or previous.entry != entry)
+            ):
+                config = await _await(component.validate(self._config(entry)))
+                if not entry.children:
+                    entry = replace(entry, config=config)
+            prepared.append(entry)
+        # Keep the last successfully applied Entry, not an uncommitted request.
+        before = dict(self._loaded)
+        snapshots = {
+            key: (
+                item.entry,
+                item.component,
+                item.fiber is not None,
+                dict(item.ctx._realms_local),
+                dict(item.ctx._intercepts_local),
+            )
+            for key, item in before.items()
         }
-        resolved = (
-            dict(zip(imports, await asyncio.gather(*imports.values())))
-            if imports
-            else {}
-        )
+        touched: set[str] = set()
+        previous_failures = self._failures(before)
+        try:
+            await self._apply(prepared, resolved, touched)
+            if self.ctx.fiber.state is FiberState.ACTIVE:
+                failures = []
+                for key in self._loaded:
+                    new_failures = [
+                        failure
+                        for failure in self._failures([key])
+                        if not any(
+                            failure is previous for previous in previous_failures
+                        )
+                    ]
+                    if new_failures:
+                        touched.add(key)
+                        failures.extend(new_failures)
+                if len(failures) == 1:
+                    raise failures[0]
+                if failures:
+                    raise ExceptionGroup("loader activation failed", failures)
+        except (Exception, asyncio.CancelledError) as error:
+            rollback_failures: list[BaseException] = []
+            for key in touched:
+                item = self._loaded.pop(key, None)
+                if item is not None:
+                    try:
+                        await self._dispose(item)
+                    except (Exception, asyncio.CancelledError) as cleanup_error:
+                        rollback_failures.append(cleanup_error)
+            self._loaded = before
+            for key, item in before.items():
+                if key not in touched:
+                    continue
+                entry, component, mounted, realms, intercepts = snapshots[key]
+                item.entry = entry
+                item.component = component
+                item.ctx._realms_local.clear()
+                item.ctx._realms_local.update(realms)
+                item.ctx._intercepts_local.clear()
+                item.ctx._intercepts_local.update(intercepts)
+                try:
+                    if mounted:
+                        await self._start(item, component)
+                except (Exception, asyncio.CancelledError) as rollback_error:
+                    rollback_failures.append(rollback_error)
+            if self.ctx.fiber.state is FiberState.ACTIVE:
+                await self.ctx.flush()
+                rollback_failures.extend(self._failures(touched))
+            if rollback_failures:
+                raise BaseExceptionGroup(
+                    "loader update and rollback failed", [error, *rollback_failures]
+                ) from error
+            raise
+
+    async def _apply(
+        self,
+        values: list[Entry],
+        resolved: dict[str, Component[Any, Any]],
+        touched: set[str],
+    ) -> None:
+        desired = {entry.id for entry in values}
+        for entry_id in set(self._loaded) - desired:
+            touched.add(entry_id)
+            await self._dispose(self._loaded.pop(entry_id))
 
         for entry in values:
             loaded = self._loaded.get(entry.id)
+            if loaded is not None and loaded.entry == entry:
+                continue
+            touched.add(entry.id)
             if loaded is None:
                 loaded = _Loaded(entry, self._entry_context(entry))
                 self._loaded[entry.id] = loaded
@@ -234,27 +396,46 @@ class Loader(Generic[ContextCov]):
 
             previous = loaded.entry
             self._patch_context(loaded, entry)
-            loaded.entry = entry
             if not entry.enabled:
                 await self._dispose(loaded)
+                loaded.entry = entry
                 continue
             if loaded.fiber is None:
+                loaded.entry = entry
                 await self._start(loaded, resolved.get(entry.id))
                 continue
             if previous.plugin != entry.plugin or bool(previous.children) != bool(
                 entry.children
             ):
                 await self._dispose(loaded)
+                loaded.entry = entry
                 await self._start(loaded, resolved.get(entry.id))
                 continue
             config = self._config(entry)
             if self._config(previous) != config:
                 await loaded.fiber.update(config)
+            loaded.entry = entry
 
         if self.ctx.fiber.state is FiberState.ACTIVE:
             await self.ctx.flush()
 
+    def _failures(self, entry_ids: Iterable[str]) -> list[Exception]:
+        failures: list[Exception] = []
+        for entry_id in entry_ids:
+            loaded = self._loaded.get(entry_id)
+            if loaded is None or loaded.fiber is None:
+                continue
+            if loaded.fiber.error is not None:
+                failures.append(loaded.fiber.error)
+            nested = _group_loaders.get(loaded.fiber.ctx)
+            if nested is not None:
+                failures.extend(nested._failures(nested._loaded))
+        return failures
+
     async def reload(self, entry_id: str) -> FiberView[ContextCov]:
+        return await self._run(lambda: self._reload(entry_id))
+
+    async def _reload(self, entry_id: str) -> FiberView[ContextCov]:
         if entry_id in self._mounted:
             mounted = self._mounted[entry_id]
             await mounted.restart()
@@ -267,7 +448,7 @@ class Loader(Generic[ContextCov]):
             return loaded.fiber
         from .hmr import HotReloader
 
-        await HotReloader(self).reload_entries([entry_id])
+        await HotReloader(self)._reload_entries([entry_id])
         fiber = self._loaded[entry_id].fiber
         if fiber is None:
             raise RuntimeError(f"entry {entry_id!r} did not start after reload")
@@ -326,6 +507,9 @@ class Loader(Generic[ContextCov]):
             await self.load_file(path)
 
     async def close(self) -> None:
+        await self._run(self._close)
+
+    async def _close(self) -> None:
         results = await asyncio.gather(
             *(self._dispose(loaded) for loaded in list(self._loaded.values())),
             *(fiber.dispose() for fiber in list(self._mounted.values())),
@@ -338,7 +522,9 @@ class Loader(Generic[ContextCov]):
             raise ExceptionGroup("loader cleanup failed", errors)
 
 
-_group_loaders: weakref.WeakKeyDictionary[Context, Loader[Context]] = weakref.WeakKeyDictionary()
+_group_loaders: weakref.WeakKeyDictionary[Context, Loader[Context]] = (
+    weakref.WeakKeyDictionary()
+)
 
 
 async def _group_apply(
@@ -346,7 +532,12 @@ async def _group_apply(
 ) -> Callable[[], Awaitable[None]]:
     loader = Loader(ctx)
     _group_loaders[ctx] = loader
-    await loader.reconcile(entries)
+    try:
+        await loader.reconcile(entries)
+    except BaseException:
+        _group_loaders.pop(ctx, None)
+        await loader.close()
+        raise
 
     async def close() -> None:
         _group_loaders.pop(ctx, None)
