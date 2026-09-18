@@ -8,7 +8,11 @@ from cordis import Entry, FiberState, Loader
 from .config import AppConfig, parse_config
 from .consumers.console import console
 from .consumers.directory import directory
-from .definitions import AppContext
+from .definitions import (
+    EVENT_CONFIG_APPLIED,
+    EVENT_CONFIG_ERROR,
+    AppContext,
+)
 from .money import format_cents
 from .providers.csv import importer
 from .providers.memory import memory
@@ -50,7 +54,7 @@ class Application:
                 Entry("directory", directory, config.importer),
             ]
         )
-        for fiber in self.ctx.fibers:
+        for fiber in self.ctx.registry.fibers:
             await fiber
             if fiber.state is not FiberState.ACTIVE:
                 raise RuntimeError(f"{fiber.name} 未激活: {fiber.state.value}")
@@ -60,7 +64,7 @@ class Application:
             f"扫描间隔 {config.importer.interval:g}s，日志 {config.logging}，存储 {provider_name}",
             flush=True,
         )
-        self.ctx.emit("config/applied", config)
+        self.ctx.emit(EVENT_CONFIG_APPLIED, config)
         return True
 
     async def watch(self, interval: float = 0.2) -> None:
@@ -73,6 +77,6 @@ class Application:
                 message = str(error)
                 if message != last_error:
                     print(f"[配置错误] {message}；等待下一次保存", flush=True)
-                    self.ctx.emit("config/error", error)
+                    self.ctx.emit(EVENT_CONFIG_ERROR, error)
                     last_error = message
             await asyncio.sleep(interval)

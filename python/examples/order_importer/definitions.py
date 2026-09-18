@@ -80,6 +80,11 @@ VALIDATOR = ServiceKey[OrderValidator]("orders.validator")
 STORE = ServiceKey[OrderStore]("orders.store")
 IMPORTER = ServiceKey[OrderImporter]("orders.importer")
 
+EVENT_ORDERS_IMPORTED = "orders/imported"
+EVENT_ORDERS_IMPORT_FAILED = "orders/import-failed"
+EVENT_CONFIG_APPLIED = "config/applied"
+EVENT_CONFIG_ERROR = "config/error"
+
 
 class AppContext(Context):
     validator = VALIDATOR

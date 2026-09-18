@@ -2,7 +2,11 @@ from pathlib import Path
 
 from cordis import Context, plugin
 
-from ..definitions import ImportReport
+from ..definitions import (
+    EVENT_ORDERS_IMPORT_FAILED,
+    EVENT_ORDERS_IMPORTED,
+    ImportReport,
+)
 
 
 @plugin
@@ -19,5 +23,5 @@ def console(ctx: Context, _config: None) -> None:
     def failed(path: Path, error: Exception) -> None:
         print(f"[导入失败] {path.name}: {error}", flush=True)
 
-    ctx.on("orders/imported", completed)
-    ctx.on("orders/import-failed", failed)
+    ctx.on(EVENT_ORDERS_IMPORTED, completed)
+    ctx.on(EVENT_ORDERS_IMPORT_FAILED, failed)

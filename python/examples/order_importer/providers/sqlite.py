@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
-from cordis import Cleanup, plugin
+from cordis import plugin
 
 from ..definitions import STORE, AppContext, Order, StoreClosedError
 
@@ -50,11 +49,11 @@ class SQLiteStore:
 
 
 @plugin(provide=[STORE])
-def database(ctx: AppContext, config: DatabaseConfig) -> Iterator[Cleanup]:
+def database(ctx: AppContext, config: DatabaseConfig) -> None:
     config.path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(config.path)
     store = SQLiteStore(connection)
-    yield store.close
+    ctx.defer(store.close, label="sqlite:close")
     with connection:
         connection.execute(
             "CREATE TABLE IF NOT EXISTS orders ("

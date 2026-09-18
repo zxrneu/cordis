@@ -225,7 +225,7 @@ tenant = await includes.include_file("tenant-a", "tenant-a.yaml")
 await tenant.update("worker", config={"interval": 10})
 ```
 
-`ConfigStore` 依赖 `ConfigBackend` 和 `ConfigCodec` 协议；内置 `FileBackend`、`JsonCodec`、`YamlCodec`。文件写入使用同目录临时文件和 `os.replace()`，写入前比较内容摘要；外部编辑过的文件会抛出 `StaleConfigError`，同时恢复 Loader 的上一棵树。CRUD、保存和取消等待均串行收尾，避免两个并发修改从同一旧树派生后互相覆盖。
+`ConfigStore` 依赖 `ConfigBackend` 和 `ConfigCodec` 协议；内置 `FileBackend`、`JsonCodec`、`YamlCodec`。文件写入使用同目录临时文件和 `os.replace()`，写入前比较内容摘要；外部编辑过的文件会抛出 `StaleConfigError`，同时恢复 Loader 的上一棵树。CRUD、保存和取消等待均串行收尾，避免两个并发修改从同一旧树派生后互相覆盖。`watch(interval=0.5, stop=None, on_error=None)` 支持监控外部文件修改并自动重新加载，中间暂存态的语法与解析异常可通过 `on_error` 捕获而不中断监听。
 
 `ConfigIncludes` 把每个文件挂成一个空 group，再对它的 nested Loader 建立独立 ConfigStore。因此不同文件可以使用相同的局部条目 id，并分别更新、监听与回写。`include_file()` 加载失败会移除刚建立的 group；`remove(name)` 卸载该文件内的全部插件。
 

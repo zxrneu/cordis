@@ -183,9 +183,23 @@ class OrderStore(Protocol):
 | 文件 | 实现与资源 |
 | --- | --- |
 | [`providers/validation.py`](../examples/order_importer/providers/validation.py) | 实现 `OrderValidator`，按金额上限校验；配置类型 `ValidationConfig` 由它拥有 |
-| [`providers/sqlite.py`](../examples/order_importer/providers/sqlite.py) | 实现 `OrderStore`，管理数据库连接；退出时关闭连接 |
+| [`providers/sqlite.py`](../examples/order_importer/providers/sqlite.py) | 实现 `OrderStore`，管理数据库连接；使用 `ctx.defer(store.close)` 绑定连接关闭生命周期 |
 | [`providers/memory.py`](../examples/order_importer/providers/memory.py) | 实现同一个 `OrderStore`，把订单保存在当前实例的字典中 |
 | [`providers/csv.py`](../examples/order_importer/providers/csv.py) | 实现 `OrderImporter`，读取单个文件，调用校验与存储接口，返回导入报告 |
+
+SQLite 提供方使用 `ctx.defer` 注册连接关闭，免去了写生成器插件的繁琐：
+
+```python
+@plugin(provide=[STORE])
+def database(ctx: AppContext, config: DatabaseConfig) -> None:
+    config.path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(config.path)
+    store = SQLiteStore(connection)
+    ctx.defer(store.close, label="sqlite:close")
+    with connection:
+        connection.execute(...)
+    ctx.provide(STORE, store)
+```
 
 CSV 提供方的插件定义很短：
 
@@ -201,13 +215,25 @@ def importer(ctx: AppContext, _config: None) -> None:
 
 ### 3. 调用方决定何时调用、怎样呈现
 
-[`consumers/directory.py`](../examples/order_importer/consumers/directory.py) 扫描目录，发现文件变化后，通过契约提交任务：
+[`consumers/directory.py`](../examples/order_importer/consumers/directory.py) 扫描目录，发现文件变化后，通过契约提交任务。它使用 Cordis 的 `ctx.timer.interval` 调度扫描任务，天然受控于插件生命周期：
+
+```python
+@plugin(inject=[IMPORTER])
+def directory(ctx: AppContext, config: ImporterConfig) -> None:
+    config.directory.mkdir(parents=True, exist_ok=True)
+    watcher = DirectoryWatcher(ctx, config)
+    ctx.timer.interval(
+        config.interval, watcher.scan_step, immediate=True, policy="cancel"
+    )
+```
+
+当扫描到变化时通过契约发起处理：
 
 ```python
 report = await asyncio.shield(
     self.ctx.importer.submit(ImportRequest(path))
 )
-self.ctx.emit("orders/imported", report)
+self.ctx.emit(EVENT_ORDERS_IMPORTED, report)
 ```
 
 这是成功路径的节选。完整代码也会处理导入失败。`ImportRequest` 从 `definitions.py` 导入；整个目录监听模块没有导入任何 `providers` 模块。

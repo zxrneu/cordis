@@ -163,7 +163,7 @@ ctx.include(plugin, config=None, *, isolate=(), intercept=None) -> Fiber
 
 `accessor()` 注册计算属性，`mixin()` 把服务的选定属性映射到 Context；两者都随当前 Effect 撤销，并拒绝与已有服务或 accessor 重名。`include()` 先派生 isolate/intercept Context 再挂载组件，派生后仍保留 Context 子类。
 
-`ctx.logger` 返回附带 Fiber 名称、uid 和 `logger` intercept 元数据的标准库日志 facade；`add_handler()` 随 Context 作用域移除并关闭 handler。`ctx.timer` 提供 timeout、interval、debounce、throttle，底层全部使用 `ctx.spawn()`。`ctx.registry` 提供 Fiber 快照以及按 Component/name 的 find、restart、dispose。
+`ctx.logger` 返回附带 Fiber 名称、uid 和 `logger` intercept 元数据的标准库日志 facade，支持大小写不敏感的字符串与整数日志级别（如 `"info"` / `logging.INFO`）；`add_handler()` 随 Context 作用域移除并关闭 handler。`ctx.timer` 提供 `timeout`、`interval`、`debounce`、`throttle`（支持高频突发合并、尾部执行与 `cancel()`），底层全部使用 `ctx.spawn()`。`ctx.registry` 提供 Fiber 快照以及按 Component/name 的 find、restart、dispose。
 
 ## 隔离与拦截
 
@@ -328,7 +328,7 @@ ctx.emit(PROGRESS, 2, "ready")
 await ctx.parallel(MESSAGE, Message(text="hi"))
 ```
 
-`EventKey[*Args]` 可用于 `on()`、`once()`、`emit()`、`parallel()`，回调位置参数必须与键逐项一致且没有业务返回值。注册选项和 scope 的行为与字符串通知相同。带类型的键不用于 `serial()`、`bail()` 或 `waterfall()`。
+`EventKey[*Args]` 可用于 `on()`、`once()`、`emit()`、`parallel()`、`serial()`、`bail()` 与 `waterfall()`，回调位置参数必须与键逐项一致。注册选项和 scope 的行为与字符串通知相同。
 
 `EventKey` 与 `QueryKey` 均不可变，名称须为非空字符串，否则抛出 `ValueError`。**键按对象身份匹配，名称仅用于诊断**：两个 `EventKey[Message]("message")` 是不同通道，也不与字符串 `"message"` 互通。请从共享契约模块导入同一个键。这与按字符串名字匹配的 `ServiceKey` 不同，避免同名但不兼容的事件契约混用。类型参数用于静态检查，不自动执行运行时数据校验。
 
