@@ -65,18 +65,42 @@ class Throttled(Generic[P, R]):
         self._timer = timer
         self._delay = delay
         self._callback = callback
-        self._lock = asyncio.Lock()
-        self._next = 0.0
+        self._task: asyncio.Task[R] | None = None
+        self._trailing: asyncio.Task[R] | None = None
+        self._last_called = -float("inf")
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> asyncio.Task[R]:
-        async def run() -> R:
-            async with self._lock:
-                loop = asyncio.get_running_loop()
-                await asyncio.sleep(max(0.0, self._next - loop.time()))
-                self._next = loop.time() + self._delay
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        remaining = self._delay - (now - self._last_called)
+
+        if remaining <= 0:
+            self._last_called = now
+            if self._trailing is not None and not self._trailing.done():
+                self._trailing.cancel()
+
+            async def run_leading() -> R:
                 return await _invoke(self._callback, *args, **kwargs)
 
-        return self._timer.ctx.spawn(run(), policy="cancel")
+            self._task = self._timer.ctx.spawn(run_leading(), policy="cancel")
+            return self._task
+
+        if self._trailing is not None and not self._trailing.done():
+            self._trailing.cancel()
+
+        async def run_trailing() -> R:
+            await asyncio.sleep(remaining)
+            self._last_called = asyncio.get_running_loop().time()
+            return await _invoke(self._callback, *args, **kwargs)
+
+        self._trailing = self._timer.ctx.spawn(run_trailing(), policy="cancel")
+        return self._trailing
+
+    def cancel(self) -> None:
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+        if self._trailing is not None and not self._trailing.done():
+            self._trailing.cancel()
 
 
 class TimerService:

@@ -8,6 +8,23 @@ if TYPE_CHECKING:
     from .core import Context, EffectHandle
 
 
+def _normalize_level(level: object) -> int | None:
+    if level is None:
+        return None
+    if isinstance(level, int):
+        return level
+    if isinstance(level, str):
+        mapping = logging.getLevelNamesMapping()
+        canonical = level.strip().upper()
+        if canonical in mapping:
+            return mapping[canonical]
+        try:
+            return int(level)
+        except ValueError:
+            pass
+    raise ValueError(f"invalid log level: {level!r}")
+
+
 class ContextLogger:
     """A stdlib logging facade enriched with Cordis context metadata."""
 
@@ -16,7 +33,7 @@ class ContextLogger:
         metadata = ctx.metadata("logger")
         config = metadata if isinstance(metadata, Mapping) else {}
         self.name = name or str(config.get("name") or ctx._fiber.name)
-        self.level = config.get("level")
+        self.level = _normalize_level(config.get("level"))
         self.extra = {
             "cordis_fiber": ctx._fiber.name,
             "cordis_fiber_uid": ctx._fiber.uid,
@@ -24,7 +41,7 @@ class ContextLogger:
         }
 
     def log(self, level: int, message: object, *args: object, **kwargs: Any) -> None:
-        if self.level is not None and level < int(self.level):
+        if self.level is not None and level < self.level:
             return
         extra = {**self.extra, **dict(kwargs.pop("extra", {}))}
         logging.getLogger(self.name).log(level, message, *args, extra=extra, **kwargs)

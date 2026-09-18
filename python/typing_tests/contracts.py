@@ -190,6 +190,8 @@ async def verify() -> None:
         ctx.on(PROGRESS, lambda count, label: None)
         ctx.emit(PROGRESS, 1, "ready")
         await ctx.parallel(PROGRESS, 2, "done")
+        assert_type(await ctx.serial(PROGRESS, 3, "step"), object)
+        assert_type(ctx.bail(PROGRESS, 4, "step"), object)
         assert_type(ctx.fiber, FiberView[AppContext])
         assert_type(await ctx.fiber, FiberView[AppContext])
         assert_type(await ctx.fiber.wait(), FiberView[AppContext])

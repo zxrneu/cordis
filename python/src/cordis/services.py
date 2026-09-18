@@ -32,10 +32,15 @@ def current_context(default: Context | None = None) -> Context | None:
     return _caller_context.get() or default
 
 
-async def _await_in_context(value: Awaitable[Any], ctx: Context) -> Any:
+async def _await_in_context(
+    value: Awaitable[Any], ctx: Context, bound: Any = None
+) -> Any:
     token = _caller_context.set(ctx)
     try:
-        return await value
+        result = await value
+        if bound is not None and result is getattr(bound, "_target", None):
+            return bound
+        return result
     finally:
         _caller_context.reset(token)
 
@@ -59,17 +64,21 @@ def _iterate_in_context(value: Iterator[Any], ctx: Context) -> Iterator[Any]:
         _caller_context.reset(token)
 
 
-def _contextualize(value: Any, ctx: Context) -> Any:
+def _contextualize(value: Any, ctx: Context, bound: Any = None) -> Any:
     if inspect.isawaitable(value):
-        return _await_in_context(value, ctx)
+        return _await_in_context(value, ctx, bound)
     if isinstance(value, AsyncIterator):
         return _iterate_async_in_context(value, ctx)
     if isinstance(value, Iterator):
         return _iterate_in_context(value, ctx)
+    if bound is not None and value is getattr(bound, "_target", None):
+        return bound
     return value
 
 
-def _bind_callable(callback: Callable[..., Any], ctx: Context) -> Callable[..., Any]:
+def _bind_callable(
+    callback: Callable[..., Any], ctx: Context, bound: Any = None
+) -> Callable[..., Any]:
     @functools.wraps(callback)
     def invoke(*args: object, **kwargs: object) -> Any:
         token = _caller_context.set(ctx)
@@ -77,7 +86,7 @@ def _bind_callable(callback: Callable[..., Any], ctx: Context) -> Callable[..., 
             result = callback(*args, **kwargs)
         finally:
             _caller_context.reset(token)
-        return _contextualize(result, ctx)
+        return _contextualize(result, ctx, bound)
 
     return invoke
 
@@ -109,7 +118,7 @@ class BoundService(Generic[ServiceT]):
             value = getattr(self._target, name)
         finally:
             _caller_context.reset(token)
-        return _bind_callable(value, self._context) if callable(value) else value
+        return _bind_callable(value, self._context, bound=self) if callable(value) else value
 
     def __setattr__(self, name: str, value: object) -> None:
         token = _caller_context.set(self._context)
@@ -120,7 +129,7 @@ class BoundService(Generic[ServiceT]):
 
     def __call__(self, *args: object, **kwargs: object) -> Any:
         target = cast(Callable[..., Any], self._target)
-        return _bind_callable(target, self._context)(*args, **kwargs)
+        return _bind_callable(target, self._context, bound=self)(*args, **kwargs)
 
 
 class Service(Generic[ConfigT]):

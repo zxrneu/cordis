@@ -494,12 +494,17 @@ class ConfigStore:
         *,
         interval: float = 0.5,
         stop: asyncio.Event | None = None,
+        on_error: Callable[[Exception], None] | None = None,
     ) -> None:
         while stop is None or not stop.is_set():
             await asyncio.sleep(interval)
             text = await self.backend.read()
             if _fingerprint(text) != self._revision:
-                await self.load()
+                try:
+                    await self.load()
+                except Exception as error:
+                    if on_error is not None:
+                        on_error(error)
 
 
 class ConfigIncludes:

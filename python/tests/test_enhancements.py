@@ -240,6 +240,124 @@ class EnhancementTests(unittest.IsolatedAsyncioTestCase):
             await includes.remove("right")
             self.assertEqual(includes.names, ("left",))
 
+    async def test_throttled_coalesces_burst_and_supports_cancel(self):
+        seen = []
+        root = Context()
+        throttled = root.timer.throttle(0.05, seen.append)
+
+        # High-frequency burst: call 1 runs immediately, 2 and 3 coalesce to trailing (3)
+        throttled(1)
+        throttled(2)
+        throttled(3)
+        await asyncio.sleep(0)
+        self.assertEqual(seen, [1])
+
+        await asyncio.sleep(0.07)
+        self.assertEqual(seen, [1, 3])
+
+        # Wait for cooldown so 4 becomes a new leading call
+        await asyncio.sleep(0.06)
+        throttled(4)
+        await asyncio.sleep(0)
+        self.assertEqual(seen, [1, 3, 4])
+
+        throttled(5)
+        throttled.cancel()
+        await asyncio.sleep(0.07)
+        self.assertEqual(seen, [1, 3, 4])
+
+    async def test_logger_string_level_normalization(self):
+        root = Context()
+        ctx_info = root.intercept("logger", {"level": "info"})
+        self.assertEqual(ctx_info.logger.level, logging.INFO)
+
+        ctx_debug = root.intercept("logger", {"level": "DEBUG"})
+        self.assertEqual(ctx_debug.logger.level, logging.DEBUG)
+
+        ctx_warn = root.intercept("logger", {"level": "WARNING"})
+        self.assertEqual(ctx_warn.logger.level, logging.WARNING)
+
+    async def test_config_store_watch_survives_syntax_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary, "cordis.json")
+            path.write_text("[]\n", encoding="utf-8")
+            root = Context()
+            loader = Loader(root)
+            store = ConfigStore.file(loader, path)
+            await store.load()
+
+            errors = []
+            stop = asyncio.Event()
+            watch_task = asyncio.create_task(
+                store.watch(interval=0.01, stop=stop, on_error=errors.append)
+            )
+
+            # Write broken JSON: watch shouldn't crash
+            path.write_text("broken json [", encoding="utf-8")
+            await asyncio.sleep(0.03)
+            self.assertGreaterEqual(len(errors), 1)
+            self.assertFalse(watch_task.done())
+
+            # Write valid JSON: watch recovers on next read
+            path.write_text(
+                '[{"id":"sample","plugin":"tests.sample_plugins:configured","config":"recovered"}]\n',
+                encoding="utf-8",
+            )
+            await asyncio.sleep(0.03)
+            self.assertEqual(loader.entries[0].config, "recovered")
+
+            stop.set()
+            await watch_task
+
+    async def test_bound_service_fluent_method_chaining(self):
+        class Builder(Service[None]):
+            def __init__(self, ctx, key):
+                super().__init__(ctx, key)
+                self.actions = []
+
+            def step_one(self, name):
+                self.actions.append((name, self.ctx))
+                return self
+
+            def step_two(self, name):
+                self.actions.append((name, self.ctx))
+                return self
+
+        BUILDER = ServiceKey[Builder]("builder")
+
+        @plugin(provide=[BUILDER])
+        def provider(ctx, _config):
+            Builder(ctx, BUILDER)
+
+        consumed_contexts = []
+
+        @plugin(inject=[BUILDER])
+        def consumer(ctx, _config):
+            consumed_contexts.append(ctx)
+            ctx.service(BUILDER).step_one("first").step_two("second")
+
+        root = Context()
+        await root.use(provider)
+        await root.use(consumer)
+
+        b = root.service(BUILDER)
+        self.assertEqual(len(b.actions), 2)
+        self.assertEqual(b.actions[0][0], "first")
+        self.assertEqual(b.actions[0][1], consumed_contexts[0])
+        self.assertEqual(b.actions[1][0], "second")
+        self.assertEqual(b.actions[1][1], consumed_contexts[0])
+
+    async def test_serial_and_bail_with_event_key(self):
+        EVENT = EventKey[int, str]("event")
+        root = Context()
+        root.on(EVENT, lambda code, msg: f"handled:{code}:{msg}" if code > 0 else None)
+
+        bail_res = root.bail(EVENT, 1, "bail_test")
+        self.assertEqual(bail_res, "handled:1:bail_test")
+
+        serial_res = await root.serial(EVENT, 2, "serial_test")
+        self.assertEqual(serial_res, "handled:2:serial_test")
+
 
 class RuntimeImportTracingTests(unittest.TestCase):
     def test_dynamic_import_is_added_to_module_graph(self):

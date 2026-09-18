@@ -2127,8 +2127,21 @@ class Context:
         # this registry boundary restores the result erased by _Listener.
         return cast(ResultT | None, result)
 
+    @overload
+    async def serial(
+        self,
+        name: EventKey[Unpack[EventArgsT]],
+        *args: Unpack[EventArgsT],
+        scope: EventScope = None,
+    ) -> object: ...
+
+    @overload
     async def serial(
         self, name: str, *args: object, scope: EventScope = None
+    ) -> object: ...
+
+    async def serial(
+        self, name: Any, *args: object, scope: EventScope = None
     ) -> object:
         for listener in self._runtime._listeners(name, scope):
             result = await _await(self._runtime._invoke(listener, name, args))
@@ -2136,16 +2149,45 @@ class Context:
                 return result
         return None
 
-    def bail(self, name: str, *args: object, scope: EventScope = None) -> object:
+    @overload
+    def bail(
+        self,
+        name: EventKey[Unpack[EventArgsT]],
+        *args: Unpack[EventArgsT],
+        scope: EventScope = None,
+    ) -> object: ...
+
+    @overload
+    def bail(self, name: str, *args: object, scope: EventScope = None) -> object: ...
+
+    def bail(self, name: Any, *args: object, scope: EventScope = None) -> object:
         for listener in self._runtime._listeners(name, scope):
             result = self._runtime._invoke(listener, name, args, sync=True)
             if result is not None and result is not False:
                 return result
         return None
 
+    @overload
+    def waterfall(
+        self,
+        name: EventKey[Unpack[EventArgsT]],
+        *args: Unpack[EventArgsT],
+        final: Callable[..., object],
+        scope: EventScope = None,
+    ) -> object: ...
+
+    @overload
     def waterfall(
         self,
         name: str,
+        *args: object,
+        final: Callable[..., object],
+        scope: EventScope = None,
+    ) -> object: ...
+
+    def waterfall(
+        self,
+        name: Any,
         *args: object,
         final: Callable[..., object],
         scope: EventScope = None,
