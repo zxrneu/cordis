@@ -11,6 +11,7 @@ from types import ModuleType
 from typing import TYPE_CHECKING, Any, Generic
 
 from .core import ContextT, Fiber, FiberState
+from .import_tracing import runtime_imports
 
 if TYPE_CHECKING:
     from .loader import Loader
@@ -115,6 +116,13 @@ class ModuleGraph:
         self.imports = {
             name: self._imports(name, path) for name, path in self.paths.items()
         }
+        for source, dependencies in runtime_imports.snapshot().items():
+            if source in self.imports:
+                self.imports[source].update(
+                    dependency
+                    for dependency in dependencies
+                    if dependency in self.paths
+                )
 
     def _imports(self, name: str, path: Path) -> set[str]:
         try:
@@ -352,7 +360,9 @@ class HotReloader(Generic[ContextT]):
                 fiber
                 for fiber in runtime.fibers
                 if fiber.parent._fiber in affected
-                or any(service.fiber in affected for service in fiber.committed.values())
+                or any(
+                    service.fiber in affected for service in fiber.committed.values()
+                )
                 # Pending/failed consumers have no committed dependency view.
                 # Match registrations without evaluating availability predicates.
                 or any(

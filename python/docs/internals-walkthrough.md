@@ -127,15 +127,16 @@ class Context:
     _runtime: _Runtime               # 共享的全局运行时内核
     _parent: Context | None          # 指向父级 Context，形成向上溯源链
     _fiber: Fiber[Any, Self]         # 私有字段擦除配置类型，保留当前 Context 类型
-    _realms_local: dict[str, object] # 本地隔离域重载表: {service_name: realm_object}
-    _intercepts_local: dict[str, object] # 本地拦截元数据: {service_name: metadata}
+    _realms: _LayerMap[object]        # 隔离域重载链: {service_name: realm_object}
+    _intercepts: _LayerMap[object]    # 拦截元数据链: {service_name: metadata}
     _closed: bool                    # 根 Context 是否已关闭
     _close_task: asyncio.Task[None] | None # 正在进行的 close 协程任务缓存（防重入）
 ```
 
 #### 链式向上回溯寻址（Prototype Chain Lookup）
-- **寻找 Realm**：`_realm(name)` 从当前 `ctx` 递归回溯 `_parent`，一旦在 `_realms_local` 找到即返回；若一直到达根节点仍无局部重载，则返回根节点的全局 Realm。
-- **寻找 Metadata**：`metadata(name)` 向上收集各层 `_intercepts_local[name]`，并自顶向下合并（若是字典则进行字典合并，否则以最底层为准）。
+- **分层映射**：`_LayerMap` 在 `ChainMap` 上封装 `local`、`derive()` 与 `layers_for()`；Context、Fiber 和 Loader 无需接触底层 `maps`。`_parent` 仍独立承担祖先关系和生命周期判断。
+- **寻找 Realm**：`_realm(name)` 通过 `_realms` 从当前层回退到祖先层；整条链都没有局部重载时，会在根层创建并返回全局 Realm。
+- **寻找 Metadata**：`metadata(name)` 从 `_intercepts` 收集各层配置；若都是 Mapping，则按“子层覆盖父层”合并，否则使用最底层配置。
 
 ---
 
@@ -336,7 +337,7 @@ def _compute_target(self) -> tuple[int, tuple[int, ...]] | None:
 4. 提交本次依赖后运行 `_execute`；仅目标未变且 desired 仍为真时检查声明服务。正常目标变化中断不会误报 MissingProvisionError。
 5. 初始化失败会回滚并记录错误；desired 为真时进入 FAILED，否则直接 DISPOSED 并移除。成功且目标仍有效时进入 ACTIVE。
 
-`_commit` 除保存服务引用和 Realm，还保存 Fiber Context 及祖先的 `_realms_local`。`_committed_realm` 使旧工作与 cleanup 在换域后仍读原依赖；激活后新派生 Context 的显式隔离仍生效。
+`_commit` 除保存服务引用和 Realm，还保存 Fiber Context 及祖先 `_realms` 的本地层。`_committed_realm` 使旧工作与 cleanup 在换域后仍读原依赖；激活后新派生 Context 的显式隔离仍生效。
 
 
 ---

@@ -4,7 +4,7 @@ import asyncio
 import contextvars
 import inspect
 import math
-from collections import defaultdict
+from collections import ChainMap, defaultdict
 from collections.abc import (
     AsyncIterable,
     AsyncIterator,
@@ -14,6 +14,7 @@ from collections.abc import (
     Iterable,
     Iterator,
     Mapping,
+    MutableMapping,
     MutableSequence,
 )
 from contextlib import AbstractAsyncContextManager, AbstractContextManager
@@ -21,6 +22,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType, TracebackType
 from typing import (
+    TYPE_CHECKING,
     Any,
     Generic,
     Literal,
@@ -28,11 +30,20 @@ from typing import (
     Self,
     TypeAlias,
     TypeVar,
+    TypeVarTuple,
+    Unpack,
     cast,
     overload,
 )
 
+from .accessors import Accessor
 from .keys import EventKey, QueryKey, RequestT, ResultT, ServiceKey
+from .registry import ComponentRegistry
+
+if TYPE_CHECKING:
+    from .logger import ContextLogger
+    from .schema import SchemaLike
+    from .timer import TimerService
 
 
 Cleanup: TypeAlias = Callable[[], object]
@@ -41,6 +52,7 @@ ContextT = TypeVar("ContextT", bound="Context")
 ContextCov = TypeVar("ContextCov", bound="Context", covariant=True)
 ContextContra = TypeVar("ContextContra", bound="Context", contravariant=True)
 ConfigContra = TypeVar("ConfigContra", contravariant=True)
+EventArgsT = TypeVarTuple("EventArgsT")
 EffectValue: TypeAlias = (
     "None | Cleanup | EffectHandle | Iterable[Cleanup | EffectHandle | None] "
     "| AsyncIterable[Cleanup | EffectHandle | None] "
@@ -85,6 +97,20 @@ D = TypeVar("D")
 _EMPTY = object()
 
 
+class _LayerMap(ChainMap[str, T]):
+    """A mutable local layer with read-through access to its ancestors."""
+
+    @property
+    def local(self) -> MutableMapping[str, T]:
+        return self.maps[0]
+
+    def derive(self, values: Mapping[str, T] | None = None) -> Self:
+        return type(self)(dict(values or {}), *self.maps)
+
+    def layers_for(self, name: str) -> tuple[T, ...]:
+        return tuple(layer[name] for layer in self.maps if name in layer)
+
+
 class CordisError(RuntimeError):
     pass
 
@@ -106,6 +132,10 @@ class DuplicateServiceError(CordisError):
 
 
 class DuplicateQueryError(CordisError):
+    pass
+
+
+class DuplicateAccessorError(CordisError):
     pass
 
 
@@ -218,6 +248,14 @@ class Component(Generic[ConfigT, ContextContra]):
     ) -> BoundComponent[ConfigT, ContextContra]:
         """Decode external data before binding; validate still runs on activation."""
         return self.configure(await _await(decoder(raw)))
+
+    async def decode_schema(
+        self, raw: object, schema: SchemaLike[ConfigT]
+    ) -> BoundComponent[ConfigT, ContextContra]:
+        """Decode external data with a supported schema adapter."""
+        from .schema import decode_schema
+
+        return self.configure(await decode_schema(schema, raw))
 
 
 @dataclass(frozen=True)
@@ -841,13 +879,13 @@ class Fiber(Generic[ConfigT, ContextT]):
         context: Context | None = self.ctx
         self._committed_contexts = {}
         while context is not None:
-            self._committed_contexts[context] = dict(context._realms_local)
+            self._committed_contexts[context] = dict(context._realms.local)
             context = context._parent
 
     def _committed_realm(self, ctx: Context, name: str) -> object:
         context: Context | None = ctx
         while context is not None:
-            realms = self._committed_contexts.get(context, context._realms_local)
+            realms = self._committed_contexts.get(context, context._realms.local)
             if name in realms:
                 return realms[name]
             context = context._parent
@@ -1039,8 +1077,10 @@ class _Runtime:
         self.services: dict[object, _Service] = {}
         self.listeners: dict[_EventName, list[_Listener]] = defaultdict(list)
         self.queries: dict[QueryKey[Any, Any], _Listener] = {}
+        self.accessors: dict[str, Accessor] = {}
         self.errors: list[tuple[Exception, Fiber[Any, Any] | None]] = []
         self.root: Context
+        self.registry = ComponentRegistry[Any](self)
 
     def next_uid(self) -> int:
         self.uid += 1
@@ -1162,7 +1202,8 @@ class _Runtime:
     def reassign_context_realms(
         self, ctx: "Context", realms: Mapping[str, object]
     ) -> None:
-        keys = set(ctx._realms_local) | set(realms)
+        local_realms = ctx._realms.local
+        keys = set(local_realms) | set(realms)
         old = {key: ctx._realm(key) for key in keys}
         parent = ctx._parent
         if parent is None:
@@ -1185,8 +1226,8 @@ class _Runtime:
                 )
             moves.append((old[key], new[key], service))
 
-        ctx._realms_local.clear()
-        ctx._realms_local.update(realms)
+        local_realms.clear()
+        local_realms.update(realms)
         for source, target, service in moves:
             if self.services.get(source) is service:
                 del self.services[source]
@@ -1284,21 +1325,21 @@ class Context:
     _runtime: _Runtime
     _parent: Context | None
     _fiber: Fiber[Any, Self]
-    _realms_local: dict[str, object]
-    _intercepts_local: dict[str, object]
+    _realms: _LayerMap[object]
+    _intercepts: _LayerMap[object]
     _closed: bool
     _close_task: asyncio.Task[None] | None
 
     def __init__(self) -> None:
         runtime = _Runtime()
-        object.__setattr__(self, "_runtime", runtime)
-        object.__setattr__(self, "_parent", None)
-        object.__setattr__(self, "_realms_local", {})
-        object.__setattr__(self, "_intercepts_local", {})
-        object.__setattr__(self, "_closed", False)
-        object.__setattr__(self, "_close_task", None)
-        root = Fiber(runtime, self, None, None, root=True)
-        object.__setattr__(self, "_fiber", root)
+        self._runtime = runtime
+        self._parent = None
+        self._realms = _LayerMap()
+        self._intercepts = _LayerMap()
+        self._closed = False
+        self._close_task = None
+        root = Fiber[Any, Self](runtime, cast(Self, self), None, None, root=True)
+        self._fiber = root
         runtime.root = self
 
     def _derive(
@@ -1309,12 +1350,13 @@ class Context:
         intercepts: Mapping[str, object] | None = None,
     ) -> Self:
         ctx = object.__new__(type(self))
-        object.__setattr__(ctx, "_runtime", self._runtime)
-        object.__setattr__(ctx, "_parent", self)
-        object.__setattr__(ctx, "_realms_local", dict(realms or {}))
-        object.__setattr__(ctx, "_intercepts_local", dict(intercepts or {}))
-        object.__setattr__(ctx, "_closed", False)
-        object.__setattr__(ctx, "_fiber", fiber or self._fiber)
+        ctx._runtime = self._runtime
+        ctx._parent = self
+        ctx._realms = self._realms.derive(realms)
+        ctx._intercepts = self._intercepts.derive(intercepts)
+        ctx._closed = False
+        ctx._close_task = None
+        ctx._fiber = fiber or self._fiber
         return ctx
 
     def _is_descendant_of(self, other: "Context") -> bool:
@@ -1337,13 +1379,29 @@ class Context:
     def errors(self) -> tuple[tuple[Exception, FiberView[Context] | None], ...]:
         return tuple(self._runtime.errors)
 
+    @property
+    def registry(self) -> ComponentRegistry[Self]:
+        return cast(ComponentRegistry[Self], self._runtime.registry)
+
+    @property
+    def logger(self) -> ContextLogger:
+        from .logger import LoggerService
+
+        return LoggerService().bind(self)
+
+    @property
+    def timer(self) -> TimerService:
+        from .timer import TimerService
+
+        return TimerService(self)
+
     def _realm(self, name: str) -> object:
-        ctx: Context | None = self
-        while ctx is not None:
-            if name in ctx._realms_local:
-                return ctx._realms_local[name]
-            ctx = ctx._parent
-        return self._runtime.root._realms_local.setdefault(name, object())
+        try:
+            return self._realms[name]
+        except KeyError:
+            realm = object()
+            self._runtime.root._realms.local[name] = realm
+            return realm
 
     def isolate(self, *names: ServiceName, realm: object | None = None) -> Self:
         if realm is not None and len(names) != 1:
@@ -1360,22 +1418,15 @@ class Context:
 
     def metadata(self, name: ServiceName) -> object:
         name = _service_name(name)
-        layers: list[object] = []
-        ctx: Context | None = self
-        while ctx is not None:
-            if name in ctx._intercepts_local:
-                layers.append(ctx._intercepts_local[name])
-            ctx = ctx._parent
+        layers = self._intercepts.layers_for(name)
         if not layers:
             return None
-        layers.reverse()
         if all(isinstance(layer, Mapping) for layer in layers):
-            merged: dict[str, object] = {}
-            for layer in layers:
-                assert isinstance(layer, Mapping)
-                merged.update(layer)
+            merged: dict[Any, Any] = {}
+            for layer in reversed(layers):
+                merged.update(cast(Mapping[Any, Any], layer))
             return merged
-        return layers[-1]
+        return layers[0]
 
     @overload
     def use(
@@ -1428,6 +1479,60 @@ class Context:
     plugin = use
 
     @overload
+    def include(
+        self: ContextT,
+        value: Component[ConfigT, ContextT],
+        config: ConfigT,
+        *,
+        isolate: Iterable[ServiceName] = (),
+        intercept: Mapping[ServiceName, object] | None = None,
+    ) -> Fiber[ConfigT, ContextT]: ...
+
+    @overload
+    def include(
+        self: ContextT,
+        value: Component[None, ContextT],
+        config: None = None,
+        *,
+        isolate: Iterable[ServiceName] = (),
+        intercept: Mapping[ServiceName, object] | None = None,
+    ) -> Fiber[None, ContextT]: ...
+
+    @overload
+    def include(
+        self: ContextT,
+        value: PluginCallback[ContextT, ConfigT] | Plugin[ContextT, ConfigT],
+        config: ConfigT,
+        *,
+        isolate: Iterable[ServiceName] = (),
+        intercept: Mapping[ServiceName, object] | None = None,
+    ) -> Fiber[ConfigT, ContextT]: ...
+
+    @overload
+    def include(
+        self: ContextT,
+        value: PluginCallback[ContextT, None] | Plugin[ContextT, None],
+        config: None = None,
+        *,
+        isolate: Iterable[ServiceName] = (),
+        intercept: Mapping[ServiceName, object] | None = None,
+    ) -> Fiber[None, ContextT]: ...
+
+    def include(
+        self,
+        value: Component[Any, Any] | PluginCallback[Any, Any] | Plugin[Any, Any],
+        config: object = None,
+        *,
+        isolate: Iterable[ServiceName] = (),
+        intercept: Mapping[ServiceName, object] | None = None,
+    ) -> Fiber[Any, Any]:
+        """Mount a component through a derived context in one expression."""
+        ctx: Context = self.isolate(*isolate)
+        for name, metadata in (intercept or {}).items():
+            ctx = ctx.intercept(name, metadata)
+        return ctx.use(value, config)
+
+    @overload
     def inject(
         self: ContextT,
         dependencies: Injection,
@@ -1466,6 +1571,14 @@ class Context:
         self._fiber._attach_effect(effect)
         effect.start(callback)
         return await effect.wait()
+
+    def defer(self, cleanup: Cleanup, *, label: str = "defer") -> EffectHandle:
+        """Register an already-created resource cleanup in the current scope."""
+        self._fiber._assert_effects_allowed()
+        if not callable(cleanup):
+            raise TypeError("cleanup must be callable")
+        effect = _Effect.completed(self._fiber, [cleanup], label)
+        return self._fiber._attach_effect(effect)
 
     def spawn(
         self,
@@ -1573,6 +1686,10 @@ class Context:
     ) -> EffectHandle:
         self._fiber._assert_effects_allowed()
         name = _service_name(name)
+        if name in self._runtime.accessors:
+            raise DuplicateAccessorError(
+                f"property {name!r} is already registered as an accessor"
+            )
         realm = self._realm(name)
         existing = self._runtime.services.get(realm)
         if existing:
@@ -1714,13 +1831,99 @@ class Context:
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_"):
             raise AttributeError(name)
+        accessor = self._runtime.accessors.get(name)
+        if accessor is not None:
+            return accessor.get(self)
         return self.service(name)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if not name.startswith("_"):
+            try:
+                runtime = object.__getattribute__(self, "_runtime")
+            except AttributeError:
+                runtime = None
+            accessor = runtime.accessors.get(name) if runtime is not None else None
+            if accessor is not None:
+                if accessor.set is None:
+                    raise AttributeError(f"accessor {name!r} is read-only")
+                accessor.set(self, value)
+                return
+        object.__setattr__(self, name, value)
+
+    def accessor(
+        self,
+        name: str,
+        get: Callable[[Context], object],
+        *,
+        set: Callable[[Context, object], None] | None = None,
+    ) -> EffectHandle:
+        """Expose a lifecycle-bound computed property on every Context view."""
+        self._fiber._assert_effects_allowed()
+        if not name or name.startswith("_"):
+            raise ValueError("accessor name must be a public non-empty name")
+        if any(name in cls.__dict__ for cls in type(self).__mro__):
+            raise DuplicateAccessorError(
+                f"property {name!r} is already defined by Context"
+            )
+        if name in self._runtime.accessors:
+            raise DuplicateAccessorError(f"accessor {name!r} is already registered")
+        if any(service.name == name for service in self._runtime.services.values()):
+            raise DuplicateAccessorError(
+                f"property {name!r} is already registered as a service"
+            )
+        accessor = Accessor(get, set)
+        self._runtime.accessors[name] = accessor
+
+        def remove() -> None:
+            if self._runtime.accessors.get(name) is accessor:
+                del self._runtime.accessors[name]
+
+        effect = _Effect.completed(self._fiber, [remove], f"accessor:{name}")
+        return self._fiber._attach_effect(effect)
+
+    def mixin(
+        self,
+        service: ServiceName,
+        names: Iterable[str] | Mapping[str, str],
+    ) -> tuple[EffectHandle, ...]:
+        """Expose selected service attributes as Context accessors."""
+        mapping = (
+            {name: name for name in names}
+            if not isinstance(names, Mapping)
+            else dict(names)
+        )
+        for exposed, source in mapping.items():
+            if not isinstance(exposed, str) or not isinstance(source, str):
+                raise TypeError("mixin names must be strings")
+            if (
+                any(exposed in cls.__dict__ for cls in type(self).__mro__)
+                or (exposed in self._runtime.accessors)
+                or any(
+                    registered.name == exposed
+                    for registered in self._runtime.services.values()
+                )
+            ):
+                raise DuplicateAccessorError(
+                    f"property {exposed!r} is already registered"
+                )
+
+        handles = []
+        for exposed, source in mapping.items():
+
+            def get(ctx: Context, source: str = source) -> object:
+                return getattr(ctx.service(service), source)
+
+            def set_value(ctx: Context, value: object, source: str = source) -> None:
+                setattr(ctx.service(service), source, value)
+
+            handles.append(self.accessor(exposed, get, set=set_value))
+        return tuple(handles)
 
     @overload
     def on(
         self,
-        name: EventKey[T],
-        callback: Callable[[T], None | Awaitable[None]],
+        name: EventKey[Unpack[EventArgsT]],
+        callback: Callable[[Unpack[EventArgsT]], None | Awaitable[None]],
         *,
         prepend: bool = False,
         global_: bool = False,
@@ -1742,8 +1945,8 @@ class Context:
 
     def on(
         self,
-        name: _EventName,
-        callback: Callable[..., object],
+        name: Any,
+        callback: Callable[..., Any],
         *,
         prepend: bool = False,
         global_: bool = False,
@@ -1790,8 +1993,8 @@ class Context:
     @overload
     def once(
         self,
-        name: EventKey[T],
-        callback: Callable[[T], None | Awaitable[None]],
+        name: EventKey[Unpack[EventArgsT]],
+        callback: Callable[[Unpack[EventArgsT]], None | Awaitable[None]],
         *,
         prepend: bool = False,
         global_: bool = False,
@@ -1813,8 +2016,8 @@ class Context:
 
     def once(
         self,
-        name: _EventName,
-        callback: Callable[..., object],
+        name: Any,
+        callback: Callable[..., Any],
         *,
         prepend: bool = False,
         global_: bool = False,
@@ -1844,18 +2047,24 @@ class Context:
 
     @overload
     def emit(
-        self, name: EventKey[T], payload: T, /, *, scope: EventScope = None
+        self,
+        name: EventKey[Unpack[EventArgsT]],
+        *args: Unpack[EventArgsT],
+        scope: EventScope = None,
     ) -> None: ...
 
     @overload
     def emit(self, name: str, *args: object, scope: EventScope = None) -> None: ...
 
-    def emit(self, name: _EventName, *args: object, scope: EventScope = None) -> None:
+    def emit(self, name: Any, *args: object, scope: EventScope = None) -> None:
         self._runtime.emit(name, *args, scope=scope)
 
     @overload
     async def parallel(
-        self, name: EventKey[T], payload: T, /, *, scope: EventScope = None
+        self,
+        name: EventKey[Unpack[EventArgsT]],
+        *args: Unpack[EventArgsT],
+        scope: EventScope = None,
     ) -> None: ...
 
     @overload
@@ -1864,7 +2073,7 @@ class Context:
     ) -> None: ...
 
     async def parallel(
-        self, name: _EventName, *args: object, scope: EventScope = None
+        self, name: Any, *args: object, scope: EventScope = None
     ) -> None:
         async def invoke(listener: _Listener) -> object:
             return await _await(self._runtime._invoke(listener, name, args))
@@ -1966,11 +2175,11 @@ class Context:
         task = root._close_task
         if task is None:
             task = asyncio.create_task(root._close())
-            object.__setattr__(root, "_close_task", task)
+            root._close_task = task
         await asyncio.shield(task)
 
     async def _close(self) -> None:
-        object.__setattr__(self, "_closed", True)
+        self._closed = True
         root = self._runtime.root._fiber
         root._set_state(FiberState.UNLOADING)
         for fiber in self._runtime.fibers.copy():

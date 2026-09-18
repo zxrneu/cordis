@@ -2,7 +2,7 @@
 
 > 本文档系统对比 Cordis 的 TypeScript 官方实现（[`packages/core`](../../packages/core)）与 Python 原生实现（[`python/src/cordis`](../src/cordis)）。从设计哲学、类型系统、元编程、并发治理、Loader、HMR 到生态周边进行全维度透视，深入剖析 Python 版目前的局限与演进方向。
 
-Python 类型接口已同步当前仓库：FiberView、EventKey/QueryKey、BoundComponent 与 Loader.mount 均已实现。已有项目的改法见[迁移指南](migration-typed-interfaces.md)；类型改进不代表下文运行时审计问题已经修复。
+Python 接口已同步当前仓库：除 FiberView、类型键和类型化挂载外，现已提供可选 Service 基类、调用方 Context 传播、Accessor/mixin、EntryTree/ConfigStore、多文件 include、混合静态/运行时 HMR 依赖追踪，以及 logger/timer/registry/schema 辅助层。已有项目的改法见[迁移指南](migration-typed-interfaces.md)。
 
 ---
 
@@ -39,13 +39,13 @@ Python 类型接口已同步当前仓库：FiberView、EventKey/QueryKey、Bound
 | :--- | :--- | :--- | :---: |
 | **底层代理模型** | 原生 `Proxy` 深度拦截，强行防守 `inject` 越权 | 基于 `__getattr__` / `__getitem__` 拦截 | 🟡 **能力中等**（对象级无法代理） |
 | **类型体验 (DX)** | 模块扩充（Module Augmentation）零成本静态穿透 | ServiceKey、EventKey/QueryKey、泛型配置绑定与 FiberView；可选 AppContext 描述符 | 🟡 需要显式共享契约；键调用无需自定义 Context |
-| **服务抽象规范** | 标准 `Service` 基类、`[Service.init]`、Callable 机制 | 仅支持无基类函数式 `ctx.provide` | 🔴 **明显不足**（缺少标准抽象） |
-| **调用方反向溯源** | `getTraceable` + `symbols.caller` 全自动透传调用者 | 仅支持 Fiber 级 `contextvars`，无方法级 Caller | 🔴 **明显不足**（无自动调用方标记） |
+| **服务抽象规范** | 标准 `Service` 基类、`[Service.init]`、Callable 机制 | 函数式 `provide` 与可选自注册 `Service` 并存 | 🟢 Pythonic 的显式双入口 |
+| **调用方反向溯源** | `getTraceable` + `symbols.caller` 全自动透传调用者 | `BoundService` + `contextvars` 覆盖同步、异步和迭代调用 | 🟢 已覆盖受管 Service |
 | **并发任务管理** | 纯 Promise/Disposable，缺少在途任务排空策略 | 原生 `ctx.spawn` + `TaskPolicy` (`drain`/`cancel`) | 🟢 **优于 TS**（结构化并发设计更强） |
-| **配置校验规范** | 原生集成 `@standard-schema/spec`（Zod/ArkType） | decode 转换原始数据，validate 校验业务配置，均支持异步 | 🟡 未内置通用 Schema 集成 |
-| **声明式 Loader** | `EntryTree` 树形配置、`group`、多文件拆分与回写 | Entry/children/group + reconcile；另有类型化 mount/unmount | 🟡 支持分组，但 reconcile 非全局事务，无内置多文件回写 |
-| **模块热重载 (HMR)**| 深度集成 Node.js ESM 加载器，全事务性置换与回滚 | 纯 Python 源码 AST 解析，替换 `sys.modules` | 🔴 **明显不足**（无法感知动态 import） |
-| **周边生态** | 官方包含 timer, logger-console, group, include 等 | 内置 group、Loader、HMR 与应用示例 | 🟡 未提供同等的独立 timer/logger/include 插件包 |
+| **配置校验规范** | 原生集成 `@standard-schema/spec`（Zod/ArkType） | decode/validate + callable、Pydantic 风格 Schema adapter | 🟢 通过协议适配 Python 生态 |
+| **声明式 Loader** | `EntryTree` 树形配置、`group`、多文件拆分与回写 | 不可变 EntryTree、事务 ConfigStore、ConfigIncludes | 🟢 已覆盖树操作与独立文件回写 |
+| **模块热重载 (HMR)**| 深度集成 Node.js ESM Loader | AST 静态图 + 导入期动态追踪，事务替换 `sys.modules` | 🟡 语义接近，仍受 Python 全局导入机制约束 |
+| **周边生态** | timer, logger-console, group, include 等独立包 | 内置 timer/logger/group/include/registry 辅助层 | 🟡 能力齐备，插件生态规模仍较小 |
 | **边界健壮性** | 经历数万常驻节点长期生产检验（如 Koishi 生态） | 审计 B01–B08 与 K01–K02 已于 2026-09-13 修复 | 🟡 已有回归覆盖，仍需长期运行验证 |
 
 ---
@@ -69,8 +69,8 @@ Python 类型接口已同步当前仓库：FiberView、EventKey/QueryKey、Bound
 
 - **Python 版**：
   Python 版通过在 Context 类上重写 `__getattr__` 与 `__getitem__`（[Context 属性和下标读取](../src/cordis/core.py#L1707)）模拟该行为。
-- **Python 版的不足**：
-  Python 缺乏语言原生的透明对象级 Proxy（`__getattr__` 只能拦截不存在的属性，对已有属性无法拦截）。一旦服务实例被返回给上层，服务对象自身的方法调用链**无法被运行时自动挂载拦截钩子**，导致配置拦截（Intercepts）和动态访问器（Accessors）的灵活性大幅缩水。
+- **Python 版的边界**：
+  Python 没有语言原生的透明 Proxy。当前实现用生命周期绑定的 `ctx.accessor()` / `ctx.mixin()` 扩展 Context，并对 `Service` 子类返回 `BoundService` 使用点视图，从而传播调用者与拦截元数据。任意第三方对象若直接通过 `ctx.provide()` 发布，仍不会自动获得方法级代理，这是刻意保留的显式边界。
 
 ### 2.2 可调用服务（Callable Service）与原型缝合
 
@@ -85,8 +85,8 @@ Python 类型接口已同步当前仓库：FiberView、EventKey/QueryKey、Bound
   app.http('https://api.com')
   app.http.post('https://api.com', {})
   ```
-- **Python 版的不足**：
-  虽然 Python 类支持定义 `__call__`，但由于没有统一的 Service 基类与自动原型缝合机制，无法实现将调用者 Context、拦截配置与追踪器自动融合在可调用服务中的能力。
+- **Python 版**：
+  `Service` 构造时自注册，`BoundService` 同时代理普通方法和 `__call__`；调用期间 `service.ctx` 指向消费者 Context，调用结束后恢复提供方 Context。它不修改类原型，也不使用 Metaclass，符合 Python 对显式对象组合的习惯。
 
 ---
 
@@ -109,7 +109,7 @@ TypeScript 可通过模块扩充声明 Context 服务成员；Python 需要显�
 
 ### 3.2 工业级 Schema 规范 vs 基础校验回调
 
-TS 版适配 [`@standard-schema/spec`](https://github.com/standard-schema/standard-schema)。Python 提供 `decode(raw, decoder)` 将 object 转为 ConfigT，再绑定插件；validate 接收 ConfigT 并返回 ConfigT 或 Awaitable[ConfigT]。尚未内置 Pydantic 等 Schema 适配器，应用可以通过 decoder 接入自己的校验库。
+TS 版适配 [`@standard-schema/spec`](https://github.com/standard-schema/standard-schema)。Python 的 `decode_schema()` / `schema_decoder()` 接受 callable、`validate()`、Pydantic v2 的 `validate_python()`、模型的 `model_validate()` 以及同步/异步结果；`Component.decode_schema()` 解码后返回类型化 BoundComponent。运行时不强依赖任何校验库。
 
 ### 当前已具备的类型链
 
@@ -117,7 +117,7 @@ TS 版适配 [`@standard-schema/spec`](https://github.com/standard-schema/standa
 | --- | --- | --- |
 | ctx.use / configure → Loader.mount | 配置与 Context 类型，返回可 update 的 Fiber | Entry/reconcile 的插件与配置仍独立存储 |
 | Context.fiber / Loader.get、reload | FiberView 保留 Context，配置只供检查 | 未知配置不提供 update；视图不是运行时沙箱 |
-| EventKey + on/emit/parallel | 一个 payload 及回调参数 | 字符串事件不关联参数类型 |
+| EventKey + on/emit/parallel | 通过 TypeVarTuple 关联零到多个参数 | 字符串事件不关联参数类型 |
 | QueryKey + handle/query | 请求、结果和可选 None | 单处理器语义，不替代多监听器短路链 |
 
 EventKey/QueryKey 按对象身份匹配，必须共享同一个键；ServiceKey 继续按字符串名字路由。类型化 mount 目前不参与源码 HMR，动态 Entry 的字符串定位符仍是代码替换入口。
@@ -136,16 +136,15 @@ EventKey/QueryKey 按对象身份匹配，必须共享同一个键；ServiceKey 
   - 隔离域过滤策略（`[symbols.filter]`）；
   - 上下文派生扩展（`[symbols.extend]`）；
   - 配置合并算法（`[symbols.resolveConfig]`）。
-- **Python 版的不足**：
-  **完全没有 `Service` 基类！** 
-  Python 版把服务降级为了普通对象，发布服务必须在普通插件函数中调用 `ctx.provide(KEY, instance)`。这种设计导致服务的定义与生命周期管理割裂在类与函数两个不同层级，缺乏标准化的服务工程实践。
+- **Python 版**：
+  `Service(ctx, key)` 是可选的自注册基类，适合需要调用方 Context 的对象服务；轻量值和第三方对象仍可继续使用 `ctx.provide()`。两条路径共享 Realm、依赖声明和 Effect 回滚，不强迫所有服务继承框架类型。
 
 ### 4.2 上下文反向追踪（Caller Traceability）
 
 - **TypeScript 版**：
   拥有强大的 `getTraceable` 机制。当消费者通过 `ctx.db.query()` 访问数据库时，运行时自动给数据库服务挂载 `symbols.caller = ctx`。数据库内部读取 `this.ctx[symbols.caller]` 即可**精确获知是哪一个插件的哪次调用触发了自己**，为权限鉴定、插件调用量配额与链路追踪提供了底层支持。
-- **Python 版的不足**：
-  完全不具备方法级调用者自动追踪能力，跨插件调用时无法得知调用发起方身份。
+- **Python 版**：
+  `BoundService` 在同步方法、awaitable、同步迭代器和异步迭代器的实际执行期间设置 `contextvars`。服务通过 `self.ctx` 或 `current_context()` 获得调用方；服务内部创建的监听器、任务和子插件因此归消费者生命周期所有。传播只针对 `Service`，不会隐式包装任意对象。
 
 ---
 
@@ -192,9 +191,9 @@ flowchart TD
   - 支持 `@cordisjs/plugin-include`，能够将单体大配置文件拆分为模块化的独立 YAML 子文件，并支持运行期将配置变更动态回写保存至磁盘。
 ### 6.2 Python 版 Loader 的恢复与并发边界
 
-Python 已修复候选导入前删除旧条目、Entry 提前记录失败配置和并发修改问题：先预检，保存旧状态，串行应用，失败后恢复受影响挂载。组内启动失败与提供者变更导致的消费者失败也会传播。见 [Loader API](api/loader.md)。
+Python 已增加不可变 `EntryTree` 的 create/update/remove/move 路径操作。`ConfigStore` 把 Loader reconcile、乐观版本检查和 JSON/YAML 原子回写放在一个取消安全的串行事务中；任一步失败都会恢复旧运行态。`ConfigIncludes` 将每个文件挂成独立 group/nested Loader，允许相同局部 id 并分别监听和回写。见 [Loader API](api/loader.md)。
 
-这些恢复不提供数据库式隔离，也不能撤销任意外部副作用。children/group 支持嵌套 Loader；类型化 mount 独立管理，不被 reconcile([]) 删除。不同 Loader 的更新仍需宿主协调。
+这些恢复不提供进程外数据库式隔离，也不能撤销任意外部副作用。children/group 支持嵌套 Loader；类型化 mount 独立管理，不被 reconcile([]) 删除。不同根 Loader 的更新仍需宿主协调。
 
 
 ---
@@ -210,7 +209,7 @@ Python 已修复候选导入前删除旧条目、Entry 提前记录失败配置�
 
 Python 的 B04/B05 已修复：模块缓存和父包属性一起恢复，操作取消会等提交或回滚收尾。接受的包会扩展到缓存子模块，并在 reload_changed 中检查 external 边界。
 
-剩余边界是 AST 不能完整识别动态 import、全进程源码扫描成本、导入时外部副作用，以及外层 Loader 不自动遍历 group 子 Loader。见 [HMR API](api/hmr.md)。
+当前依赖图合并 AST 静态边和插件导入期间捕获的 `__import__` / `importlib.import_module()` 动态边；动态模块名因此能参与反向影响分析。剩余边界是插件加载窗口之外才发生的条件导入、全进程源码扫描成本、导入时外部副作用，以及外层 Loader 不自动遍历 group 子 Loader。见 [HMR API](api/hmr.md)。
 
 
 ---
@@ -231,14 +230,13 @@ TypeScript 官方生态矩阵:
 └── @cordisjs/plugin-utils           (对象追踪与工具集)
 
 Python 当前状态:
-├── cordis-python (core, loader, hmr, keys；统一从 cordis 导出)
-├── 内置 group、配置文件监听、受管任务、类型化通知与查询
+├── cordis-python (core, loader/config, hmr, services；统一从 cordis 导出)
+├── 内置 group/include、logger、timer、registry、schema adapter
+├── 配置文件监听、原子回写、受管任务、类型化通知与查询
 └── examples/ (CSV 导入、Agent、安全卸载、类型化接口等示例)
 ```
 
-**对开发者的直接影响**：
-- 在 Python 中，开发者无法使用 `ctx.timer.setTimeout()`，必须手动使用 `asyncio.sleep` 与 `ctx.spawn` 组合；
-- 没有开箱即用的分级日志插件，无法实现按上下文作用域自动过滤日志。
+Python 的这些能力采用标准库习惯：`ctx.timer.timeout()/interval()/debounce()/throttle()` 返回受管 Task；`ctx.logger` 基于 `logging` 并自动附加 Fiber 元数据；`ContextLogger.add_handler()` 随作用域移除 handler。与 TS 的主要差距从“缺少能力”变成了“生态包数量和长期生产验证规模不同”。
 
 ---
 
@@ -266,6 +264,6 @@ Python 当前状态:
 1. cleanup 期限、容量和长期运行诊断。
 2. 动态依赖声明、嵌套 Loader 的 HMR 范围与 watcher 恢复策略。
 3. 依赖环、整组就绪和 Realm 冲突预检。
-4. 服务抽象与标准插件生态。
+4. 长期运行观测、插件生态规模与更多第三方 Schema/日志 handler 集成。
 
 完整状态见[实现与维护参考](implementation.md#维护清单)。

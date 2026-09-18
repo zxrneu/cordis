@@ -1,19 +1,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Generic, Never, TypeVar, overload
+from typing import (
+    TYPE_CHECKING,
+    Generic,
+    Never,
+    TypeVar,
+    TypeVarTuple,
+    Unpack,
+    overload,
+)
 
 if TYPE_CHECKING:
     from .core import Context
 
 T = TypeVar("T")
+EventArgsT = TypeVarTuple("EventArgsT")
 RequestT = TypeVar("RequestT")
 ResultT = TypeVar("ResultT")
 
 
 @dataclass(frozen=True, eq=False)
-class EventKey(Generic[T]):
-    """Invariant payload contract; dispatch uses key identity, not its label."""
+class EventKey(Generic[Unpack[EventArgsT]]):
+    """Invariant argument contract; dispatch uses key identity, not its label."""
 
     name: str
 

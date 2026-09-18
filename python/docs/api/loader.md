@@ -30,7 +30,7 @@ Entry(
 | `intercept` | `Mapping[str, object]` | 按字符串服务名给当前条目设置拦截元数据，读取后需收窄类型 |
 | `children` | `tuple[Entry \| Mapping[str, Any], ...]` | 嵌套插件清单；默认为空 |
 
-必须满足以下两种形式之一，否则抛出 `ValueError`：指定 `plugin`；或不指定 plugin、提供非空 `children`。不能同时指定插件和子条目。
+指定 `plugin` 表示插件条目；不指定 plugin 表示 group，`children` 可以为空。不能同时指定插件和子条目。
 
 Entry 会复制并冻结 isolate / intercept 的外层映射，把 children 转成 tuple；**不会深拷贝 config 或嵌套值**。更新时创建新配置，不要原地修改旧对象。
 
@@ -81,11 +81,12 @@ mount 管理的条目不进入 `entries`，也不会被 `reconcile()` 的完整�
 
 类型化挂载使用 Loader 的 Context；如需隔离或拦截，可先通过 `ctx.isolate()` / `ctx.intercept()` 创建装配 Context。完整示例见 [`typed_interfaces.py`](../../examples/typed_interfaces.py)。
 
-### entries / get
+### entries / get / child
 
 ```text
 loader.entries -> tuple[Entry, ...]
 loader.get(entry_id: str) -> FiberView[ContextT] | None
+loader.child(entry_id: str) -> Loader[ContextT] | None
 ```
 
 `entries` 返回这个 Loader 直接管理的声明式条目快照，包括停用项。`get()` 可以查询声明式条目及 mount 挂载，行为如下：
@@ -96,7 +97,7 @@ loader.get(entry_id: str) -> FiberView[ContextT] | None
 | 已记录条目但没有挂载 Fiber，例如停用项 | `None` |
 | 不存在该 id | 抛出 `KeyError`，不是返回 `None` |
 
-嵌套组由内部 Loader 管理。父 Loader 的 `get()` 只能查询组的 id，不能用它直接查询子条目的 id。
+嵌套组由内部 Loader 管理。父 Loader 的 `get()` 只能查询组的 id；`child()` 可取得已激活 group 的嵌套 Loader，非 group、未激活或未知 id 返回 `None`。
 
 字符串 id 不能恢复插件的具体配置类型，返回视图的 config 因此为 object，不暴露 update。ctx 保留 Loader 的 Context 子类类型。代码内需要更新配置时，保留 `ctx.use()` 或 `loader.mount()` 的返回值。
 
@@ -205,6 +206,30 @@ async def close() -> None: ...
 它不关闭整个 Context，也不自动停止在宿主中启动的文件监听任务；请将监听任务交给 Context 管理，并按宿主的退出流程停止它们。
 
 ## 配置文件
+
+### EntryTree / ConfigStore / ConfigIncludes
+
+`EntryTree` 是不可变配置值对象，提供 `get(path)`、`create()`、`update()`、`remove()` 和 `move()`。路径使用 `/` 分隔稳定 id；每次修改返回新树，旧树保持不变，并在构造时递归拒绝同层重复 id。
+
+```python
+from cordis import ConfigIncludes, ConfigStore, Entry, Loader
+
+loader = Loader(ctx)
+store = ConfigStore.file(loader, "cordis.json")
+await store.load()
+await store.create(Entry("worker", "myapp.plugins:worker"))
+await store.update("worker", enabled=False)
+
+includes = ConfigIncludes(loader)
+tenant = await includes.include_file("tenant-a", "tenant-a.yaml")
+await tenant.update("worker", config={"interval": 10})
+```
+
+`ConfigStore` 依赖 `ConfigBackend` 和 `ConfigCodec` 协议；内置 `FileBackend`、`JsonCodec`、`YamlCodec`。文件写入使用同目录临时文件和 `os.replace()`，写入前比较内容摘要；外部编辑过的文件会抛出 `StaleConfigError`，同时恢复 Loader 的上一棵树。CRUD、保存和取消等待均串行收尾，避免两个并发修改从同一旧树派生后互相覆盖。
+
+`ConfigIncludes` 把每个文件挂成一个空 group，再对它的 nested Loader 建立独立 ConfigStore。因此不同文件可以使用相同的局部条目 id，并分别更新、监听与回写。`include_file()` 加载失败会移除刚建立的 group；`remove(name)` 卸载该文件内的全部插件。
+
+当前可写格式是 JSON 和可选 YAML；Loader 的 TOML 读取兼容接口仍是只读加载，因为标准库没有 TOML writer。自定义存储（数据库、远端 KV）只需实现异步 `read()` / `write()` 和 `identity`，无需修改 Loader。
 
 ### load_file / load_json
 

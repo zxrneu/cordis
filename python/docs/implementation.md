@@ -14,6 +14,12 @@
 | [keys.py](../src/cordis/keys.py) | ServiceKey 与服务描述符；EventKey、QueryKey 的类型契约与身份 |
 | [loader.py](../src/cordis/loader.py) | 类型化挂载、动态 Entry 清单协调、嵌套组、配置文件监听 |
 | [hmr.py](../src/cordis/hmr.py) | Python 模块依赖图、过期 Entry 检测、模块替换与恢复 |
+| [config.py](../src/cordis/config.py) | 不可变 EntryTree、存储/编码协议、事务 ConfigStore 与多文件 include |
+| [services.py](../src/cordis/services.py) | 可选 Service 基类、BoundService 与调用方 Context 传播 |
+| [accessors.py](../src/cordis/accessors.py) | 生命周期绑定的 Context accessor 描述 |
+| [logger.py](../src/cordis/logger.py) / [timer.py](../src/cordis/timer.py) | 基于标准库和受管 Task 的辅助层 |
+| [registry.py](../src/cordis/registry.py) / [schema.py](../src/cordis/schema.py) | 组件检查操作与配置 Schema 适配边界 |
+| [import_tracing.py](../src/cordis/import_tracing.py) | 插件导入窗口内的动态 import 边采集 |
 | [__init__.py](../src/cordis/__init__.py) | 公共 API |
 | [tests/](../tests/) | 生命周期、失败回滚、隔离、Loader 与 HMR 测试 |
 
@@ -101,7 +107,7 @@ def submit(self, request: ImportRequest) -> asyncio.Task[ImportReport]:
 
 HMR 的流程是：
 
-1. 从已加载 Python 源模块构建静态 import 图；
+1. 从已加载 Python 源模块构建 AST 静态 import 图，并合并插件加载期捕获的动态 import 边；
 2. 从变更文件沿反向依赖找到受影响模块；
 3. 找出插件模块受影响的 Loader Entry；
 4. 备份并清除相应的 `sys.modules` 和字节码缓存；
@@ -134,7 +140,7 @@ HMR 的恢复范围是模块缓存和受管插件，恢复本身也可能失败�
 | 边界 | Loader 更新有预检和失败恢复，不提供数据库式隔离 | 失败时恢复受影响的旧 Entry/挂载；恢复本身失败会聚合报告；外部副作用需应用补偿 |
 | 边界 | 同一 Loader 的管理操作串行执行 | 不同 Loader、直接 Fiber 操作及进程外更新仍需宿主协调 |
 | 边界 | reconcile 成功不等于业务就绪 | ACTIVE 父 Context 下传播本轮启动失败；缺少依赖仍可 PENDING；父级 LOADING 时子激活延后 |
-| P1 | HMR 依赖图只识别 AST 中的静态 import | `importlib` 动态导入、运行时路径修改、部分 namespace package 需要显式 reload 或完整重启 |
+| P1 | HMR 动态依赖只在插件导入窗口采集 | 插件启动后才发生的条件导入、运行时路径修改和部分 namespace package 仍需显式 reload 或完整重启 |
 | P1 | HMR 恢复模块缓存、父包绑定和 Component，不撤销 import-time 外部副作用 | 保持模块顶层纯净，把副作用放进插件生命周期 |
 | P1 | 没有依赖环诊断 | 循环依赖会保持 `PENDING`；通过状态事件和 `fibers` 排查 |
 | 边界 | 字符串服务名、字符串事件和 Entry 文件清单仍是动态接口 | 类型化代码使用服务键、事件键及 configure/decode/mount；这些入口不会自动验证旧动态代码 |

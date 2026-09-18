@@ -13,13 +13,17 @@
 | 定义插件、声明依赖和配置校验 | `plugin` / `component`、`Component`、`Plugin` | [插件与生命周期](api/plugins.md#定义插件) |
 | 挂载插件、更新配置、等待和卸载 | `Context.use()`、`Fiber`、`FiberState` | [挂载与运行句柄](api/plugins.md#挂载插件) |
 | 定义带类型的服务接口 | `ServiceKey[T]`、Context 描述符 | [服务键](api/context.md#servicekey) |
+| 定义自动注册且可感知调用方的对象服务 | `Service`、`BoundService`、`current_context()` | [服务操作](api/context.md#服务操作) |
 | 注册、读取和替换服务 | `provide()`、`service()`、`get()`、`set()`、`notify()` | [服务操作](api/context.md#服务操作) |
 | 隔离服务、按调用方适配服务 | `isolate()`、`intercept()`、`metadata()` | [隔离与拦截](api/context.md#隔离与拦截) |
-| 登记清理操作、管理后台任务 | `effect()`、`EffectHandle`、`spawn()`、`TaskPolicy` | [资源与任务](api/context.md#资源与任务) |
+| 登记清理操作、管理后台任务 | `effect()`、`defer()`、`EffectHandle`、`spawn()`、`TaskPolicy` | [资源与任务](api/context.md#资源与任务) |
 | 注册监听器、派发事件 | `on()`、`once()`、`emit()`、`parallel()`、`serial()`、`bail()`、`waterfall()` | [事件](api/context.md#事件) |
 | 关联通知参数、查询请求和结果类型 | `EventKey`、`QueryKey`、`handle()`、`query()` | [类型化事件](api/context.md#eventkey类型化通知) |
 | 绑定配置后类型化挂载 | `Component.configure()` / `decode()`、`BoundComponent`、`Loader.mount()` | [类型化挂载](api/loader.md#mount--unmount) |
 | 装配插件树、加载或监听配置文件 | `Entry`、`Loader`、`group`、`import_plugin()` | [配置与加载器](api/loader.md) |
+| 编辑、回写或拆分配置树 | `EntryTree`、`ConfigStore`、`ConfigIncludes` | [配置与加载器](api/loader.md) |
+| 动态属性、日志、定时器和组件检查 | `accessor()` / `mixin()`、`ctx.logger`、`ctx.timer`、`ctx.registry` | [Context](api/context.md) |
+| 接入配置校验库 | `decode_schema()`、`schema_decoder()`、`Component.decode_schema()` | [插件与生命周期](api/plugins.md) |
 | 重载修改后的 Python 模块 | `HotReloader`、`ModuleGraph`、`FullRestartRequired` | [代码热重载](api/hmr.md) |
 | 查看错误和生命周期状态 | `Context.errors`、`Context.fibers`、内部事件 | [观测与异常](#观测与异常) |
 
@@ -136,6 +140,7 @@ root.on("internal/error", lambda error, fiber: print(fiber, error))
 | `UndeclaredServiceError` | `CordisError` | 严格读取未声明的服务；根 Context 严格读取不存在的服务也会抛出它 |
 | `DuplicateServiceError` | `CordisError` | 同一 Realm 重复提供服务，或 `set()` 修改自己不拥有的服务 |
 | `DuplicateQueryError` | `CordisError` | 同一运行时对同一个 QueryKey 重复注册处理器 |
+| `DuplicateAccessorError` | `CordisError` | 动态 accessor 与已有 accessor 或服务属性重名 |
 | `MissingProvisionError` | `CordisError` | 插件初始化完成，却没有注册 `provide=[...]` 声明的服务 |
 | `FullRestartRequired` | `RuntimeError` | HMR 的受影响模块触及配置的外部边界；它不是 `CordisError` 的子类 |
 
@@ -149,9 +154,10 @@ root.on("internal/error", lambda error, fiber: print(fiber, error))
 | --- | --- |
 | 插件 | [`plugin` / `component`、`Component`、`BoundComponent`、`Plugin`](api/plugins.md#定义插件) |
 | 生命周期 | [`Fiber`、`FiberView`、`FiberState`](api/plugins.md#fiber) |
-| 上下文与服务 | [`Context`、`ServiceKey`](api/context.md) |
+| 上下文与服务 | [`Context`、`ServiceKey`、`Service`、`BoundService`、`Accessor`](api/context.md) |
 | 类型化事件 | [`EventKey`、`QueryKey`](api/context.md#事件) |
 | 资源与任务 | [`EffectHandle`、`EffectCallback`、`EffectResult`、`Cleanup`、`TaskPolicy`](api/context.md#资源与任务) |
-| 配置 | [`Entry`、`Loader`、`group`、`import_plugin`](api/loader.md) |
+| 配置 | [`Entry`、`EntryTree`、`Loader`、`ConfigStore`、`ConfigIncludes`、`group`、`import_plugin`](api/loader.md) |
+| 辅助层 | `ContextLogger`、`LoggerService`、`TimerService`、`ComponentRegistry`、Schema adapters |
 | 热重载 | [`HotReloader`、`ModuleGraph`](api/hmr.md) |
 | 异常 | [`CordisError`、`InactiveContextError`、`InactiveServiceError`、`UndeclaredServiceError`、`DuplicateServiceError`、`DuplicateQueryError`、`MissingProvisionError`、`FullRestartRequired`](#公开异常) |

@@ -93,6 +93,15 @@ class CordisTests(unittest.IsolatedAsyncioTestCase):
         await root.flush()
         self.assertCountEqual(values, ["left", "right"])
 
+    async def test_nested_isolation_inherits_and_overrides_realms(self):
+        root = Context()
+        realm = object()
+        parent = root.isolate("value", realm=realm)
+
+        self.assertIs(parent.intercept("value", None)._realm("value"), realm)
+        self.assertIs(parent.isolate("other")._realm("value"), realm)
+        self.assertIsNot(parent.isolate("value")._realm("value"), realm)
+
     async def test_undeclared_service_access_is_rejected(self):
         @plugin
         def bad(ctx, _config):
@@ -239,6 +248,17 @@ class CordisTests(unittest.IsolatedAsyncioTestCase):
         root.use(consumer)
         await root.flush()
         self.assertEqual(values, ["py-cordis"])
+
+    async def test_nested_intercepts_merge_with_nearest_layer_winning(self):
+        root = Context()
+        outer = root.intercept("value", {"outer": True, "shared": "outer"})
+        inner = outer.intercept("value", {"inner": True, "shared": "inner"})
+
+        self.assertEqual(
+            inner.metadata("value"),
+            {"outer": True, "inner": True, "shared": "inner"},
+        )
+        self.assertEqual(inner.intercept("value", "leaf").metadata("value"), "leaf")
 
     async def test_declared_provision_is_checked(self):
         @plugin(provide=["missing"])

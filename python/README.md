@@ -15,7 +15,9 @@
 - **类型化 API**：泛型 `Component` / `Fiber` 保留配置与 Context 类型，`FiberView` 分离状态查看与配置写入，`ServiceKey[T]` 检查服务注册和读取，`EventKey` / `QueryKey` 关联事件参数和查询结果；
 - **隔离域与拦截机制**：Context 支持隔离 Realm 与动态合并的拦截元数据；
 - **声明式加载器**：基于键控配置树与受管 Realm 进行协调管理（Reconciliation）；
-- **感知依赖的 HMR（热重载）**：事务性替换模块，在导入或激活失败时自动回滚至上一可用组件状态。
+- **持久化配置事务**：不可变 `EntryTree`、原子 JSON/YAML 回写、乐观并发检查与多文件 include；
+- **上下文服务工具**：可选 `Service` 基类、调用方 Context 传播、Accessor/mixin、logger、timer 和组件 registry；
+- **感知依赖的 HMR（热重载）**：合并 AST 与运行时 import 边，事务性替换模块并在失败时回滚。
 
 
 运行时修复：[2026-09-13 缺陷修复与验证](docs/bug-fixes-2026-09-13.md)（审计 10 项已修复，含取消、并发和回滚回归）。
@@ -113,11 +115,19 @@ await loader.reload_changed(["my_app/plugins/shared.py"])
 
 插件定位符使用 `package.module:attribute` 语法。`load_file()` 支持 JSON 和 TOML；在安装可选依赖（`pip install 'cordis-python[yaml]'`）后还支持 YAML。`watch_file()` 和 `HotReloader.watch()` 提供了无外部依赖的轮询式文件监听器。
 
+需要运行时编辑并写回配置时，使用 `ConfigStore.file(loader, path)`；它以不可变 `EntryTree` 执行路径 CRUD，写入前检查外部修改，并将 Loader 更新与原子文件替换作为一个可回滚事务。多个配置文件可通过 `ConfigIncludes(loader).include_file(name, path)` 各自挂到独立 group，局部条目 id 互不冲突。
+
+## 服务与运行时辅助层
+
+复杂对象服务可以选择继承 `Service`。构造函数会自注册；消费者读取到的是绑定视图，服务方法内的 `self.ctx` 自动指向本次调用方，因此创建的任务、监听器和子插件跟随消费者卸载。普通值仍可直接使用 `ctx.provide()`，无需继承框架类型。
+
+`ctx.accessor()` 和 `ctx.mixin()` 提供生命周期绑定的动态属性；`ctx.include()` 将 isolate/intercept 与组件挂载合并为一次调用。`ctx.logger` 基于标准库 logging 并附加 Fiber 元数据，`ctx.timer` 提供受管 timeout/interval/debounce/throttle，`ctx.registry` 用于查询、重启和销毁已挂载组件。
+
 ## 事件派发
 
 生命周期绑定的事件监听器支持同步派发 `emit`、并发聚合 `parallel`、短路中断 `serial`/`bail` 以及中间件风格的 `waterfall`。内置的 `internal/status` 和 `internal/error` 事件用于暴露生命周期状态转换和异常；`ctx.fibers` 与 `ctx.errors` 提供运行时的快照信息。
 
-业务通知可用 `EventKey[Payload]` 与 on/once、emit/parallel 关联参数；单处理器请求用 `QueryKey[Request, Result]` 与 handle/query，查询返回 Result 或 None。两种键按对象身份匹配，需由注册方和调用方共享。字符串事件保留原有动态派发策略。
+业务通知可用 `EventKey[*Args]` 与 on/once、emit/parallel 关联零到多个参数，例如 `EventKey[int, str]`；单处理器请求用 `QueryKey[Request, Result]` 与 handle/query，查询返回 Result 或 None。两种键按对象身份匹配，需由注册方和调用方共享。字符串事件保留原有动态派发策略。
 
 ## 异步任务与插件卸载
 

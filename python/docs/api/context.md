@@ -147,6 +147,24 @@ ctx.notify(*names: ServiceName) -> None
 
 `notify()` 不是强制重启广播：如果提供者身份和可用性没有改变，消费者不会重启。
 
+### Service 与调用方 Context
+
+对象服务可选择继承 `Service[ConfigT]`，并在构造时调用 `super().__init__(ctx, KEY)` 自注册。消费者严格读取时得到轻量 `BoundService` 使用点视图；同步方法、awaitable、同步/异步迭代器执行期间，`self.ctx` 和 `current_context()` 指向调用方 Context，执行结束后恢复提供方 Context。
+
+因此服务内部的 `self.ctx.spawn()`、`self.ctx.on()`、`self.ctx.use()` 会归调用方生命周期所有。这个机制只包装 Service 子类；普通 `ctx.provide()` 对象保持原样，适合值服务和不需要调用方追踪的第三方对象。
+
+### accessor / mixin / include 与运行时辅助属性
+
+```text
+ctx.accessor(name, get, *, set=None) -> EffectHandle
+ctx.mixin(service, names) -> tuple[EffectHandle, ...]
+ctx.include(plugin, config=None, *, isolate=(), intercept=None) -> Fiber
+```
+
+`accessor()` 注册计算属性，`mixin()` 把服务的选定属性映射到 Context；两者都随当前 Effect 撤销，并拒绝与已有服务或 accessor 重名。`include()` 先派生 isolate/intercept Context 再挂载组件，派生后仍保留 Context 子类。
+
+`ctx.logger` 返回附带 Fiber 名称、uid 和 `logger` intercept 元数据的标准库日志 facade；`add_handler()` 随 Context 作用域移除并关闭 handler。`ctx.timer` 提供 timeout、interval、debounce、throttle，底层全部使用 `ctx.spawn()`。`ctx.registry` 提供 Fiber 快照以及按 Component/name 的 find、restart、dispose。
+
 ## 隔离与拦截
 
 ### isolate
@@ -163,7 +181,7 @@ right = root.isolate(CLOCK)
 # 在 left / right 分别挂载 CLOCK 的提供者与消费者，即可各自使用自己的服务。
 ```
 
-传入 `realm` 可以让多个派生视图共享一个服务域。显式 realm 只允许指定一个服务，否则抛出 `ValueError`。建议创建并复用 `shared = object()` 这样的不透明标识；当前实现对假值 realm 会新建标识。不要把同一个标识复用于不同服务名，因为底层服务注册以 Realm 为键。
+传入 `realm` 可以让多个派生视图共享一个服务域。显式 realm 只允许指定一个服务，否则抛出 `ValueError`。建议创建并复用 `shared = object()` 这样的不透明标识；`0`、空字符串等假值也是有效显式标识。不要把同一个标识复用于不同服务名，因为底层服务注册以 Realm 为键。
 
 隔离控制的是服务解析，不等同于进程沙箱，也不会自动隔离事件。
 
@@ -256,6 +274,8 @@ await handle()  # 正确：调用后等待清理
 
 清理整个嵌套 Effect 会处理其中的任务、子插件和资源。`on()` / `handle()` 返回的句柄只移除注册，不会取消此前已经触发的回调任务；这些任务仍由注册时的作用域管理。
 
+已有资源无需执行初始化回调时，可用 `ctx.defer(cleanup, label="...")` 直接登记逆操作并获得 EffectHandle。
+
 ### spawn / TaskPolicy
 
 ```python
@@ -295,18 +315,20 @@ result = await task  # int
 
 ## 事件
 
-通知可以使用 `EventKey[T]` 关联参数类型；查询使用 `QueryKey[RequestT, ResultT]` 关联请求与结果。字符串事件继续支持动态的多参数和派发策略。
+通知可以使用 `EventKey[*Args]` 关联零到多个参数类型；查询使用 `QueryKey[RequestT, ResultT]` 关联请求与结果。字符串事件继续支持动态的多参数和派发策略。
 
 ### EventKey：类型化通知
 
 ```python
 MESSAGE = EventKey[Message]("message")
+PROGRESS = EventKey[int, str]("progress")
 ctx.on(MESSAGE, handle_message)       # Callable[[Message], None | Awaitable[None]]
 ctx.emit(MESSAGE, Message(text="hi"))
+ctx.emit(PROGRESS, 2, "ready")
 await ctx.parallel(MESSAGE, Message(text="hi"))
 ```
 
-`EventKey[T]` 可用于 `on()`、`once()`、`emit()`、`parallel()`。通知接收一个位置参数 `T`，回调没有业务返回值；多个字段可放入 dataclass。注册选项和 scope 的行为与字符串通知相同。带类型的键不用于 `serial()`、`bail()` 或 `waterfall()`。
+`EventKey[*Args]` 可用于 `on()`、`once()`、`emit()`、`parallel()`，回调位置参数必须与键逐项一致且没有业务返回值。注册选项和 scope 的行为与字符串通知相同。带类型的键不用于 `serial()`、`bail()` 或 `waterfall()`。
 
 `EventKey` 与 `QueryKey` 均不可变，名称须为非空字符串，否则抛出 `ValueError`。**键按对象身份匹配，名称仅用于诊断**：两个 `EventKey[Message]("message")` 是不同通道，也不与字符串 `"message"` 互通。请从共享契约模块导入同一个键。这与按字符串名字匹配的 `ServiceKey` 不同，避免同名但不兼容的事件契约混用。类型参数用于静态检查，不自动执行运行时数据校验。
 

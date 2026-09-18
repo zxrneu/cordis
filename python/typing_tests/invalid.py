@@ -6,6 +6,7 @@ from cordis import BoundComponent, Context, Entry, Fiber, FiberState, Loader
 from contracts import (
     COUNT,
     MESSAGE,
+    PROGRESS,
     FIND_USER,
     GREETER,
     AppContext,
@@ -90,6 +91,8 @@ async def invalid(ctx: AppContext, fiber: Fiber[GreeterConfig, AppContext]) -> N
     ctx.emit(MESSAGE, 123)  # E
     ctx.emit(MESSAGE)  # E
     ctx.emit(MESSAGE, "hi", "extra")  # E
+    ctx.emit(PROGRESS, "one", "ready")  # E
+    ctx.emit(PROGRESS, 1)  # E
     await ctx.parallel(MESSAGE, 123)  # E
     ctx.on(MESSAGE, lambda message: 123)  # E
     ctx.on(MESSAGE, lambda message: message.bit_length())  # E

@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from typing import Protocol, TypedDict, assert_type
 
 from cordis import (
-    BoundComponent, Component, Context, EffectHandle, Entry, EventKey, Fiber,
-    FiberView, Loader, QueryKey, ServiceKey, plugin,
+    BoundComponent, Component, ComponentRegistry, Context, EffectHandle, Entry,
+    EventKey, Fiber, FiberView, Loader, QueryKey, ServiceKey, plugin,
 )
 
 
@@ -19,6 +19,7 @@ class Greeter(Protocol):
 GREETER = ServiceKey[Greeter]("greeter")
 COUNT = ServiceKey[int]("count")
 MESSAGE = EventKey[str]("message")
+PROGRESS = EventKey[int, str]("progress")
 FIND_USER = QueryKey[int, str]("find_user")
 ALLOWED = QueryKey[int, bool]("allowed")
 
@@ -76,6 +77,11 @@ def decode_config(raw: object) -> GreeterConfig:
     if not isinstance(raw, str):
         raise ValueError("expected a prefix string")
     return {"prefix": raw}
+
+
+class GreeterSchema:
+    def validate_python(self, raw: object) -> GreeterConfig:
+        return decode_config(raw)
 
 
 async def decode_config_async(raw: object) -> GreeterConfig:
@@ -170,6 +176,7 @@ async def verify() -> None:
         assert_type(await fiber.wait(), Fiber[GreeterConfig, AppContext])
         await fiber.update({"prefix": "hi"})
         assert_type(ctx.use(consumer), Fiber[None, AppContext])
+        assert_type(ctx.include(consumer), Fiber[None, AppContext])
         assert_type(ctx.isolate(GREETER), AppContext)
         assert_type(ctx.intercept(GREETER, {"prefix": "hi"}), AppContext)
         assert_type(ctx.get(COUNT), int | None)
@@ -180,6 +187,9 @@ async def verify() -> None:
         assert_type(ctx.provide(COUNT, 1), EffectHandle)
         ctx.set(COUNT, 2)
         assert_type(ctx.spawn(asyncio.sleep(0, result=42)), asyncio.Task[int])
+        ctx.on(PROGRESS, lambda count, label: None)
+        ctx.emit(PROGRESS, 1, "ready")
+        await ctx.parallel(PROGRESS, 2, "done")
         assert_type(ctx.fiber, FiberView[AppContext])
         assert_type(await ctx.fiber, FiberView[AppContext])
         assert_type(await ctx.fiber.wait(), FiberView[AppContext])
@@ -188,6 +198,7 @@ async def verify() -> None:
         assert_type(ctx.fiber.config, object)
         assert_type(ctx.fiber.tasks, tuple[asyncio.Task[object], ...])
         assert_type(ctx.fibers, tuple[FiberView[Context], ...])
+        assert_type(ctx.registry, ComponentRegistry[AppContext])
         assert_type(
             ctx.errors, tuple[tuple[Exception, FiberView[Context] | None], ...]
         )
@@ -205,6 +216,7 @@ async def verify() -> None:
         assert_type(binding, BoundComponent[GreeterConfig, AppContext])
         assert_type(await greeter.decode("hi", decode_config), BoundComponent[GreeterConfig, AppContext])
         assert_type(await greeter.decode("hi", decode_config_async), BoundComponent[GreeterConfig, AppContext])
+        assert_type(await greeter.decode_schema("hi", GreeterSchema()), BoundComponent[GreeterConfig, AppContext])
         mounted_typed = await loader.mount("bound", binding)
         assert_type(mounted_typed, Fiber[GreeterConfig, AppContext])
         await mounted_typed.update(config)

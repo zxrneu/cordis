@@ -29,6 +29,7 @@ from .core import (
     _await,
     _settle,
 )
+from .import_tracing import trace_imports
 
 
 Isolation = Mapping[str, bool | str]
@@ -78,8 +79,6 @@ class Entry:
         object.__setattr__(self, "isolate", MappingProxyType(isolate))
         object.__setattr__(self, "intercept", _freeze_mapping(self.intercept))
         object.__setattr__(self, "children", tuple(self.children))
-        if self.plugin is None and not self.children:
-            raise ValueError(f"entry {self.id!r} needs a plugin or children")
         if self.plugin is not None and self.children:
             raise ValueError(
                 f"entry {self.id!r} cannot declare both plugin and children"
@@ -100,7 +99,8 @@ def import_plugin(locator: str) -> _PluginLike:
     module_name, separator, attribute = locator.partition(":")
     if not separator or not module_name or not attribute:
         raise ValueError("plugin locator must use 'package.module:attribute' syntax")
-    value: object = importlib.import_module(module_name)
+    with trace_imports(module_name):
+        value: object = importlib.import_module(module_name)
     for part in attribute.split("."):
         value = getattr(value, part)
     # Importlib is the dynamic boundary; mounting validates the resolved plugin.
@@ -158,6 +158,14 @@ class Loader(Generic[ContextCov]):
             return self._mounted[entry_id]
         return self._loaded[entry_id].fiber
 
+    def child(self, entry_id: str) -> Loader[ContextCov] | None:
+        """Return the nested Loader owned by a mounted group entry, if any."""
+        loaded = self._loaded.get(entry_id)
+        if loaded is None or loaded.entry.plugin is not None or loaded.fiber is None:
+            return None
+        child = _group_loaders.get(loaded.fiber.ctx)
+        return cast(Loader[ContextCov] | None, child)
+
     async def mount(
         self: Loader[ContextT],
         entry_id: str,
@@ -212,10 +220,8 @@ class Loader(Generic[ContextCov]):
         return self.ctx._derive(realms=self._realms(entry), intercepts=entry.intercept)
 
     def _component(self, entry: Entry) -> Component[Any, Any]:
-        if entry.children:
-            return group
         if entry.plugin is None:
-            raise ValueError(f"entry {entry.id!r} needs a plugin")
+            return group
         value = (
             import_plugin(entry.plugin)
             if isinstance(entry.plugin, str)
@@ -224,7 +230,7 @@ class Loader(Generic[ContextCov]):
         return _as_component(value)
 
     def _config(self, entry: Entry) -> object:
-        return list(entry.children) if entry.children else entry.config
+        return list(entry.children) if entry.plugin is None else entry.config
 
     async def _dispose(self, loaded: _Loaded[ContextCov]) -> None:
         if loaded.fiber is None:
@@ -245,10 +251,11 @@ class Loader(Generic[ContextCov]):
 
     def _patch_context(self, loaded: _Loaded[ContextCov], entry: Entry) -> None:
         realms = self._realms(entry)
-        if loaded.ctx._realms_local != realms:
+        if loaded.ctx._realms.local != realms:
             self.ctx._runtime.reassign_context_realms(loaded.ctx, realms)
-        loaded.ctx._intercepts_local.clear()
-        loaded.ctx._intercepts_local.update(entry.intercept)
+        local_intercepts = loaded.ctx._intercepts.local
+        local_intercepts.clear()
+        local_intercepts.update(entry.intercept)
 
     async def reconcile(self, entries: Iterable[Entry | Mapping[str, Any]]) -> None:
         values = list(entries)
@@ -272,7 +279,7 @@ class Loader(Generic[ContextCov]):
             if isinstance(result, BaseException):
                 raise result
             resolved[entry.id] = result
-            if entry.children:
+            if entry.plugin is None:
                 await self._prepare([_coerce_entry(child) for child in entry.children])
         return resolved
 
@@ -311,8 +318,8 @@ class Loader(Generic[ContextCov]):
                 item.entry,
                 item.component,
                 item.fiber is not None,
-                dict(item.ctx._realms_local),
-                dict(item.ctx._intercepts_local),
+                dict(item.ctx._realms.local),
+                dict(item.ctx._intercepts.local),
             )
             for key, item in before.items()
         }
@@ -353,10 +360,12 @@ class Loader(Generic[ContextCov]):
                 entry, component, mounted, realms, intercepts = snapshots[key]
                 item.entry = entry
                 item.component = component
-                item.ctx._realms_local.clear()
-                item.ctx._realms_local.update(realms)
-                item.ctx._intercepts_local.clear()
-                item.ctx._intercepts_local.update(intercepts)
+                local_realms = item.ctx._realms.local
+                local_realms.clear()
+                local_realms.update(realms)
+                local_intercepts = item.ctx._intercepts.local
+                local_intercepts.clear()
+                local_intercepts.update(intercepts)
                 try:
                     if mounted:
                         await self._start(item, component)
@@ -404,9 +413,7 @@ class Loader(Generic[ContextCov]):
                 loaded.entry = entry
                 await self._start(loaded, resolved.get(entry.id))
                 continue
-            if previous.plugin != entry.plugin or bool(previous.children) != bool(
-                entry.children
-            ):
+            if previous.plugin != entry.plugin:
                 await self._dispose(loaded)
                 loaded.entry = entry
                 await self._start(loaded, resolved.get(entry.id))
