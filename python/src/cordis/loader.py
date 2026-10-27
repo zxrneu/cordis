@@ -129,6 +129,7 @@ class Loader(Generic[ContextCov]):
         self._mounted: dict[str, FiberView[ContextCov]] = {}
         self._bindings: dict[str, BoundComponent[Any, Any]] = {}
         self._store: ConfigStore | None = None
+        self._parent: tuple[Loader[Any], str] | None = None
         self._local_realms: dict[tuple[str, str], object] = {}
         self._global_realms: dict[tuple[str, str], object] = {}
         self._lock = asyncio.Lock()
@@ -158,6 +159,7 @@ class Loader(Generic[ContextCov]):
         if loaded is None:
             await _await(next_step())
             return
+        location = self._store_location()
 
         async def update() -> None:
             previous, previous_config = loaded.entry, fiber.config
@@ -165,17 +167,18 @@ class Loader(Generic[ContextCov]):
             if fiber.config == previous_config:
                 return
             try:
-                if self._store is not None:
-                    tree = self._store.tree.update(previous.id, config=fiber.config)
-                    await self._store._replace(tree, True)
+                if location is not None:
+                    store, path = location
+                    tree = store.tree.update((*path, previous.id), config=fiber.config)
+                    await store._replace(tree, True)
                 else:
                     loaded.entry = replace(previous, config=fiber.config)
             except BaseException:
                 await fiber._update(previous_config, rollback=False)
                 raise
 
-        if self._store is not None:
-            await self._store._run(update)
+        if location is not None:
+            await location[0]._run(update)
         else:
             await self._run(update)
 
@@ -188,15 +191,27 @@ class Loader(Generic[ContextCov]):
             return
         if not loaded.entry.enabled:
             return
-        if self._store is not None:
-            await self._store.update(loaded.entry.id, enabled=False)
+        location = self._store_location()
+        if location is not None:
+            store, path = location
+            await store.update((*path, loaded.entry.id), enabled=False)
         else:
             loaded.entry = replace(loaded.entry, enabled=False)
+
+    def _store_location(self) -> tuple[ConfigStore, tuple[str, ...]] | None:
+        loader: Loader[Any] = self
+        path: tuple[str, ...] = ()
+        while loader._store is None:
+            if loader._parent is None:
+                return None
+            loader, entry_id = loader._parent
+            path = (entry_id, *path)
+        return loader._store, path
 
     def walk(self) -> Iterable[Loader[ContextCov]]:
         """Visit this Loader and every mounted group/include Loader."""
         yield self
-        for entry_id in tuple(self._loaded):
+        for entry_id in (*self._loaded, *self._mounted):
             child = self.child(entry_id)
             if child is not None:
                 yield from child.walk()
@@ -225,7 +240,7 @@ class Loader(Generic[ContextCov]):
         self._publications[name] = handle
         return handle
 
-    async def _run(self, operation: Callable[[], Awaitable[T]]) -> T:
+    def _assert_can_mutate(self) -> None:
         if any(loader is self and state.active for loader, state in _mutations.get()):
             raise InactiveContextError("cannot recursively mutate the same Loader")
         # Check in the caller, before the operation moves into a shielded task.
@@ -234,6 +249,9 @@ class Loader(Generic[ContextCov]):
                 self.ctx._runtime.assert_can_wait_for(loaded.fiber)
         for mounted in self._mounted.values():
             self.ctx._runtime.assert_can_wait_for(mounted.ctx._fiber)
+
+    async def _run(self, operation: Callable[[], Awaitable[T]]) -> T:
+        self._assert_can_mutate()
         async with self._lock:
 
             async def run() -> T:
@@ -271,9 +289,12 @@ class Loader(Generic[ContextCov]):
     def child(self, entry_id: str) -> Loader[ContextCov] | None:
         """Return the nested Loader owned by a mounted group entry, if any."""
         loaded = self._loaded.get(entry_id)
-        if loaded is None or loaded.entry.plugin is not None or loaded.fiber is None:
+        if loaded is not None and loaded.entry.plugin is not None:
             return None
-        child = _group_loaders.get(loaded.fiber.ctx)
+        fiber = loaded.fiber if loaded is not None else self._mounted.get(entry_id)
+        if fiber is None:
+            return None
+        child = _group_loaders.get(fiber.ctx)
         return cast(Loader[ContextCov] | None, child)
 
     async def mount(
@@ -374,6 +395,10 @@ class Loader(Generic[ContextCov]):
         loaded.component = (
             component if component is not None else self._component(loaded.entry)
         )
+        if loaded.entry.plugin is None:
+            _group_parents[loaded.ctx] = (weakref.ref(self), loaded.entry.id)
+        else:
+            _group_parents.pop(loaded.ctx, None)
         loaded.fiber = loaded.ctx.use(
             loaded.component, self._config(loaded.entry, loaded.ctx)
         )
@@ -458,7 +483,15 @@ class Loader(Generic[ContextCov]):
             for key, item in before.items()
         }
         touched: set[str] = set()
-        previous_failures = self._failures(before)
+        previous_failures = self._failures((*before, *self._mounted))
+        previous_errors = {
+            fiber: fiber.error
+            for loader in self.walk()
+            for fiber in (
+                *(item.fiber for item in loader._loaded.values() if item.fiber),
+                *loader._mounted.values(),
+            )
+        }
         try:
             await self._apply(prepared, resolved, touched)
             if self.ctx.fiber.state is FiberState.ACTIVE:
@@ -466,14 +499,23 @@ class Loader(Generic[ContextCov]):
                 for key in self._loaded:
                     new_failures = [
                         failure
-                        for failure in self._failures([key])
+                        for failure in self._failures([key], include_mounted=False)
                         if not any(
                             failure is previous for previous in previous_failures
                         )
                     ]
-                    if new_failures:
-                        touched.add(key)
-                        failures.extend(new_failures)
+                    # _apply tracks changed entries. A descendant's failure
+                    # must not turn an unchanged parent into a replaced scope.
+                    failures.extend(new_failures)
+                # An unchanged group must retain dynamic typed mounts. Detect
+                # their failures without treating the whole group as replaced.
+                for loader in self.walk():
+                    for failure in loader._failures(loader._mounted):
+                        if not any(
+                            failure is previous
+                            for previous in (*previous_failures, *failures)
+                        ):
+                            failures.append(failure)
                 if len(failures) == 1:
                     raise failures[0]
                 if failures:
@@ -507,7 +549,28 @@ class Loader(Generic[ContextCov]):
                     rollback_failures.append(rollback_error)
             if self.ctx.fiber.state is FiberState.ACTIVE:
                 await self.ctx.flush()
-                rollback_failures.extend(self._failures(touched))
+                # Keep independently mounted groups and their consumer handles.
+                # FAILED consumers do not respond to provider notifications, so
+                # retry new failures after restoring their providers.
+                for fiber, previous_error in previous_errors.items():
+                    if (
+                        fiber.ctx._fiber.desired
+                        and fiber.state is FiberState.FAILED
+                        and fiber.error is not previous_error
+                    ):
+                        try:
+                            await fiber.restart()
+                        except (Exception, asyncio.CancelledError) as recovery_error:
+                            rollback_failures.append(recovery_error)
+                await self.ctx.flush()
+                rollback_failures.extend(
+                    failure
+                    for failure in self._failures((*self._loaded, *self._mounted))
+                    if not any(
+                        failure is previous
+                        for previous in (*previous_failures, *rollback_failures)
+                    )
+                )
             if rollback_failures:
                 raise BaseExceptionGroup(
                     "loader update and rollback failed", [error, *rollback_failures]
@@ -560,17 +623,27 @@ class Loader(Generic[ContextCov]):
         if self.ctx.fiber.state is FiberState.ACTIVE:
             await self.ctx.flush()
 
-    def _failures(self, entry_ids: Iterable[str]) -> list[Exception]:
+    def _failures(
+        self, entry_ids: Iterable[str], *, include_mounted: bool = True
+    ) -> list[Exception]:
         failures: list[Exception] = []
         for entry_id in entry_ids:
             loaded = self._loaded.get(entry_id)
-            if loaded is None or loaded.fiber is None:
+            fiber = self._mounted.get(entry_id) if include_mounted else None
+            if fiber is None and loaded is not None:
+                fiber = loaded.fiber
+            if fiber is None:
                 continue
-            if loaded.fiber.error is not None:
-                failures.append(loaded.fiber.error)
-            nested = _group_loaders.get(loaded.fiber.ctx)
+            if fiber.error is not None:
+                failures.append(fiber.error)
+            nested = _group_loaders.get(fiber.ctx)
             if nested is not None:
-                failures.extend(nested._failures(nested._loaded))
+                ids: Iterable[str] = (
+                    (*nested._loaded, *nested._mounted)
+                    if include_mounted
+                    else nested._loaded
+                )
+                failures.extend(nested._failures(ids, include_mounted=include_mounted))
         return failures
 
     async def reload(self, entry_id: str) -> FiberView[ContextCov]:
@@ -691,11 +764,20 @@ _group_loaders: weakref.WeakKeyDictionary[Context, Loader[Context]] = (
     weakref.WeakKeyDictionary()
 )
 
+# A group may remain PENDING until another task activates its parent. Keep the
+# tree location on its assembly context rather than the initiating task context.
+_group_parents: weakref.WeakKeyDictionary[
+    Context, tuple[weakref.ReferenceType[Loader[Any]], str]
+] = weakref.WeakKeyDictionary()
+
 
 async def _group_apply(
     ctx: Context, entries: Iterable[Entry | Mapping[str, Any]]
 ) -> Callable[[], Awaitable[None]]:
     loader = Loader(ctx)
+    parent = _group_parents.get(ctx._fiber.parent)
+    if parent is not None and (owner := parent[0]()) is not None:
+        loader._parent = (owner, parent[1])
     _group_loaders[ctx] = loader
     try:
         await loader.reconcile(entries)

@@ -99,7 +99,7 @@ loader.child(entry_id: str) -> Loader[ContextT] | None
 | 已记录条目但没有挂载 Fiber，例如停用项 | `None` |
 | 不存在该 id | 抛出 `KeyError`，不是返回 `None` |
 
-嵌套组由内部 Loader 管理。父 Loader 的 `get()` 只能查询组的 id；`child()` 可取得已激活 group 的嵌套 Loader，非 group、未激活或未知 id 返回 `None`。
+嵌套组由内部 Loader 管理。`get("group/worker")` 可以查询嵌套条目；`child()` 可取得已激活 group 的嵌套 Loader，包括 `mount()` 管理的 group，非 group、未激活或未知 id 返回 `None`。
 
 字符串 id 不能恢复插件的具体配置类型，返回视图的 config 因此为 object，不暴露 update。ctx 保留 Loader 的 Context 子类类型。代码内需要更新配置时，保留 `ctx.use()` 或 `loader.mount()` 的返回值。
 
@@ -126,6 +126,10 @@ async def reconcile(entries: Iterable[Entry | Mapping[str, Any]]) -> None: ...
 重复 id、非法 Entry 结构和启用候选的导入错误在修改前拒绝；组内条目的结构和导入也会预检。顶层新增或变更组件的 validate 在修改前运行，并记录规范化配置；激活时可能再次校验，因此校验器应可重复调用。
 
 应用前保存旧 Entry、Component 和上下文设置。更新成功后才记录新配置；应用或启动失败时，清理本轮受影响挂载并恢复旧条目，未受影响条目保持原 Fiber。恢复包括被移除项、此前成功更新项，以及因提供者变化而失败的消费者和组内插件。恢复成功仍抛出原错误，恢复失败则聚合报告。外部副作用和自定义 hook 的原地修改不保证可撤销，也不提供变更期间的数据库式隔离。
+
+同一 Loader 中通过 `mount()` 挂载的类型化消费者也参与失败检查；提供者回滚后，重试本轮新增失败的消费者，保留原 Fiber 和配置。原先已失败的消费者不会因此自动重试。
+
+如果失败发生在未修改组的声明式消费者或子 Loader 动态挂载中，回滚保留该组、子 Loader 和类型化 Fiber；不会仅因后代消费者失败而重建整个组。提供者恢复后，只重试本轮新增失败的消费者；恢复也失败时聚合报告原错误与恢复错误。
 
 父 Context 为 ACTIVE 时会等待本轮转换并传播新增启动失败；缺少依赖仍可返回 PENDING，父 Context 处于 LOADING 时子激活会延后。业务要求就绪时，仍应检查关键 Fiber：
 
@@ -229,7 +233,9 @@ await tenant.update("worker", config={"interval": 10})
 
 `ConfigStore` 依赖 `ConfigBackend` 和 `ConfigCodec` 协议；内置 `FileBackend`、`JsonCodec`、`YamlCodec`。文件写入使用同目录临时文件和 `os.replace()`，写入前比较内容摘要；外部编辑过的文件会抛出 `StaleConfigError`，同时恢复 Loader 的上一棵树。CRUD、保存和取消等待均串行收尾，避免两个并发修改从同一旧树派生后互相覆盖。`watch(interval=0.5, stop=None, on_error=None, ready=None)` 支持监控外部文件修改并自动重新加载，中间暂存态的语法与解析异常可通过 `on_error` 捕获而不中断监听。
 
-`ConfigIncludes` 把每个文件挂成一个空 group，再对它的 nested Loader 建立独立 ConfigStore。因此不同文件可以使用相同的局部条目 id，并分别更新、监听与回写。`include_file()` 加载失败会移除刚建立的 group；`remove(name)` 卸载该文件内的全部插件。
+`ConfigIncludes` 通过 `mount()` 把每个文件挂成一个空 group，再对它的 nested Loader 建立独立 ConfigStore。因此不同文件可以使用相同的局部条目 id，并分别更新、监听与回写。include 不进入父 Loader 的 `entries`，父 ConfigStore 的保存、加载和替换会保留它们，也不会把 include 的内容写入主文件。通过 `get()`、`child()`、`walk()` 和 HMR 仍可访问 include。`include_file()` 加载失败只移除刚建立的挂载；`remove(name)` 卸载该文件内的全部插件。
+
+若 remove 已移除挂载，但插件清理抛错，include 名称仍会注销并允许重新创建，原清理错误继续向调用方传播。卸载开始前的自等待等检查失败时保留原注册。取消等待者也会等注销收尾完成，再传播取消及其原因。
 
 当前可写格式是 JSON 和可选 YAML；Loader 的 TOML 读取兼容接口仍是只读加载，因为标准库没有 TOML writer。自定义存储（数据库、远端 KV）只需实现异步 `read()` / `write()` 和 `identity`，无需修改 Loader。
 
@@ -323,7 +329,7 @@ import_plugin(locator: str) -> PluginLike
 
 ## 运行时同步、表达式与就绪门控
 
-声明式条目的 Fiber.update() 自动同步 Entry 配置及绑定的 ConfigStore；直接 dispose() 将条目标为 disabled 并持久化。Loader 自己的协调、HMR 和父级退出不会被记录为用户停用。close() 释放挂载、监听器和显式发布的服务，可以再次 reconcile 使用该 Loader。
+声明式条目的 Fiber.update() 自动同步 Entry 配置及绑定的 ConfigStore；直接 dispose() 将条目标为 disabled 并持久化。嵌套 group 的变更沿完整条目路径写回最近的 ConfigStore，include 的独立存储构成边界。Loader 自己的协调、HMR 和父级退出不会被记录为用户停用。close() 释放挂载、监听器和显式发布的服务，可以再次 reconcile 使用该 Loader。
 
 `ConfigExpression("ctx.port + 1")` 或文件中的 `{"__expr__": "ctx.port + 1"}` 在插件装配时递归求值。普通字符串保持字面值；仅支持表达式、公共属性、索引与常规运算，不支持调用、语句或私有名称。上下文中的服务访问遵守通常的依赖约束；表达式仍可能触发属性逻辑，配置来源须可信。
 
@@ -335,8 +341,16 @@ import_plugin(locator: str) -> PluginLike
 
 ConfigStore 的默认策略仍是 `conflicts="raise", deferred=False`：外部变化抛 StaleConfigError，回写失败恢复运行态。ConfigIncludes 的默认值为 `conflicts="file_wins", deferred=True`，也可显式覆盖。
 
+ConfigStore 和 ConfigIncludes 在创建事务辅助任务前执行与 Loader 相同的自等待检查；会等待自身或依赖卸载的受管任务必须将变更交给宿主发起。
+
 `ConfigPatch(path, changes={...})` 覆盖条目字段；`ConfigPatch(parent_path, insert=(Entry(...),))` 插入补丁拥有的条目，根级 parent_path 用 None。传给 `ConfigStore.file(..., patches=..., patch_path="overrides.json")`；sidecar 为 JSON 数组，每项含 path、changes、insert。若不配置 patch_path，补丁只保存在内存中。补丁覆盖的字段和插入条目的修改回到补丁，其余字段回到主文件；移除目标时清除失效补丁。
+
+补丁按完整路径匹配；不同组的同名 id 不会自动关联。通过 `ConfigStore.move()` 显式移动条目或整组时，补丁所有权随目标迁移，写入失败回滚时恢复原路径，延迟回写时保留迁移信息供 flush 重试。`replace()` 不推断移动，路径变化按删除和新增处理。已经删除的目标即使在写入重试前被同路径重建，也不会继承旧补丁。
+
+sidecar 不存在或被删除后，下一次 load/watch 恢复构造时传入的 `patches`；未传入时使用空补丁，不保留之前从文件读入的覆盖。
 
 `file_wins` 对基线、运行态、文件态做三方合并：保留互不冲突的修改，冲突处以文件为准，`store.conflicts` 提供路径、字段与说明。`deferred=True` 在 OSError 时保留有效运行态，将未写入差异放入只读 `store.journal` 快照，并记录 `write_error`。`await store.flush()` 显式重试，watch 也会重试；成功后清空 journal。宿主退出前应显式 flush，进程退出不会保存内存日志。
 
-主文件和 sidecar 各自原子替换；sidecar 写入失败会尝试恢复主文件，恢复失败报告异常组。两个文件不构成跨文件原子事务；需要这一保证时应提供具备事务能力的后端。
+若失败前已经应用了 file_wins 合并结果，CRUD 返回值、`store.tree` 和 journal 均记录实际已应用的配置。
+
+主文件和 sidecar 各自原子替换；sidecar 写入失败会分别尝试恢复两者，恢复失败报告异常组。首次创建时，恢复也包括删除本次新建的文件。FileBackend 提供幂等的 `async delete() -> None`；自定义后端在主存储或 sidecar 尚不存在、且需要写入两者时，也必须在相应后端提供此可选能力，否则在写入前抛出 ConfigError。只写主配置时仍只要求 read/write。两个文件不构成跨文件原子事务；需要这一保证时应提供具备事务能力的后端。

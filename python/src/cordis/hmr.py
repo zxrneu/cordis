@@ -232,6 +232,10 @@ class HotReloader(Generic[ContextT]):
                 if child is not None:
                     visit(child, path + "/")
             for entry_id, binding in tuple(loader._bindings.items()):
+                child = loader.child(entry_id)
+                if child is not None:
+                    visit(child, prefix + entry_id + "/")
+                    continue
                 fiber = loader._mounted[entry_id]
                 reference = locator(binding.component)
                 if reference:

@@ -156,7 +156,10 @@ def trace_imports(owner: str) -> Iterator[None]:
     """Capture imports executed while one plugin module is being evaluated."""
 
     previous = set(runtime_imports.snapshot().get(owner, ()))
-    runtime_imports.clear(owner)
+    # Cached imports do not execute the module body and cannot rebuild its
+    # dynamic edges. HMR evicts the module before an actual re-execution.
+    if owner not in sys.modules:
+        runtime_imports.clear(owner)
     _install()
     enabled_token = _enabled.set(True)
     owner_token = _owner.set(owner)

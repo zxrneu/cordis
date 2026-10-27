@@ -40,14 +40,14 @@ class Debounced(Generic[P, R]):
         self._task: asyncio.Task[R] | None = None
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> asyncio.Task[R]:
-        if self._task is not None and not self._task.done():
-            self._task.cancel()
-
         async def run() -> R:
             await asyncio.sleep(self._delay)
             return await _invoke(self._callback, *args, **kwargs)
 
+        previous = self._task
         self._task = self._timer.ctx.spawn(run(), policy="cancel")
+        if previous is not None and not previous.done():
+            previous.cancel()
         return self._task
 
     def cancel(self) -> None:
@@ -79,14 +79,20 @@ class Throttled(Generic[P, R]):
         remaining = self._delay - (now - self._last_called)
 
         if remaining <= 0:
-            self._last_called = now
-            if self._trailing is not None and not self._trailing.done():
-                self._trailing.cancel()
-
             async def run_leading() -> R | None:
                 return await _invoke(self._callback, *args, **kwargs)
 
-            self._task = self._timer.ctx.spawn(run_leading(), policy="cancel")
+            previous_called, previous_trailing = self._last_called, self._trailing
+            # Eager task factories may invoke a reentrant callback during spawn.
+            # Publish the cooldown first, but restore it if admission fails.
+            self._last_called = now
+            try:
+                self._task = self._timer.ctx.spawn(run_leading(), policy="cancel")
+            except BaseException:
+                self._last_called = previous_called
+                raise
+            if previous_trailing is not None and not previous_trailing.done():
+                previous_trailing.cancel()
             return self._task
 
         if not self._allow_trailing:
@@ -96,15 +102,15 @@ class Throttled(Generic[P, R]):
 
             return self._timer.ctx.spawn(skipped(), policy="cancel")
 
-        if self._trailing is not None and not self._trailing.done():
-            self._trailing.cancel()
-
         async def run_trailing() -> R | None:
             await asyncio.sleep(remaining)
             self._last_called = asyncio.get_running_loop().time()
             return await _invoke(self._callback, *args, **kwargs)
 
+        previous = self._trailing
         self._trailing = self._timer.ctx.spawn(run_trailing(), policy="cancel")
+        if previous is not None and not previous.done():
+            previous.cancel()
         return self._trailing
 
     def cancel(self) -> None:

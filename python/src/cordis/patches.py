@@ -118,6 +118,8 @@ def route_patches(
     raw: EntryTree,
     desired: EntryTree,
     patches: Sequence[ConfigPatch],
+    *,
+    relocations: Mapping[tuple[str, ...], tuple[str, ...] | None] | None = None,
 ) -> tuple[EntryTree, tuple[ConfigPatch, ...]]:
     """Return file-owned entries and updated overlays without flattening ownership."""
     indexed = _index(desired)
@@ -125,13 +127,9 @@ def route_patches(
     result: list[ConfigPatch] = []
     file_tree = desired
 
-    def locate(path: tuple[str, ...], entry_id: str) -> tuple[str, ...] | None:
-        if path in indexed:
-            return path
-        matches = [candidate for candidate in indexed if candidate[-1] == entry_id]
-        if len(matches) > 1:
-            raise ValueError(f"ambiguous moved patch entry {entry_id!r}")
-        return matches[0] if matches else None
+    def locate(path: tuple[str, ...]) -> tuple[str, ...] | None:
+        current = relocations.get(path, path) if relocations is not None else path
+        return current if current in indexed else None
 
     # Inserts own their complete subtrees, including children added at runtime.
     inserted: list[tuple[str, ...]] = []
@@ -142,7 +140,7 @@ def route_patches(
         parent = _path(patch.path)
         groups: dict[tuple[str, ...], list[Entry]] = {}
         for entry in patch.insert:
-            current = locate((*parent, entry.id), entry.id)
+            current = locate((*parent, entry.id))
             if current is None:
                 continue
             groups.setdefault(current[:-1], []).append(indexed[current])
@@ -168,7 +166,7 @@ def route_patches(
         if patch.insert or not patch.path:
             continue
         original = _path(patch.path)
-        current = locate(original, original[-1])
+        current = locate(original)
         if current is None:
             removed.add(index)
             continue

@@ -14,6 +14,8 @@ ContextCov = TypeVar("ContextCov", bound="Context", covariant=True)
 class _RegistryRuntime(Protocol):
     fibers: list[Fiber[Any, Any]]
 
+    def assert_can_wait_for(self, target: Fiber[Any, Any] | None) -> None: ...
+
 
 class ComponentRegistry(Generic[ContextCov]):
     """Read and operate on mounted component instances without owning them."""
@@ -62,8 +64,11 @@ class ComponentRegistry(Generic[ContextCov]):
         *,
         name: str | None = None,
     ) -> None:
+        selected = tuple(self._mutable(component, name))
+        for fiber in selected:
+            self._runtime.assert_can_wait_for(fiber)
         await asyncio.gather(
-            *(fiber.restart() for fiber in self._mutable(component, name))
+            *(fiber.restart() for fiber in selected)
         )
 
     async def dispose(
@@ -72,8 +77,11 @@ class ComponentRegistry(Generic[ContextCov]):
         *,
         name: str | None = None,
     ) -> None:
+        selected = tuple(self._mutable(component, name))
+        for fiber in selected:
+            self._runtime.assert_can_wait_for(fiber)
         results = await asyncio.gather(
-            *(fiber.dispose() for fiber in self._mutable(component, name)),
+            *(fiber.dispose() for fiber in selected),
             return_exceptions=True,
         )
         errors = [result for result in results if isinstance(result, Exception)]

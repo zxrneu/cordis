@@ -10,9 +10,9 @@ import tempfile
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Literal, Protocol, TypeAlias, TypeVar, cast
+from typing import Any, Literal, Protocol, TypeAlias, TypeVar, cast, runtime_checkable
 
-from .loader import Entry, Loader
+from .loader import Entry, Loader, group
 from .patches import (
     ConfigChange,
     ConfigConflict,
@@ -53,6 +53,13 @@ class ConfigBackend(Protocol):
     async def read(self) -> str | None: ...
 
     async def write(self, text: str) -> None: ...
+
+
+@runtime_checkable
+class _RemovableBackend(Protocol):
+    """Optional capability for restoring an absent file after a failed write."""
+
+    async def delete(self) -> None: ...
 
 
 def _parts(path: EntryPath) -> tuple[str, ...]:
@@ -334,6 +341,9 @@ class FileBackend:
     async def write(self, text: str) -> None:
         await asyncio.to_thread(self._write, text)
 
+    async def delete(self) -> None:
+        await asyncio.to_thread(self.path.unlink, missing_ok=True)
+
     def _write(self, text: str) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temporary = tempfile.mkstemp(
@@ -432,6 +442,8 @@ class ConfigStore:
         self.backend = backend
         self.codec = codec
         self.patches = tuple(patches)
+        self._default_patches = self.patches
+        self._patch_locations: dict[tuple[str, ...], tuple[str, ...] | None] = {}
         self.patch_backend = patch_backend
         self.conflict_policy = conflicts
         self.deferred = deferred
@@ -488,6 +500,8 @@ class ConfigStore:
                 )
                 for value in json.loads(text)
             )
+        else:
+            self.patches = self._default_patches
         self._patch_revision = _fingerprint(text)
 
     def _patch_text(self, patches: Sequence[ConfigPatch]) -> str:
@@ -507,7 +521,18 @@ class ConfigStore:
             + "\n"
         )
 
+    def _patch_paths(self) -> tuple[tuple[str, ...], ...]:
+        paths: list[tuple[str, ...]] = []
+        for patch in self.patches:
+            prefix = _parts(patch.path) if patch.path else ()
+            if patch.insert:
+                paths.extend((*prefix, entry.id) for entry in patch.insert)
+            elif prefix:
+                paths.append(prefix)
+        return tuple(paths)
+
     async def _run(self, operation: Callable[[], Awaitable[T]]) -> T:
+        self.loader._assert_can_mutate()
         return await _serialized(self._lock, operation)
 
     async def _load(self) -> EntryTree:
@@ -555,7 +580,18 @@ class ConfigStore:
 
     async def _replace(self, tree: EntryTree, persist: bool) -> EntryTree:
         previous = self._tree
+        previous_locations = self._patch_locations
+        self._patch_locations = dict(previous_locations)
         try:
+            for original in self._patch_paths():
+                current = self._patch_locations.get(original, original)
+                if current is not None:
+                    try:
+                        tree.get(current)
+                    except KeyError:
+                        # Keep deletion intent until persistence succeeds, so a
+                        # later create at this path cannot inherit an old patch.
+                        self._patch_locations[original] = None
             await self.loader.reconcile(tree.entries)
             if persist:
                 try:
@@ -563,9 +599,13 @@ class ConfigStore:
                 except OSError as error:
                     if not self.deferred:
                         raise
+                    # A file-wins merge may already have changed the running
+                    # tree before the write failed. Journal the applied result.
+                    tree = EntryTree(self.loader.entries)
                     self.write_error = error
                     self._pending = True
         except BaseException as error:
+            self._patch_locations = previous_locations
             try:
                 await self.loader.reconcile(previous.entries)
             except BaseException as rollback_error:
@@ -595,7 +635,9 @@ class ConfigStore:
             )
         else:
             raw = self._file_tree
-        file_tree, patches = route_patches(raw, tree, self.patches)
+        file_tree, patches = route_patches(
+            raw, tree, self.patches, relocations=self._patch_locations
+        )
         text = self.codec.dumps(file_tree.entries)
         await self.loader.reconcile(tree.entries)
         # Check again immediately before writing, after codecs and patch routing.
@@ -613,22 +655,44 @@ class ConfigStore:
             raise StaleConfigError(
                 f"patches changed outside this store: {self.patch_backend.identity}"
             )
+        if self.patch_backend is not None:
+            for backend, previous in (
+                (self.backend, current),
+                (self.patch_backend, previous_patches),
+            ):
+                if previous is None and not isinstance(backend, _RemovableBackend):
+                    raise ConfigError(
+                        "creating configuration with a sidecar requires "
+                        f"delete() for rollback: {backend.identity}"
+                    )
         await self.backend.write(text)
         try:
             if self.patch_backend is not None:
                 await self.patch_backend.write(self._patch_text(patches))
         except BaseException as error:
-            if current is not None:
+            recovery_errors: list[BaseException] = []
+            assert self.patch_backend is not None
+            for backend, previous in (
+                (self.backend, current),
+                (self.patch_backend, previous_patches),
+            ):
                 try:
-                    await self.backend.write(current)
-                    if self.patch_backend is not None and previous_patches is not None:
-                        await self.patch_backend.write(previous_patches)
+                    if await backend.read() == previous:
+                        continue
+                    if previous is None:
+                        assert isinstance(backend, _RemovableBackend)
+                        await backend.delete()
+                    else:
+                        await backend.write(previous)
                 except BaseException as recovery:
-                    raise BaseExceptionGroup(
-                        "configuration write and recovery failed", [error, recovery]
-                    ) from error
+                    recovery_errors.append(recovery)
+            if recovery_errors:
+                raise BaseExceptionGroup(
+                    "configuration write and recovery failed", [error, *recovery_errors]
+                ) from error
             raise
         self.patches = patches
+        self._patch_locations.clear()
         if self.patch_backend is not None:
             self._patch_revision = _fingerprint(self._patch_text(patches))
         self._file_tree = file_tree
@@ -680,7 +744,24 @@ class ConfigStore:
     ) -> EntryTree:
         async def move() -> EntryTree:
             tree = self._tree.move(path, parent=parent, position=position)
-            return await self._replace(tree, True)
+            source = _parts(path)
+            target = (*(_parts(parent) if parent is not None else ()), source[-1])
+            previous_locations = self._patch_locations
+            relocations: dict[tuple[str, ...], tuple[str, ...] | None] = {}
+            for original in self._patch_paths():
+                current = previous_locations.get(original, original)
+                if current is not None and current[: len(source)] == source:
+                    current = (*target, *current[len(source) :])
+                if current != original:
+                    relocations[original] = current
+            # Track only patch-owned paths, including across deferred retries.
+            # Full-tree replacement and deletion never infer moves from ids.
+            self._patch_locations = relocations
+            try:
+                return await self._replace(tree, True)
+            except BaseException:
+                self._patch_locations = previous_locations
+                raise
 
         return await self._run(move)
 
@@ -754,17 +835,17 @@ class ConfigIncludes:
     ) -> ConfigStore:
         if not name:
             raise ValueError("include name must be non-empty")
+        self.loader._assert_can_mutate()
 
         async def include() -> ConfigStore:
             if name in self._stores or any(
                 entry.id == name for entry in self.loader.entries
             ):
                 raise ValueError(f"include {name!r} already exists")
-            previous = self.loader.entries
-            await self.loader.reconcile((*previous, Entry(name)))
+            await self.loader.mount(name, group.configure(()))
             child = self.loader.child(name)
             if child is None:
-                await self.loader.reconcile(previous)
+                await self.loader.unmount(name)
                 raise ConfigError(f"include group {name!r} did not create a Loader")
             store = ConfigStore(
                 child,
@@ -779,7 +860,7 @@ class ConfigIncludes:
                 await store.load()
             except BaseException as error:
                 try:
-                    await self.loader.reconcile(previous)
+                    await self.loader.unmount(name)
                 except BaseException as rollback_error:
                     raise BaseExceptionGroup(
                         "configuration include and rollback both failed",
@@ -813,11 +894,17 @@ class ConfigIncludes:
         )
 
     async def remove(self, name: str) -> ConfigStore:
+        self.loader._assert_can_mutate()
+
         async def remove() -> ConfigStore:
             store = self._stores[name]
-            entries = tuple(entry for entry in self.loader.entries if entry.id != name)
-            await self.loader.reconcile(entries)
-            del self._stores[name]
+            try:
+                await self.loader.unmount(name)
+            finally:
+                # unmount removes registration before settling cleanup. Keep
+                # the name only if the original mount is still registered.
+                if self.loader._mounted.get(name) is not store.loader.ctx.fiber:
+                    del self._stores[name]
             return store
 
         return await _serialized(self._lock, remove)

@@ -192,6 +192,8 @@ ctx.include(plugin, config=None, *, isolate=(), intercept=None) -> Fiber
 
 `ctx.logger` 返回附带 Fiber 名称、uid 和 `logger` intercept 元数据的标准库日志 facade，支持大小写不敏感的字符串与整数日志级别（如 `"info"` / `logging.INFO`）；`add_handler()` 随 Context 作用域移除并关闭 handler。`ctx.timer` 提供 `timeout`、`interval`、`debounce`、`throttle`（支持高频突发合并、尾部执行与 `cancel()`），底层全部使用 `ctx.spawn()`。`ctx.registry` 提供 Fiber 快照以及按 Component/name 的 find、restart、dispose。
 
+定时器替换已有调用前，先接纳新的受管任务；如果容量不足而抛出 `TaskLimitError`，旧调用会保留，拒绝的新调用不会自动重试。Registry 的批量操作会在修改任何目标前检查自等待关系；受管任务或更新 hook 不能通过它等待自身或依赖的卸载。
+
 ## 隔离与拦截
 
 ### isolate

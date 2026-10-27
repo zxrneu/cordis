@@ -110,16 +110,18 @@ class RuntimeLimitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(root.errors, ())
         self.assertEqual(root.error_count, 1)
 
-    async def test_once_cleanup_keeps_ownership_when_capacity_is_exhausted(self):
+    async def test_sync_once_works_when_business_task_capacity_is_exhausted(self):
         root = self.context(max_tasks=1)
         gate = asyncio.Event()
         self.addCleanup(gate.set)
         root.spawn(gate.wait(), policy="cancel")
-        root.once("message", lambda: None)
-        owned = root.fiber.effects
-        with self.assertRaises(TaskLimitError):
-            root.emit("message")
-        self.assertEqual(root.fiber.effects, owned)
+        seen = []
+        handle = root.once("message", lambda: seen.append("called"))
+        root.emit("message")
+        root.emit("message")
+        await handle()
+        self.assertEqual(seen, ["called"])
+        self.assertEqual(root.task_count, 1)
 
     @unittest.skipUnless(hasattr(asyncio, "eager_task_factory"), "requires Python 3.12+")
     async def test_eager_tasks_reserve_capacity_before_executing(self):

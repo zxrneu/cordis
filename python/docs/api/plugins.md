@@ -174,6 +174,8 @@ async def update(config: ConfigT, *, rollback: bool = True, persist: bool = True
 - **默认路径**：保存新配置，卸载旧实例并重新激活。启动失败且 `rollback=True` 时，尝试用旧配置重新启动；即使恢复成功，也会抛出本次更新的失败原因。
 - **原地更新路径**：插件处于 `ACTIVE` 且提供了 `update` hook 时，调用 `update(ctx, previous, next)`，成功后保存新配置，不自动重启消费者。
 
+同一 Fiber 的配置应用串行执行。已经开始的原地更新 hook 必须结束后，卸载才会释放该组件的资源和依赖；hook 不能等待自身或依赖的卸载。运行时开始关闭后拒绝新的更新，已排队但尚未应用的更新也会被拒绝。停机超时诊断会以 `cordis:update:<组件名>` 标出尚未结束的 hook。
+
 `rollback=False` 只关闭默认重启路径的恢复尝试。自定义 hook 必须自行恢复它修改的对象或外部状态，`rollback=True` 不会自动撤销 hook 的副作用。新配置的运行时激活可能再次调用 validate。
 
 Loader 管理的声明式 Entry 会同步保存更新后的配置；绑定 ConfigStore 时自动回写。`persist=False` 跳过这层持久化协调，供 Loader 自身 reconcile 使用。`internal/update` 中间件可拦截或拒绝更新。

@@ -543,6 +543,17 @@ _collector: contextvars.ContextVar[_Sink | None] = contextvars.ContextVar(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class _UpdateCall:
+    fiber: Fiber[Any, Any]
+    finished: asyncio.Future[None]
+
+
+_update_calls: contextvars.ContextVar[tuple[_UpdateCall, ...]] = contextvars.ContextVar(
+    "cordis_update_calls", default=()
+)
+
+
 async def _await(value: T | Awaitable[T]) -> T:
     return cast(T, await value) if inspect.isawaitable(value) else value
 
@@ -766,10 +777,13 @@ class _Effect:
         return self.handle
 
     async def dispose(self) -> None:
+        await asyncio.shield(self._start_disposal())
+
+    def _start_disposal(self) -> asyncio.Task[None]:
         self._assert_can_dispose()
         if self._disposal is None:
             self._disposal = asyncio.create_task(self._dispose())
-        await asyncio.shield(self._disposal)
+        return self._disposal
 
     def _assert_can_dispose(self) -> None:
         if self._disposal is not None and self._disposal.done():
@@ -847,6 +861,8 @@ class Fiber(Generic[ConfigT, ContextT]):
         self._load_token = object()
         self._scope = _Sink(self, self._load_token, self._actions)
         self._tasks: set[asyncio.Task[object]] = set()
+        self._updates: set[asyncio.Future[None]] = set()
+        self._update_lock = asyncio.Lock()
         self._on_dispose: Callable[[], Awaitable[None]] | None = None
         intercepts = {
             key: metadata
@@ -951,9 +967,18 @@ class Fiber(Generic[ConfigT, ContextT]):
             self.runtime.emit("internal/status", self, old)
 
     def _spawn_drive(self) -> None:
+        # Eager factories must not run lifecycle callbacks before the owning
+        # Fiber and its caller have finished registering the new drive.
+        started: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+        async def drive() -> None:
+            await started
+            await self._drive()
+
         self.inertia = asyncio.create_task(
-            self._drive(), name=f"cordis:fiber:{self.name}:{self.uid}"
+            drive(), name=f"cordis:fiber:{self.name}:{self.uid}"
         )
+        started.set_result(None)
 
     def _begin_unload(self) -> None:
         self._set_state(FiberState.UNLOADING)
@@ -1037,6 +1062,13 @@ class Fiber(Generic[ConfigT, ContextT]):
             while True:
                 if self.state is FiberState.UNLOADING:
                     await self._drain_dependents()
+                    # An in-place update may still be using this activation's
+                    # resources. Wait only for its hook, not the surrounding
+                    # transaction, which may itself need lifecycle transitions.
+                    if self._updates:
+                        await asyncio.gather(
+                            *(asyncio.shield(done) for done in tuple(self._updates))
+                        )
                     await self._recover()
                     self.committed.clear()
                     self.committed_realms.clear()
@@ -1054,6 +1086,13 @@ class Fiber(Generic[ConfigT, ContextT]):
 
                 if self.state is not FiberState.LOADING:
                     return
+
+                if self.target is None:
+                    # Dependency readiness can change after scheduling but
+                    # before the drive starts; this is pending, not a failure.
+                    self._set_state(FiberState.UNLOADING)
+                    self.runtime.provider_leaving(self)
+                    continue
 
                 target = self.target
                 self._load_token = object()
@@ -1147,10 +1186,7 @@ class Fiber(Generic[ConfigT, ContextT]):
         self, config: ConfigT, *, rollback: bool = True, persist: bool = True
     ) -> None:
         self.runtime.assert_can_wait_for(self)
-        if not self.desired or self.state is FiberState.DISPOSED:
-            raise InactiveContextError(
-                f"cannot update disposed component {self.name!r}"
-            )
+        self._assert_update_allowed()
         await _settle(
             self._dispatch_update(config, rollback=rollback, persist=persist),
             name=f"cordis:update:{self.name}",
@@ -1171,7 +1207,23 @@ class Fiber(Generic[ConfigT, ContextT]):
         await _await(result)
 
     async def _update(self, config: ConfigT, *, rollback: bool) -> None:
+        async with self._update_lock:
+            await self._apply_update(config, rollback=rollback)
+
+    def _assert_update_allowed(self) -> None:
+        if (
+            not self.desired
+            or self.state is FiberState.DISPOSED
+            or self.runtime.root._close_task is not None
+        ):
+            raise InactiveContextError(
+                f"cannot update closing or disposed component {self.name!r}"
+            )
+
+    async def _apply_update(self, config: ConfigT, *, rollback: bool) -> None:
+        self._assert_update_allowed()
         config = await self._validate_config(config)
+        self._assert_update_allowed()
         if config == self.config:
             return
         previous = self.config
@@ -1180,8 +1232,18 @@ class Fiber(Generic[ConfigT, ContextT]):
             and self.component.update is not None
             and self.state is FiberState.ACTIVE
         ):
-            await _await(self.component.update(self.ctx, previous, config))
-            self.config = config
+            finished: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            self._updates.add(finished)
+            token = _update_calls.set(
+                (*_update_calls.get(), _UpdateCall(self, finished))
+            )
+            try:
+                await _await(self.component.update(self.ctx, previous, config))
+                self.config = config
+            finally:
+                _update_calls.reset(token)
+                self._updates.remove(finished)
+                finished.set_result(None)
             return
         self.config = config
         try:
@@ -1232,17 +1294,19 @@ class _Runtime:
 
     def assert_can_wait_for(self, target: Fiber[Any, Any] | None) -> None:
         current = asyncio.current_task()
-        owner = next(
-            (
-                fiber
-                for fiber in [self.root._fiber, *self.fibers]
-                if current in fiber._tasks
-            ),
-            None,
+        owners = {
+            fiber
+            for fiber in [self.root._fiber, *self.fibers]
+            if current in fiber._tasks
+        }
+        owners.update(
+            call.fiber
+            for call in _update_calls.get()
+            if call.fiber.runtime is self and not call.finished.done()
         )
-        if owner is None:
+        if not owners:
             return
-        pending = [owner]
+        pending = list(owners)
         visited: set[Fiber[Any, Any]] = set()
         while pending:
             fiber = pending.pop()
@@ -1251,7 +1315,7 @@ class _Runtime:
             visited.add(fiber)
             if target is None or fiber is target:
                 raise InactiveContextError(
-                    "a managed task cannot wait for teardown of its own scope "
+                    "owned work cannot wait for teardown of its own scope "
                     "or a dependency; request the change from the host instead"
                 )
             pending.extend(service.fiber for service in fiber.committed.values())
@@ -1426,7 +1490,8 @@ class _Runtime:
                 fiber.name,
                 fiber.state,
                 tuple(
-                    name for name in fiber.inject
+                    name
+                    for name in fiber.inject
                     if self.resolve(fiber.ctx, name) is None
                 ),
                 (
@@ -1477,9 +1542,7 @@ class _Runtime:
                     positions.pop(path.pop())
                 elif neighbor in positions:
                     cycle = [*path[positions[neighbor] :], neighbor]
-                    cycles.append(
-                        tuple(f"{fiber.name}#{fiber.uid}" for fiber in cycle)
-                    )
+                    cycles.append(tuple(f"{fiber.name}#{fiber.uid}" for fiber in cycle))
                 elif neighbor not in visited:
                     visited.add(neighbor)
                     positions[neighbor] = len(path)
@@ -1490,8 +1553,17 @@ class _Runtime:
     def shutdown_blockers(self) -> tuple[ShutdownBlocker, ...]:
         return tuple(
             ShutdownBlocker(
-                fiber.uid, fiber.name, fiber.state,
-                tuple(sorted(task.get_name() for task in fiber.tasks)),
+                fiber.uid,
+                fiber.name,
+                fiber.state,
+                tuple(
+                    sorted(
+                        [
+                            *(task.get_name() for task in fiber.tasks),
+                            *(f"cordis:update:{fiber.name}" for _ in fiber._updates),
+                        ]
+                    )
+                ),
             )
             for fiber in [self.root._fiber, *self.fibers]
             if fiber.state is not FiberState.DISPOSED
@@ -1603,9 +1675,10 @@ class _Runtime:
 
     async def flush(self) -> None:
         while True:
-            tasks = [
-                fiber.inertia for fiber in self.fibers if fiber.inertia is not None
-            ]
+            pending = [fiber for fiber in self.fibers if fiber.inertia is not None]
+            for fiber in pending:
+                self.assert_can_wait_for(fiber)
+            tasks = [fiber.inertia for fiber in pending if fiber.inertia is not None]
             if not tasks:
                 return
             await asyncio.gather(*(asyncio.shield(task) for task in tasks))
@@ -1626,9 +1699,7 @@ class Context:
     def __init__(
         self, *, max_tasks: int | None = 1024, error_history_limit: int = 256
     ) -> None:
-        if max_tasks is not None and (
-            type(max_tasks) is not int or max_tasks <= 0
-        ):
+        if max_tasks is not None and (type(max_tasks) is not int or max_tasks <= 0):
             raise ValueError("max_tasks must be a positive integer or None")
         if type(error_history_limit) is not int or error_history_limit < 0:
             raise ValueError("error_history_limit must be a non-negative integer")
@@ -2007,10 +2078,26 @@ class Context:
             raise
 
         started = False
+        reserved = True
+        options = _TaskOptions(policy, timeout)
+
+        def register(task: asyncio.Task[object]) -> None:
+            nonlocal reserved
+            if reserved:
+                self._runtime.task_reservations -= 1
+                reserved = False
+            sink.tasks[task] = options
+            self._fiber._tasks.add(task)
+            self._runtime.tasks.add(task)
 
         async def run() -> T:
             nonlocal started
             started = True
+            task = asyncio.current_task()
+            assert task is not None
+            # Eager work needs ownership before executing user code, including
+            # self-wait guards. Replace the reservation rather than count both.
+            register(task)
             return await awaitable
 
         context = contextvars.copy_context()
@@ -2023,15 +2110,14 @@ class Context:
             task = loop.create_task(
                 runner, name=name or f"cordis:task:{self._fiber.name}", context=context
             )
-            sink.tasks[task] = _TaskOptions(policy, timeout)
-            self._fiber._tasks.add(task)
-            self._runtime.tasks.add(task)
+            register(task)
         except BaseException:
             runner.close()
             _close_coroutine(awaitable)
             raise
         finally:
-            self._runtime.task_reservations -= 1
+            if reserved:
+                self._runtime.task_reservations -= 1
 
         def completed(task: asyncio.Task[T]) -> None:
             sink.tasks.pop(task, None)
@@ -2466,7 +2552,12 @@ class Context:
         self._fiber._assert_effects_allowed(self._resource_scope)
         _validate_task_options(task_policy, timeout)
         listener = _Listener(
-            self, callback, self._fiber._sink(self._resource_scope), global_, task_policy, timeout
+            self,
+            callback,
+            self._fiber._sink(self._resource_scope),
+            global_,
+            task_policy,
+            timeout,
         )
         listeners = self._runtime.listeners[name]
         options = {"prepend": prepend, "global": global_}
@@ -2543,10 +2634,19 @@ class Context:
             ]
             if not listeners:
                 self._runtime.listeners.pop(name, None)
-            # Interceptors may own asynchronous external registrations. Keep
-            # their cleanup supervised while preserving a synchronous callback.
-            self.spawn(handle(), name=f"cordis:once:{name}")
-            handle._effect.detach()
+
+            # Cleanup is lifecycle work, independent of business task capacity.
+            # Leave the effect attached until disposal finishes so teardown waits.
+            def completed(task: asyncio.Task[None]) -> None:
+                if not task.cancelled() and isinstance(
+                    error := task.exception(), Exception
+                ):
+                    if name == "internal/error":
+                        self._runtime.record_error(error, self._fiber)
+                    else:
+                        self._runtime.report(error, self._fiber)
+
+            handle._effect._start_disposal().add_done_callback(completed)
             return callback(*args)
 
         handle = self._on(
