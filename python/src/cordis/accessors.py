@@ -14,3 +14,5 @@ class Accessor:
 
     get: Callable[[Context], object]
     set: Callable[[Context, object], None] | None = None
+    get_for: Callable[[Context, object], object] | None = None
+    set_for: Callable[[Context, object, object], None] | None = None

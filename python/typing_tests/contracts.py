@@ -7,9 +7,44 @@ from dataclasses import dataclass
 from typing import Protocol, TypedDict, assert_type
 
 from cordis import (
-    BoundComponent, Component, ComponentRegistry, Context, EffectHandle, Entry,
-    EventKey, Fiber, FiberView, Loader, QueryKey, ServiceKey, plugin,
+    BoundComponent,
+    Component,
+    ComponentRegistry,
+    Context,
+    EffectHandle,
+    Entry,
+    BoundService,
+    ContextAware,
+    EffectInfo,
+    EventKey,
+    Fiber,
+    FiberView,
+    Loader,
+    QueryKey,
+    ReadinessError,
+    ReadinessIssue,
+    ShutdownTimeoutError,
+    ShutdownBlocker,
+    ServiceKey,
+    TimerTicks,
+    plugin,
 )
+
+
+async def runtime_limits() -> None:
+    async with Context(max_tasks=64, error_history_limit=128) as ctx:
+        assert_type(ctx.task_count, int)
+        assert_type(ctx.error_count, int)
+        assert_type(ctx.clear_errors(), None)
+        try:
+            assert_type(await ctx.wait_ready(timeout=5), None)
+        except ReadinessError as error:
+            assert_type(error.issues, tuple[ReadinessIssue, ...])
+            assert_type(error.cycles, tuple[tuple[str, ...], ...])
+        try:
+            assert_type(await ctx.close(timeout=None), None)
+        except ShutdownTimeoutError as error:
+            assert_type(error.blockers, tuple[ShutdownBlocker, ...])
 
 
 class Greeter(Protocol):
@@ -42,6 +77,10 @@ async def find_user_async(user_id: int) -> str | None:
 
 class AppContext(Context):
     greeter = GREETER
+
+
+class GreetingObject(ContextAware):
+    pass
 
 
 class GreeterConfig(TypedDict):
@@ -154,6 +193,16 @@ async def async_resource() -> AsyncIterator[None]:
     yield
 
 
+@contextmanager
+def numbered_resource() -> Iterator[int]:
+    yield 42
+
+
+@asynccontextmanager
+async def async_numbered_resource() -> AsyncIterator[int]:
+    yield 42
+
+
 async def verify() -> None:
     assert_type(greeter, Component[GreeterConfig, AppContext])
     assert_type(consumer, Component[None, AppContext])
@@ -167,6 +216,11 @@ async def verify() -> None:
 
     async with AppContext() as ctx:
         assert_type(ctx, AppContext)
+        assert_type(ctx.enter_context(numbered_resource()), int)
+        assert_type(await ctx.enter_async_context(async_numbered_resource()), int)
+        async with ctx.scope() as scoped:
+            assert_type(scoped, AppContext)
+            assert_type(scoped.service(COUNT), int)
         config: GreeterConfig = {"prefix": "hello"}
         fiber = ctx.use(greeter, config)
         assert_type(fiber, Fiber[GreeterConfig, AppContext])
@@ -199,15 +253,28 @@ async def verify() -> None:
         assert_type(ctx.fiber.ctx[COUNT], int)
         assert_type(ctx.fiber.config, object)
         assert_type(ctx.fiber.tasks, tuple[asyncio.Task[object], ...])
+        assert_type(ctx.fiber.effects, tuple[EffectInfo, ...])
+        assert_type(ctx.extend(port=8080), AppContext)
+        assert_type(ctx.timer.timeout(0.1), asyncio.Task[None])
+        assert_type(ctx.timer.timeout(0.1, lambda: 42), asyncio.Task[int])
+        assert_type(ctx.timer.interval(0.1), TimerTicks)
+        assert_type(ctx.timer.interval(0.1, lambda: None), asyncio.Task[None])
+        assert_type(
+            ctx.timer.throttle(0.1, find_user, trailing=False)(1),
+            asyncio.Task[str | None],
+        )
+        assert_type(
+            GreetingObject(ctx).__cordis_intercept__(None, ctx),
+            BoundService[GreetingObject],
+        )
         assert_type(ctx.fibers, tuple[FiberView[Context], ...])
         assert_type(ctx.registry, ComponentRegistry[AppContext])
-        assert_type(
-            ctx.errors, tuple[tuple[Exception, FiberView[Context] | None], ...]
-        )
+        assert_type(ctx.errors, tuple[tuple[Exception, FiberView[Context] | None], ...])
         for mounted in ctx.fibers:
             assert_type(mounted.ctx, Context)
             assert_type(mounted.ctx[COUNT], int)
         loader = Loader(ctx)
+        assert_type(loader.provide(), EffectHandle)
         loaded = loader.get("greeter")
         assert_type(loaded, FiberView[AppContext] | None)
         if loaded is not None:
@@ -216,13 +283,25 @@ async def verify() -> None:
         assert_type(await loader.reload("greeter"), FiberView[AppContext])
         binding = greeter.configure(config)
         assert_type(binding, BoundComponent[GreeterConfig, AppContext])
-        assert_type(await greeter.decode("hi", decode_config), BoundComponent[GreeterConfig, AppContext])
-        assert_type(await greeter.decode("hi", decode_config_async), BoundComponent[GreeterConfig, AppContext])
-        assert_type(await greeter.decode_schema("hi", GreeterSchema()), BoundComponent[GreeterConfig, AppContext])
+        assert_type(
+            await greeter.decode("hi", decode_config),
+            BoundComponent[GreeterConfig, AppContext],
+        )
+        assert_type(
+            await greeter.decode("hi", decode_config_async),
+            BoundComponent[GreeterConfig, AppContext],
+        )
+        assert_type(
+            await greeter.decode_schema("hi", GreeterSchema()),
+            BoundComponent[GreeterConfig, AppContext],
+        )
         mounted_typed = await loader.mount("bound", binding)
         assert_type(mounted_typed, Fiber[GreeterConfig, AppContext])
         await mounted_typed.update(config)
-        assert_type(await loader.mount("base", validated.configure(config)), Fiber[GreeterConfig, AppContext])
+        assert_type(
+            await loader.mount("base", validated.configure(config)),
+            Fiber[GreeterConfig, AppContext],
+        )
         await loader.unmount("bound")
         entry = Entry("greeter", greeter, config, intercept={"count": 1})
         assert_type(entry.intercept["count"], object)

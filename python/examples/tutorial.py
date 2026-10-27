@@ -6,7 +6,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Protocol
 
-from cordis import Cleanup, Context, FiberState, ServiceKey, plugin
+from cordis import Context, FiberState, ServiceKey, plugin
 
 
 class Greeter(Protocol):
@@ -17,6 +17,8 @@ GREETER = ServiceKey[Greeter]("greeter")
 
 
 class AppContext(Context):
+    """Retain the context subclass for compatibility; new code can use Context."""
+
     greeter = GREETER
 
 
@@ -26,7 +28,7 @@ class GreeterConfig:
 
 
 @plugin(provide=[GREETER])
-def greeter(ctx: AppContext, config: GreeterConfig) -> Cleanup:
+def greeter(ctx: Context, config: GreeterConfig) -> None:
     def greet(name: str) -> str:
         return f"{config.prefix} {name}"
 
@@ -36,14 +38,16 @@ def greeter(ctx: AppContext, config: GreeterConfig) -> Cleanup:
     def cleanup() -> None:
         print(f"服务清理: {config.prefix}")
 
-    return cleanup
+    ctx.defer(cleanup)
 
 
 @plugin(inject=[GREETER])
-def app(ctx: AppContext, _config: None) -> Cleanup:
+def app(ctx: Context, _config: None) -> None:
+    greet = ctx.service(GREETER)
+
     async def on_greet(name: str) -> str:
         await asyncio.sleep(0)
-        message = ctx.greeter(name)
+        message = greet(name)
         print(message)
         return message
 
@@ -53,11 +57,11 @@ def app(ctx: AppContext, _config: None) -> Cleanup:
     def cleanup() -> None:
         print("应用清理")
 
-    return cleanup
+    ctx.defer(cleanup)
 
 
 async def main() -> None:
-    async with AppContext() as root:
+    async with Context() as root:
         consumer = root.use(app)
         assert (await consumer).state is FiberState.PENDING
         print(f"等待依赖: {consumer.state.value}")

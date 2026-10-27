@@ -22,23 +22,24 @@
 ```python
 import asyncio
 
-from examples.order_importer.definitions import AppContext, ValidateOrderRequest
+from cordis import Context
+from examples.order_importer.definitions import VALIDATOR, ValidateOrderRequest
 from examples.order_importer.providers.validation import ValidationConfig, validation
 
 
 async def main() -> None:
-    async with AppContext() as root:
+    async with Context() as root:
         # 创建并启动一次校验插件，金额上限为 5000 分，也就是 50 元。
         running = root.use(validation, ValidationConfig(max_amount_cents=5000))
         await running
 
         request = ValidateOrderRequest("ORD-001", "Alice", "25.00")
-        print(root.validator.validate(request))
+        print(root.service(VALIDATOR).validate(request))
 
         # 更新这次运行的配置，让它接受 80 元的订单。
         await running.update(ValidationConfig(max_amount_cents=10000))
         request = ValidateOrderRequest("ORD-002", "Bob", "80.00")
-        print(root.validator.validate(request))
+        print(root.service(VALIDATOR).validate(request))
 
 
 asyncio.run(main())
@@ -57,7 +58,7 @@ Order(order_id='ORD-002', customer='Bob', amount_cents=8000)
 | --- | --- | --- |
 | `validation` | 插件的定义，Cordis 称为 **Component** | 告诉运行时要运行哪一份功能 |
 | `running` | 这一次运行的管理对象，称为 **Fiber** | 更新配置、重启或卸载这次运行 |
-| `root.validator` | 插件提供的业务对象，称为**服务** | 真正调用 `validate()` 校验订单 |
+| `root.service(VALIDATOR)` | 插件提供的业务对象，称为**服务** | 真正调用 `validate()` 校验订单 |
 
 所以，**管理插件用 Fiber，处理业务用服务**。`@plugin` 只是把函数变成插件定义；调用 `root.use(...)` 才把它加入应用。这个动作称为“挂载”：创建一次独立的运行，并在条件满足时启动插件。
 
@@ -97,9 +98,9 @@ STORE = ServiceKey[OrderStore]("orders.store")
 | --- | --- |
 | 提供方调用 `ctx.provide(STORE, store)` | “这是我提供的存储对象。” |
 | 调用方声明 `@plugin(inject=[STORE])` | “我运行时需要存储服务。” |
-| 调用方执行 `ctx.store.save(order)` | “请当前的存储服务保存这份订单。” |
+| 调用方取得存储对象后执行 `store.save(order)` | “请当前的存储服务保存这份订单。” |
 
-`ctx.store` 是示例在 `AppContext` 上定义的带类型属性，等价于 `ctx.service(STORE)`。它既能得到编辑器提示，也会检查调用方是否声明了依赖。
+推荐通过 `ctx.service(STORE)` 显式获取服务，并传给业务对象。示例的旧 `AppContext` 描述符仍兼容；类型提示不要求继承 Context。
 
 这就形成了你在 CSV 示例中看到的三角色：**契约定义能做什么，提供方实现它，调用方使用它。** `Protocol` 帮助类型检查器确认服务有哪些方法、接收什么参数；两种存储是否都按订单号更新、是否返回相同形式的结果，还需要共同的行为约定和测试。
 
@@ -274,8 +275,8 @@ CSV 示例中的分工是：宿主监听 TOML，校验外部数据并转成配�
 
 ```python
 @plugin(inject=[STORE, VALIDATOR], provide=[IMPORTER])
-def importer(ctx: AppContext, _config: None) -> None:
-    ctx.provide(IMPORTER, CsvImporter(ctx))
+def importer(ctx: Context, _config: None) -> None:
+    ctx.provide(IMPORTER, CsvImporter(ctx, ctx.service(VALIDATOR), ctx.service(STORE)))
 ```
 
 这里只定义了组件，还没有启动它。函数体在对应实例具备激活条件时才执行；重启会再次执行初始化，因此初始化逻辑必须为每次产生的资源登记清理。
@@ -350,11 +351,13 @@ flowchart TD
 
 **父子归属和服务依赖是两种关系。** 子插件跟随父插件存在；消费者与提供者可以是兄弟插件，只通过服务声明建立依赖。父组件尚未激活时，子组件不会抢先运行。
 
-派生 Context 共享同一个运行时。`ctx.close()` 关闭的是整个运行时，因此由宿主持有根 Context 并负责关闭；局部停用通过 Fiber 或 Loader 完成。
+派生 Context 共享同一个运行时。`ctx.close()` 关闭的是整个运行时，因此由宿主持有根 Context 并负责关闭；插件停用通过 Fiber 或 Loader 完成；局部资源通过 `async with ctx.scope()` 管理。
 
 自定义 `AppContext` 适合声明服务描述符。派生过程会保留子类类型，但不会重新调用你的 `__init__`；不要假设在自定义构造函数里赋值的普通实例字段会自动复制给所有派生 Context。
 
 ### Effect：操作与它的清理
+
+这里的 Effect 是内部所有权与清理模型。新插件优先用 `enter_context()` / `enter_async_context()` 获取资源，或用 `defer()` 登记清理；局部生命周期使用 `scope()`。以下原始生成器写法保留兼容。
 
 Effect 是插件运行时创建的作用及其生命周期管理。可逆性来自明确的逆操作，例如注册监听器对应注销、打开连接对应关闭，而不是解释器自动记住所有改动。
 

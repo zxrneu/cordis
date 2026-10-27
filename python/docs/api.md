@@ -4,7 +4,7 @@
 
 公开对象统一从 `cordis` 导入，范围以 [`cordis.__all__`](../src/cordis/__init__.py) 为准。这里没有把上游 TypeScript API 当作 Python 已实现的功能。
 
-本轮 FiberView、事件键和配置绑定的调用迁移见[迁移指南](migration-typed-interfaces.md)。运行时当前配置与 API 以仓库源码为准。
+推荐显式依赖与标准资源管理，见 [Python 接口约定](python-style.md)。FiberView、事件键和配置绑定的调用迁移见[迁移指南](migration-typed-interfaces.md)。运行时当前配置与 API 以仓库源码为准。
 
 ## 按任务查找
 
@@ -12,11 +12,12 @@
 | --- | --- | --- |
 | 定义插件、声明依赖和配置校验 | `plugin` / `component`、`Component`、`Plugin` | [插件与生命周期](api/plugins.md#定义插件) |
 | 挂载插件、更新配置、等待和卸载 | `Context.use()`、`Fiber`、`FiberState` | [挂载与运行句柄](api/plugins.md#挂载插件) |
-| 定义带类型的服务接口 | `ServiceKey[T]`、Context 描述符 | [服务键](api/context.md#servicekey) |
+| 定义带类型的服务接口 | `ServiceKey[T]`、`ctx.service(KEY)` | [服务键](api/context.md#servicekey) |
 | 定义自动注册且可感知调用方的对象服务 | `Service`、`BoundService`、`current_context()` | [服务操作](api/context.md#服务操作) |
 | 注册、读取和替换服务 | `provide()`、`service()`、`get()`、`set()`、`notify()` | [服务操作](api/context.md#服务操作) |
 | 隔离服务、按调用方适配服务 | `isolate()`、`intercept()`、`metadata()` | [隔离与拦截](api/context.md#隔离与拦截) |
-| 登记清理操作、管理后台任务 | `effect()`、`defer()`、`EffectHandle`、`spawn()`、`TaskPolicy` | [资源与任务](api/context.md#资源与任务) |
+| 管理资源、局部作用域与后台任务 | `enter_context()`、`enter_async_context()`、`scope()`、`defer()`、`spawn()` | [资源与任务](api/context.md#资源与任务) |
+| 检查启动就绪、设置容量和停机期限 | `wait_ready()`、`close(timeout=...)`、Context 容量参数 | [运行时边界](api/context.md#启动就绪与停机期限) |
 | 注册监听器、派发事件 | `on()`、`once()`、`emit()`、`parallel()`、`serial()`、`bail()`、`waterfall()` | [事件](api/context.md#事件) |
 | 关联通知参数、查询请求和结果类型 | `EventKey`、`QueryKey`、`handle()`、`query()` | [类型化事件](api/context.md#eventkey类型化通知) |
 | 绑定配置后类型化挂载 | `Component.configure()` / `decode()`、`BoundComponent`、`Loader.mount()` | [类型化挂载](api/loader.md#mount--unmount) |
@@ -41,27 +42,23 @@ from cordis import Context, FiberState, ServiceKey, plugin
 TITLE = ServiceKey[str]("title")
 
 
-class AppContext(Context):
-    title = TITLE
-
-
 @dataclass(frozen=True)
 class Config:
     title: str
 
 
 @plugin(provide=[TITLE])
-def provider(ctx: AppContext, config: Config) -> None:
+def provider(ctx: Context, config: Config) -> None:
     ctx.provide(TITLE, config.title)
 
 
 @plugin(inject=[TITLE])
-def consumer(ctx: AppContext, _config: None) -> None:
-    print(ctx.title)
+def consumer(ctx: Context, _config: None) -> None:
+    print(ctx.service(TITLE))
 
 
 async def main() -> None:
-    async with AppContext() as root:
+    async with Context() as root:
         reader = root.use(consumer)
         writer = root.use(provider, Config("你好，Cordis"))
         await root.flush()
@@ -85,7 +82,7 @@ asyncio.run(main())
 配置已更新
 ```
 
-`provider` 是可复用的 **Component**，`writer` 是本次挂载的 **Fiber**，`root.title` 是提供方注册的**服务值**。配置更新触发提供方重启，依赖它的调用方也随之重新激活。
+`provider` 是可复用的 **Component**，`writer` 是本次挂载的 **Fiber**，`root.service(TITLE)` 是提供方注册的**服务值**。配置更新触发提供方重启，依赖它的调用方也随之重新激活。
 
 ## 阅读签名时的约定
 
@@ -116,8 +113,16 @@ asyncio.run(main())
 | `ctx.fiber` | 当前 Context 所属 Fiber 的只读属性视图 FiberView；根 Context 也有根 Fiber |
 | `ctx.fibers` | 运行时中尚未移除的普通 Fiber 快照，不包含根 Fiber；不限于当前 Context 的子插件 |
 | `ctx.errors` | `tuple[tuple[Exception, FiberView[Context] \| None], ...]` 错误历史快照；读取不会清空 |
+| `ctx.error_count` / `ctx.clear_errors()` | 累计错误数 / 主动释放历史引用，计数不因清空或淘汰而重置 |
+| `ctx.task_count` | 所有插件及根作用域共享的未完成受管任务数 |
 | `internal/status` | 回调参数 `(fiber, previous_state)`；新状态读取 `fiber.state` |
 | `internal/error` | 回调参数 `(error, fiber)`；无法归属时 `fiber` 可以是 `None` |
+| `internal/plugin` | `(fiber)`；注册与移除时发出，移除后 uid 为 None |
+| `internal/service` | `(provider_ctx, name, value)`；变化按 Realm 过滤；移除时 value 为 None |
+| `internal/update` | `(fiber, config, no_save, next)`；中间件须调用 next 才执行更新 |
+| `internal/get` / `internal/set` | `(ctx, name, next)` / `(ctx, name, value, next)`；同步中间件 |
+| `internal/listener` | `(ctx, name, callback, options)`；可返回 EffectHandle 或清理回调替代默认注册 |
+| `internal/dispatch` | `(mode, name, args, scope)`；业务事件派发前通知，不递归观测 internal 事件 |
 
 在根 Context 创建后、挂载业务插件前注册监听器，例如：
 
@@ -126,7 +131,7 @@ root.on("internal/status", lambda fiber, old: print(old, "->", fiber.state))
 root.on("internal/error", lambda error, fiber: print(fiber, error))
 ```
 
-插件初始化失败通常保存在 `fiber.error` 中，`await fiber` 会重新抛出。`ctx.flush()` 只等待生命周期转换结束，不会把所有失败转换成调用异常，也不等待后台任务完成。读取关键 Fiber 的状态仍然必要。
+插件初始化失败通常保存在 `fiber.error` 中，`await fiber` 会重新抛出。`ctx.flush()` 只等待生命周期转换结束，不会把所有失败转换成调用异常，也不等待后台任务完成。宿主使用 `ctx.wait_ready(timeout=...)` 检查整个运行时的组件激活状态。错误历史默认保留最近 256 条，`internal/error` 仍对每次普通报告发送通知。
 
 ### 公开异常
 
@@ -142,6 +147,10 @@ root.on("internal/error", lambda error, fiber: print(fiber, error))
 | `DuplicateQueryError` | `CordisError` | 同一运行时对同一个 QueryKey 重复注册处理器 |
 | `DuplicateAccessorError` | `CordisError` | 动态 accessor 与已有 accessor 或服务属性重名 |
 | `MissingProvisionError` | `CordisError` | 插件初始化完成，却没有注册 `provide=[...]` 声明的服务 |
+| `TaskLimitError` | `CordisError` | 受管业务任务达到运行时容量上限 |
+| `ReadinessError` | `CordisError` | 期望运行的插件未激活，携带 `issues` 和声明依赖环 `cycles` |
+| `ReadinessTimeoutError` | `ReadinessError`、`TimeoutError` | 启动生命周期未在期限内稳定 |
+| `ShutdownTimeoutError` | `CordisError`、`TimeoutError` | 停机等待超时，携带 `blockers`；清理继续执行 |
 | `FullRestartRequired` | `RuntimeError` | HMR 的受影响模块触及配置的外部边界；它不是 `CordisError` 的子类 |
 
 另外，参数错误会使用 `TypeError` / `ValueError`，缺失的 Loader 条目使用 `KeyError`；用户回调、文件解析及模块导入的异常也可能直接传播。多个清理操作失败、并发事件失败、部分 HMR 失败会以 Python `ExceptionGroup` 汇总。
@@ -154,10 +163,11 @@ root.on("internal/error", lambda error, fiber: print(fiber, error))
 | --- | --- |
 | 插件 | [`plugin` / `component`、`Component`、`BoundComponent`、`Plugin`](api/plugins.md#定义插件) |
 | 生命周期 | [`Fiber`、`FiberView`、`FiberState`](api/plugins.md#fiber) |
+| 运行诊断 | [`ReadinessIssue`、`ShutdownBlocker`](api/context.md#启动就绪与停机期限) |
 | 上下文与服务 | [`Context`、`ServiceKey`、`Service`、`BoundService`、`Accessor`](api/context.md) |
 | 类型化事件 | [`EventKey`、`QueryKey`](api/context.md#事件) |
 | 资源与任务 | [`EffectHandle`、`EffectCallback`、`EffectResult`、`Cleanup`、`TaskPolicy`](api/context.md#资源与任务) |
 | 配置 | [`Entry`、`EntryTree`、`Loader`、`ConfigStore`、`ConfigIncludes`、`group`、`import_plugin`](api/loader.md) |
 | 辅助层 | `ContextLogger`、`LoggerService`、`TimerService`、`ComponentRegistry`、Schema adapters |
 | 热重载 | [`HotReloader`、`ModuleGraph`](api/hmr.md) |
-| 异常 | [`CordisError`、`InactiveContextError`、`InactiveServiceError`、`UndeclaredServiceError`、`DuplicateServiceError`、`DuplicateQueryError`、`MissingProvisionError`、`FullRestartRequired`](#公开异常) |
+| 异常 | [`CordisError`、`InactiveContextError`、`InactiveServiceError`、`UndeclaredServiceError`、`DuplicateServiceError`、`DuplicateQueryError`、`MissingProvisionError`、`TaskLimitError`、`ReadinessError`、`ReadinessTimeoutError`、`ShutdownTimeoutError`、`FullRestartRequired`](#公开异常) |

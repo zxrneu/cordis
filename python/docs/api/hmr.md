@@ -12,10 +12,10 @@ HotReloader(loader: Loader[ContextT], *, externals: Iterable[str] = ())
 
 | 参数 / 属性 | 含义 |
 | --- | --- |
-| `loader` | 被管理的 Loader；自动查找其声明式 Entry 中的字符串定位符，不处理类型化 mount |
+| `loader` | 被管理的 Loader；递归查找 group/include 条目与可重新导入的类型化 mount |
 | `externals` | 不能跨越的模块名集合，构造时复制为 set；默认空集合 |
 
-依赖感知重载通过**字符串插件定位符**匹配条目。已直接传入的函数、Component 或对象不会自动跟随源码文件变更；要支持该路径，Entry 的 plugin 使用 `package.module:attribute`。
+依赖感知重载使用字符串定位符或模块名/限定名重新导入插件。模块顶层定义的 Component 和函数可自动匹配；局部闭包、lambda 和无可导入名称的对象不自动匹配，应改用稳定的模块级入口或字符串定位符。
 
 ### reload_changed
 
@@ -23,7 +23,7 @@ HotReloader(loader: Loader[ContextT], *, externals: Iterable[str] = ())
 async def reload_changed(changed: Iterable[str | Path]) -> tuple[str, ...]: ...
 ```
 
-接收修改后的文件路径或已加载模块名，扫描当前进程的静态 import 关系，找到它们的直接和间接调用模块，再重载匹配的条目。返回被处理的条目 id 元组；文件未映射到已加载模块，或没有匹配条目时返回 `()`。
+接收修改后的文件路径或已加载模块名，合并当前进程的静态 import 关系与插件加载窗口中捕获的动态导入，找到它们的直接和间接调用模块，再重载匹配的条目。返回被处理的条目路径元组（嵌套条目如 `group/worker`）；文件未映射到已加载模块，或没有匹配条目时返回 `()`。
 
 例如，在宿主已有 loader 时：
 
@@ -60,10 +60,12 @@ async def watch(
     *,
     interval: float = 0.5,
     stop: asyncio.Event | None = None,
+    on_error: Callable[[Exception], None] | None = None,
+    ready: asyncio.Event | None = None,
 ) -> None: ...
 ```
 
-对给定的一组**现有文件**记录修改时间并持续轮询，发生变化时调用 `reload_changed()`。只检查传入的固定文件集合，不递归扫描目录，也不自动发现新文件。
+监听文件或目录，目录递归扫描 .py 文件。记录时间和大小，新增、修改、删除时调用 reload_changed()。ready Event 在初始快照完成后置位。
 
 ```python
 watcher = root.spawn(
@@ -73,7 +75,7 @@ watcher = root.spawn(
 )
 ```
 
-初次调用不重载。interval 由调用方保证为有限正数；stop 在循环边界检查。文件删除、读取失败、`FullRestartRequired` 或重载失败都会使 watcher 结束，宿主负责恢复或重启；它没有防抖、退避或自动重试。
+初次调用不重载。interval 必须为有限正数，stop 可中断轮询等待。重载失败、语法错误和 FullRestartRequired 交给 on_error，默认记录到运行时；监听继续，下一次源码变化可重新尝试。FullRestartRequired 仍由宿主决定如何重启。
 
 ## 重载与恢复范围
 
@@ -92,9 +94,9 @@ watcher = root.spawn(
 
 回滚同时恢复 sys.modules 和原父包属性（包括原有非模块属性），清除失败导入在接受模块的顶层命名空间内新增的模块与绑定。包子模块也受缓存一致性检查。
 
-HMR 与同一 Loader 的其他管理操作共用锁。排队时取消不变更状态；导入、旧实例卸载或候选启动期间取消，会等待整个提交或回滚完成后再向调用方抛出 CancelledError。线程导入也必须完成后才释放锁；候选成功可能已提交，候选失败则尝试恢复旧版本。未设置统一收尾超时，阻塞导入和不结束的 cleanup 仍可能阻塞调用。
+HMR 按稳定顺序取得涉及 Loader 的锁，与其他管理操作互斥，嵌套及类型化挂载在同一事务中替换与恢复。排队时取消不变更状态；导入、旧实例卸载或候选启动期间取消，会等待整个提交或回滚完成后再向调用方抛出 CancelledError。线程导入也必须完成后才释放锁；候选成功可能已提交，候选失败则尝试恢复旧版本。未设置统一收尾超时，阻塞导入和不结束的 cleanup 仍可能阻塞调用。
 
-自动匹配仅覆盖此 Loader 直接管理的声明式条目，不递归重载 group 内部的子 Loader（L01）。HMR 不会撤销模块顶层的文件写入、网络请求或进程全局副作用。依赖图只识别 AST 中的静态 import；动态导入、外部扩展和复杂包重导出不能据此获得完整覆盖。
+自动匹配覆盖嵌套 group/include 和可重新导入的类型化挂载。HMR 不会撤销模块顶层的文件写入、网络请求或进程全局副作用。依赖图包含 AST 静态边和插件加载期间追踪的动态边；加载窗口之外才执行的条件导入、外部扩展及复杂重导出仍需要宿主评估覆盖范围。
 
 ## FullRestartRequired
 
@@ -114,7 +116,7 @@ ModuleGraph()
 | --- | --- | --- |
 | `paths` | `dict[str, Path]` | 模块名到解析后的绝对源码路径 |
 | `by_path` | `dict[Path, set[str]]` | 同一路径对应的模块名集合 |
-| `imports` | `dict[str, set[str]]` | 每个模块静态导入的已加载模块 |
+| `imports` | `dict[str, set[str]]` | 每个模块静态及已追踪动态导入的已加载模块 |
 
 这些都是构造时的快照，后续 import 或文件变更不会自动更新它们。源码无法读取或解析时，该模块的 import 集合按空集合处理。
 

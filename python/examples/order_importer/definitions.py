@@ -87,6 +87,8 @@ EVENT_CONFIG_ERROR = "config/error"
 
 
 class AppContext(Context):
+    """Retain the context subclass for compatibility; new code can use Context."""
+
     validator = VALIDATOR
     store = STORE
     importer = IMPORTER

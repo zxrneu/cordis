@@ -5,20 +5,40 @@ import asyncio
 import importlib
 import importlib.util
 import sys
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Generic
 
-from .core import ContextT, Fiber, FiberState
+from .core import BoundComponent, Component, ContextT, Fiber, FiberState, _as_component
 from .import_tracing import runtime_imports
 
 if TYPE_CHECKING:
-    from .loader import Loader
+    from .loader import Loader, _Loaded
 
 
 class FullRestartRequired(RuntimeError):
     pass
+
+
+@dataclass
+class _ReloadTarget:
+    loader: Loader[Any]
+    item: _Loaded[Any]
+    locator: str
+    mount_id: str | None = None
+
+    async def start(self, component: Component[Any, Any] | None) -> None:
+        if self.mount_id is None:
+            await self.loader._start(self.item, component)
+            return
+        assert component is not None
+        fiber = self.item.ctx.use(component, self.item.entry.config)
+        self.item.fiber = fiber
+        self.item.component = component
+        self.loader._mounted[self.mount_id] = fiber
+        self.loader._bindings[self.mount_id] = BoundComponent(component, fiber.config)
 
 
 def _expand_modules(accepted: set[str]) -> set[str]:
@@ -187,6 +207,47 @@ class HotReloader(Generic[ContextT]):
         self.loader = loader
         self.externals = set(externals)
 
+    def _targets(self) -> dict[str, _ReloadTarget]:
+        from .loader import Entry, _Loaded
+
+        targets: dict[str, _ReloadTarget] = {}
+
+        def locator(component: Component[Any, Any] | None) -> str:
+            callback = component.apply if component is not None else None
+            module = getattr(callback, "__module__", "")
+            name = getattr(callback, "__qualname__", "")
+            return f"{module}:{name}" if module and name and "<" not in name else ""
+
+        def visit(loader: Loader[Any], prefix: str = "") -> None:
+            for entry_id, item in tuple(loader._loaded.items()):
+                path = prefix + entry_id
+                if item.entry.plugin is not None:
+                    plugin = item.entry.plugin
+                    reference = (
+                        plugin if isinstance(plugin, str) else locator(item.component)
+                    )
+                    if reference:
+                        targets[path] = _ReloadTarget(loader, item, reference)
+                child = loader.child(entry_id)
+                if child is not None:
+                    visit(child, path + "/")
+            for entry_id, binding in tuple(loader._bindings.items()):
+                fiber = loader._mounted[entry_id]
+                reference = locator(binding.component)
+                if reference:
+                    item = _Loaded(
+                        Entry(entry_id, reference, fiber.config),
+                        fiber.ctx._fiber.parent,
+                        fiber.ctx._fiber,
+                        binding.component,
+                    )
+                    targets[prefix + entry_id] = _ReloadTarget(
+                        loader, item, reference, entry_id
+                    )
+
+        visit(self.loader)
+        return targets
+
     async def reload_changed(self, changed: Iterable[str | Path]) -> tuple[str, ...]:
         changed = tuple(changed)
         return await self.loader._run(lambda: self._reload_changed(changed))
@@ -203,15 +264,15 @@ class HotReloader(Generic[ContextT]):
                 "changed modules cross the HMR boundary: " + ", ".join(sorted(blocked))
             )
 
+        targets = self._targets()
         stale = [
             entry_id
-            for entry_id, loaded in self.loader._loaded.items()
-            if isinstance(loaded.entry.plugin, str)
-            and loaded.entry.plugin.partition(":")[0] in accepted
+            for entry_id, target in targets.items()
+            if target.locator.partition(":")[0] in accepted
         ]
         if not stale:
             return ()
-        await self._reload_entries(stale, accepted=accepted)
+        await self._reload_entries(stale, accepted=accepted, targets=targets)
         return tuple(stale)
 
     async def reload_entries(
@@ -226,15 +287,41 @@ class HotReloader(Generic[ContextT]):
         )
 
     async def _reload_entries(
-        self, entry_ids: Iterable[str], *, accepted: set[str] | None = None
+        self,
+        entry_ids: Iterable[str],
+        *,
+        accepted: set[str] | None = None,
+        targets: dict[str, _ReloadTarget] | None = None,
+        locked: bool = False,
     ) -> None:
         entry_ids = list(dict.fromkeys(entry_ids))
-        loaded_items = [self.loader._loaded[entry_id] for entry_id in entry_ids]
-        roots = {
-            loaded.entry.plugin.partition(":")[0]
-            for loaded in loaded_items
-            if isinstance(loaded.entry.plugin, str)
-        }
+        available = targets if targets is not None else self._targets()
+        selected = {entry_id: available[entry_id] for entry_id in entry_ids}
+        if not locked:
+            from .loader import _mutations
+
+            owners = list(dict.fromkeys(target.loader for target in selected.values()))
+            owners = [
+                owner
+                for owner in owners
+                if not any(
+                    loader is owner and state.active
+                    for loader, state in _mutations.get()
+                )
+            ]
+
+            async def acquire(index: int) -> None:
+                if index == len(owners):
+                    await self._reload_entries(
+                        entry_ids, accepted=accepted, targets=available, locked=True
+                    )
+                else:
+                    await owners[index]._run(lambda: acquire(index + 1))
+
+            await acquire(0)
+            return
+        loaded_items = [target.item for target in selected.values()]
+        roots = {target.locator.partition(":")[0] for target in selected.values()}
         accepted = set(accepted or roots)
         snapshot = _ModuleSnapshot(accepted)
         accepted = snapshot.accepted
@@ -244,7 +331,7 @@ class HotReloader(Generic[ContextT]):
             if isinstance((module := sys.modules.get(name)), ModuleType)
         }
         old_components = {
-            entry_id: self.loader._loaded[entry_id].component for entry_id in entry_ids
+            entry_id: target.item.component for entry_id, target in selected.items()
         }
         # Capture committed dependencies before teardown clears them. Include
         # consumers outside this Loader and descendants of affected components.
@@ -282,11 +369,8 @@ class HotReloader(Generic[ContextT]):
 
         try:
             replacements = {
-                entry_id: await asyncio.to_thread(
-                    self.loader._component,
-                    self.loader._loaded[entry_id].entry,
-                )
-                for entry_id in entry_ids
+                entry_id: await asyncio.to_thread(self._import_target, target)
+                for entry_id, target in selected.items()
             }
         except BaseException:
             snapshot.restore()
@@ -294,23 +378,24 @@ class HotReloader(Generic[ContextT]):
 
         try:
             disposals = await asyncio.gather(
-                *(self.loader._dispose(loaded) for loaded in loaded_items),
+                *(target.loader._dispose(target.item) for target in selected.values()),
                 return_exceptions=True,
             )
             errors = [error for error in disposals if isinstance(error, BaseException)]
             if errors:
                 raise BaseExceptionGroup("hot reload cleanup failed", errors)
             for entry_id, component in replacements.items():
-                loaded = self.loader._loaded[entry_id]
+                target = selected[entry_id]
+                loaded = target.item
                 if loaded.entry.enabled:
-                    await self.loader._start(loaded, component)
+                    await target.start(component)
             await self.loader.ctx.flush()
             failures = new_failures()
             if failures:
                 raise ExceptionGroup("hot reload failed", list(failures.values()))
         except BaseException as reload_error:
             disposed = await asyncio.gather(
-                *(self.loader._dispose(loaded) for loaded in loaded_items),
+                *(target.loader._dispose(target.item) for target in selected.values()),
                 return_exceptions=True,
             )
             snapshot.restore()
@@ -318,11 +403,12 @@ class HotReloader(Generic[ContextT]):
                 error for error in disposed if isinstance(error, BaseException)
             ]
             for entry_id in entry_ids:
-                loaded = self.loader._loaded[entry_id]
+                target = selected[entry_id]
+                loaded = target.item
                 if not loaded.entry.enabled:
                     continue
                 try:
-                    await self.loader._start(loaded, old_components[entry_id])
+                    await target.start(old_components[entry_id])
                 except Exception as error:
                     rollback_errors.append(error)
             await self.loader.ctx.flush()
@@ -349,6 +435,14 @@ class HotReloader(Generic[ContextT]):
                     [reload_error, *rollback_errors],
                 ) from reload_error
             raise reload_error
+
+    @staticmethod
+    def _import_target(target: _ReloadTarget) -> Component[Any, Any]:
+        from .loader import import_plugin
+
+        if target.mount_id is None and isinstance(target.item.entry.plugin, str):
+            return target.loader._component(target.item.entry)
+        return _as_component(import_plugin(target.locator))
 
     def _affected_fibers(
         self, roots: Iterable[Fiber[Any, Any]]
@@ -381,22 +475,18 @@ class HotReloader(Generic[ContextT]):
         *,
         interval: float = 0.5,
         stop: asyncio.Event | None = None,
+        on_error: Callable[[Exception], None] | None = None,
+        ready: asyncio.Event | None = None,
     ) -> None:
-        files = await asyncio.gather(
-            *(asyncio.to_thread(Path(path).resolve) for path in paths)
-        )
-        stats = await asyncio.gather(*(asyncio.to_thread(path.stat) for path in files))
-        modified = {path: stat.st_mtime_ns for path, stat in zip(files, stats)}
-        while stop is None or not stop.is_set():
-            await asyncio.sleep(interval)
-            stats = await asyncio.gather(
-                *(asyncio.to_thread(path.stat) for path in files)
-            )
-            changed: list[Path] = []
-            for path, stat in zip(files, stats):
-                current = stat.st_mtime_ns
-                if current != modified[path]:
-                    modified[path] = current
-                    changed.append(path)
-            if changed:
+        from .watchers import watch_paths
+
+        async for changed in watch_paths(
+            paths, interval=interval, stop=stop, ready=ready
+        ):
+            try:
                 await self.reload_changed(changed)
+            except Exception as error:
+                if on_error is not None:
+                    on_error(error)
+                else:
+                    self.loader.ctx._runtime.report(error)

@@ -1,12 +1,20 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 
 Json = dict[str, Any]
 ToolHandler = Callable[[Mapping[str, Any]], Awaitable[Any] | Any]
+
+
+class LanguageModel(Protocol):
+    """Return an assistant message for the supplied conversation and tools."""
+
+    async def complete(
+        self, messages: Sequence[Json], tools: Sequence[Json]
+    ) -> Json: ...
 
 
 @dataclass(frozen=True, slots=True)

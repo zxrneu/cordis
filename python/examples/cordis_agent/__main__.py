@@ -54,13 +54,12 @@ async def main() -> None:
         asyncio.to_thread(lambda: str(Path(args.workspace).resolve())),
         asyncio.to_thread(lambda: str(Path(args.session).resolve())),
     )
-    root = Context()
-    loader = Loader(root)
-    try:
-        await loader.reconcile(bundle(args))
-    finally:
-        await loader.close()
-        await root.close()
+    async with Context() as root:
+        loader = Loader(root)
+        try:
+            await loader.reconcile(bundle(args))
+        finally:
+            await loader.close()
 
 
 if __name__ == "__main__":

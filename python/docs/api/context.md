@@ -7,7 +7,7 @@
 ## Context
 
 ```python
-Context()
+Context(*, max_tasks: int | None = 1024, error_history_limit: int = 256)
 ```
 
 创建独立运行时和一个处于 `ACTIVE` 状态的根 Fiber。通常在 asyncio 入口中使用：
@@ -20,6 +20,10 @@ async with Context() as root:
 
 `__aenter__()` 返回自身，退出时调用 `close()`。继承 Context 可以添加服务描述符；通过 `isolate()`、`intercept()` 或插件挂载创建的派生 Context 会保留子类类型，但不会再次调用子类的 `__init__()`。
 
+`max_tasks` 限制整个运行时的未完成受管任务，包括 `spawn()`、异步事件回调和定时器；所有插件、派生 Context 与局部作用域共享额度。正整数设置上限，`None` 显式取消限制。生命周期驱动和清理协调不占业务任务额度。超限立即抛出 `TaskLimitError`，不会排队；拒绝的原生 coroutine 会被关闭，传入的已有 Task / Future 仍由调用方负责。
+
+`error_history_limit` 设置错误历史容量，默认保留最近 256 条，0 禁用历史保留。淘汰历史不会影响 `internal/error` 通知；错误监听器自身失败只记录，不递归通知。异常和其 traceback 在保留期间可能引用所属组件，按需通过 `clear_errors()` 释放。
+
 | 方法 / 属性 | 返回值 | 作用 |
 | --- | --- | --- |
 | `use(value, config=None)` / `plugin(...)` | `Fiber[ConfigT, ContextT]` | [挂载插件](plugins.md#contextuse--contextplugin) |
@@ -27,12 +31,26 @@ async with Context() as root:
 | `fiber` | `FiberView[Self]` | 当前所属 Fiber 的视图，保留 Context 子类类型 |
 | `fibers` | `tuple[FiberView[Context], ...]` | 整个运行时的普通 Fiber 视图快照，不含根 Fiber |
 | `errors` | `tuple[tuple[Exception, FiberView[Context] \| None], ...]` | 整个运行时的错误历史快照 |
+| `error_count` | `int` | 运行时累计报告的错误数，包含已淘汰的错误 |
+| `clear_errors()` | `None` | 清空历史引用，保留累计计数 |
+| `task_count` | `int` | 整个运行时未完成的受管任务数 |
 | `await flush()` | `None` | 等待已安排的生命周期转换稳定；不等待后台任务或未来依赖 |
-| `await close()` | `None` | 关闭整个运行时，包括所有插件、受管任务和根资源 |
+| `await wait_ready(timeout=30.0)` | `None` | 等待生命周期稳定，并要求所有期望运行的插件处于 ACTIVE |
+| `await close(timeout=30.0)` | `None` | 在期限内等待整个运行时关闭，包括插件、受管任务和根资源 |
 
-**派生 Context 的 `close()` 也会关闭整个运行时。** 只想卸载某一部分时，使用 `Fiber.dispose()` 或 `EffectHandle`。
+**派生 Context 的 `close()` 也会关闭整个运行时。** 插件卸载使用 `Fiber.dispose()`；局部资源生命周期使用 `async with ctx.scope()`。
 
 多次调用 `close()` 会等待同一个关闭任务，不会重复清理；关闭失败时会再次看到该任务的异常。取消某个关闭等待者不会取消已经开始的关闭流程。资源清理可以抛出 `ExceptionGroup`。
+
+### 启动就绪与停机期限
+
+`wait_ready()` 在生命周期稳定后立即检查状态。缺失依赖的 PENDING 或初始化失败的 FAILED 会抛出 `ReadinessError`，不会继续等待未来的服务注册。异常的 `issues` 是 `tuple[ReadinessIssue, ...]`；每项包含 `uid`、`name`、`state`、不可用依赖名 `dependencies`、尚未激活的 `parent` 名及原始 `error`。`cycles` 给出按 Realm 匹配、由唯一声明提供者构成的依赖环线索，节点格式为 `name#uid`；动态注册、多个候选提供者等情形不能靠声明完整推断。
+
+生命周期在期限内未稳定时抛出 `ReadinessTimeoutError`，同样包含状态快照。取消等待者或超时不会取消初始化；依赖补齐后可以重试。该方法由宿主调用，受管任务中调用会触发自等待保护。它检查组件激活状态，业务连接、请求成功率等健康条件由应用检查。`flush()` 与旧的 `Loader.wait_ready()` 保留原有的生命周期等待语义。
+
+`close()` 默认最多等待 30 秒。超时抛出 `ShutdownTimeoutError`，`blockers` 是 `tuple[ShutdownBlocker, ...]`，包含未结束组件的 `uid`、`name`、`state` 和受管任务名 `tasks`。清理继续进行；运行时不会提前释放仍被任务使用的服务。后续 `close()` 继续等待同一关闭任务，最终失败仍进入错误历史。显式 `timeout=None` 取消等待期限。两个方法的期限都必须为有限非负秒数或 None。
+
+这些期限依赖事件循环调度，不能打断同步阻塞代码，也不保证解释器能在期限内退出；进程管理器负责最终的进程退出期限。`Fiber.dispose()`、`scope()` 退出和配置变更仍等待资源安全清理。运行建议见[生产运行约定](../production.md)。
 
 Context 没有携带当前组件的配置类型，因此上述视图的 `config` 为 object，且不暴露 `update()`，属性也只读。视图支持 `dispose()`、`restart()`、`wait()` 和直接等待；`await view` / `await view.wait()` 仍返回视图。更新配置时保留 `ctx.use(component, config)` 或 `await loader.mount(...)` 返回的 `Fiber[ConfigT, ContextT]`。经视图访问 `fiber.ctx` 仍会检查服务键与方法参数。详见 [FiberView](plugins.md#fiberview)。
 
@@ -67,6 +85,8 @@ class AppContext(Context):
 
 ## 服务操作
 
+推荐在插件装配处通过 `ctx.service(KEY)` 获取依赖，再传给普通 Python 对象。普通对象保留原始身份；任务或监听器归属由显式传入的 Context 决定。动态属性和服务代理的兼容行为见下文，迁移方式见 [Python 接口约定](../python-style.md)。
+
 ### provide
 
 以下为使用服务键时的签名；字符串名字也可使用，但会丢失值类型的关联：
@@ -93,7 +113,7 @@ def provide(
 
 `check` 抛出异常时会记录运行时错误，并将这次解析视为不可用。外部条件变化后要调用 `notify()`，它不是自动轮询的谓词。`adapt` 的结果不缓存；异常会传播到读取方。
 
-仅撤销服务注册不会自动调用服务对象的 `close()`。对象资源应另行登记清理，例如生成器插件先 `yield connection.close`，再 `ctx.provide(...)`。完整资源模式见[插件初始化返回值](plugins.md#初始化可以返回什么)。
+仅撤销服务注册不会自动调用服务对象的 `close()`。对象资源应先通过 `enter_context()` / `enter_async_context()` 获取，或用 `defer()` 登记清理，再发布服务。这样部分初始化失败时同样能够释放资源。
 
 ### service、下标和属性读取
 
@@ -107,6 +127,7 @@ ctx[name] -> Any
 严格读取已声明的服务。Context 子类上的服务描述符也走同一条路径；动态的 `ctx.some_name` 仅在不存在同名普通属性时按字符串服务名解析。
 
 - 插件必须通过 `inject` 声明依赖，或沿同一 Realm 的父 Context 继承可用的依赖视图。
+- 自己提供的服务，以及祖先 Fiber 已提供或声明的依赖可直接读取。其他服务需要匹配 inject 声明。
 - 已声明但不可用，抛出 `InactiveServiceError`；未声明则抛出 `UndeclaredServiceError`。
 - 根 Context 可以直接读取可用服务，无需声明 inject；不存在时仍会抛出 `UndeclaredServiceError`。
 
@@ -149,19 +170,25 @@ ctx.notify(*names: ServiceName) -> None
 
 ### Service 与调用方 Context
 
+以下是已有服务代理的兼容行为。新服务优先使用普通对象，并通过参数明确提供依赖和资源所有者。
+
 对象服务可选择继承 `Service[ConfigT]`，并在构造时调用 `super().__init__(ctx, KEY)` 自注册。消费者严格读取时得到轻量 `BoundService` 使用点视图；同步方法、awaitable、同步/异步迭代器执行期间，`self.ctx` 和 `current_context()` 指向调用方 Context，执行结束后恢复提供方 Context。
 
-因此服务内部的 `self.ctx.spawn()`、`self.ctx.on()`、`self.ctx.use()` 会归调用方生命周期所有。这个机制只包装 Service 子类；普通 `ctx.provide()` 对象保持原样，适合值服务和不需要调用方追踪的第三方对象。
+因此服务内部的 `self.ctx.spawn()`、`self.ctx.on()`、`self.ctx.use()` 会归调用方生命周期所有。依赖读取保留提供方的声明范围，副作用归调用方；调用根 Context 也不能绕过服务自己的依赖声明。`ContextAware(ctx, namespace=None, preserve_dependencies=True)` 让普通对象显式加入传播；设为 `False` 时完全使用调用方依赖范围。其他 `ctx.provide()` 对象保持原样。
+
+`Service.check()` 可覆写可用性判断，变化后调用 `ctx.notify(key)`。`resolve_config(base=None, head=None, merge=None)` 按 base、由外到内的 intercept 映射、head 合并；默认浅层覆盖，merge 可提供自定义策略。自注册 Service 可直接作为插件工厂的返回值，有 start/stop 时执行相应生命周期。
+
+带 namespace 的服务支持 `ctx.foo.bar` 关联到 `foo.bar` 服务或 accessor；访问仍按读取者的声明检查，关联属性不会扩大其依赖范围。
 
 ### accessor / mixin / include 与运行时辅助属性
 
 ```text
-ctx.accessor(name, get, *, set=None) -> EffectHandle
-ctx.mixin(service, names) -> tuple[EffectHandle, ...]
+ctx.accessor(name, get, *, set=None, get_for=None, set_for=None) -> EffectHandle
+ctx.mixin(service, names, *, namespace=None) -> tuple[EffectHandle, ...]
 ctx.include(plugin, config=None, *, isolate=(), intercept=None) -> Fiber
 ```
 
-`accessor()` 注册计算属性，`mixin()` 把服务的选定属性映射到 Context；两者都随当前 Effect 撤销，并拒绝与已有服务或 accessor 重名。`include()` 先派生 isolate/intercept Context 再挂载组件，派生后仍保留 Context 子类。
+`accessor()` 注册计算属性，`mixin()` 把服务的选定属性映射到 Context；两者都随当前 Effect 撤销，并拒绝与已有服务或 accessor 重名。`mixin` 的 service 可为对象或服务名，映射格式为 `{暴露名称: 源属性名}`。namespace 将成员关联到对象服务；property 使用关联接收者，普通方法仍绑定源对象。accessor 的 get_for(ctx, receiver) / set_for(ctx, receiver, value) 可自定义该行为。`include()` 先派生 isolate/intercept Context 再挂载组件，派生后仍保留 Context 子类。
 
 `ctx.logger` 返回附带 Fiber 名称、uid 和 `logger` intercept 元数据的标准库日志 facade，支持大小写不敏感的字符串与整数日志级别（如 `"info"` / `logging.INFO`）；`add_handler()` 随 Context 作用域移除并关闭 handler。`ctx.timer` 提供 `timeout`、`interval`、`debounce`、`throttle`（支持高频突发合并、尾部执行与 `cancel()`），底层全部使用 `ctx.spawn()`。`ctx.registry` 提供 Fiber 快照以及按 Component/name 的 find、restart、dispose。
 
@@ -204,7 +231,64 @@ ctx.metadata(name: ServiceName) -> object
 
 ## 资源与任务
 
+### enter_context / enter_async_context
+
+```python
+def enter_context(manager: AbstractContextManager[T]) -> T: ...
+
+async def enter_async_context(manager: AbstractAsyncContextManager[T]) -> T: ...
+```
+
+进入标准上下文管理器，返回实际的进入结果，并将退出操作登记到当前资源作用域。资源保持有效，直到该作用域或所属插件关闭；不是在初始化函数返回时立即释放。
+
+```python
+from pathlib import Path
+
+from cordis import Context, plugin
+
+
+@plugin
+def audit(ctx: Context, path: Path) -> None:
+    stream = ctx.enter_context(path.open("a", encoding="utf-8"))
+    ctx.on("audit", lambda message: stream.write(message + "\n"))
+```
+
+作用域退出时先处理在途任务，再按登记顺序逆序清理监听器和资源。初始化中途失败也会清理此前取得的资源。只有关闭方法的对象可用标准库 `closing()` / `aclosing()` 包装。
+
+关闭或过期的 Context 会在进入前拒绝获取资源。异步进入成功后如果原作用域已经关闭或替换，会立即退出该管理器，再抛出 `InactiveContextError`。进入过程自身的部分获取与取消处理遵循管理器的契约。
+
+延迟退出时传给管理器的异常信息为 `(None, None, None)`，不能用来处理宿主代码块的异常；需要异常传递与抑制时，使用普通 `with` / `async with`。
+
+### scope：局部资源作用域
+
+```python
+def scope() -> AbstractAsyncContextManager[Self]: ...
+```
+
+用 `async with ctx.scope() as scope` 取得一个保留 Context 子类类型的派生视图。通过该视图登记的服务、监听器、任务、清理和子插件属于局部作用域；代码块退出时等待工作结束并清理资源。
+
+```python
+async with root.scope() as scope:
+    scope.on("message", received.append)
+    root.emit("message", "hello")
+# 此处局部监听器已注销。
+```
+
+作用域共享父级服务依赖，不创建新插件或服务隔离域。通过原 Context 登记的资源仍归原 Context 管理；归属由使用的 Context 明确表达。派生视图继续保留该归属，退出后不能再用它注册资源或工作。
+
+父插件或整个运行时关闭时，也会清理尚未退出的局部作用域。宿主任务取消会等待清理完成，再传播取消；清理异常仍会报告。受管任务不能关闭包含自己的作用域，否则抛出 `InactiveContextError`。
+
+### defer
+
+```python
+def defer(cleanup: Cleanup, *, label: str = "defer") -> EffectHandle: ...
+```
+
+立即登记已有清理函数，返回可提前调用的异步清理句柄。每次完成资源获取或外部注册后就登记清理，避免后续步骤失败时遗漏已取得的资源。标准上下文管理器优先使用上面的进入方法。
+
 ### EffectCallback、EffectResult 与 Cleanup
+
+以下初始化返回值协议及 `effect()` 保留兼容。新代码推荐显式获取资源、登记清理，局部生命周期使用 `scope()`。
 
 这三个类型别名均可从 `cordis` 导入：
 
@@ -309,6 +393,8 @@ result = await task  # int
 
 任务失败时，等待它会抛出原异常，同时运行时会记录所属 Fiber 并触发 `internal/error`；不会自动把已激活 Fiber 改成 `FAILED`。普通取消不作为运行时错误记录。
 
+运行时达到 `max_tasks` 时，`spawn()` 和需要新建受管 Task 的业务事件派发立即抛出 `TaskLimitError`；同步业务监听器异常依旧向派发方传播。内部事件派发中的拒绝进入错误历史。使用限流、可控队列或请求入口的拒绝策略处理容量耗尽。
+
 所有任务先结束，再按 LIFO 清理资源；提供者等待依赖它的消费者完成退出。取消需要协程响应，不能中断同步阻塞调用或强制终止线程。业务调用需要独立的执行超时时，应在协程内使用 `asyncio.timeout()`。
 
 裸 `asyncio.create_task()` 不会自动纳管。不要从受管任务中等待自己的 Fiber、父插件、依赖服务或整个运行时关闭；把该请求交给宿主。
@@ -384,7 +470,7 @@ def on(
 
 监听器在注册它的 Fiber / Effect 中执行，所创建的资源归属注册方；插件开始退出后不再接收新事件。异步回调会自动转为受管任务。若同步回调返回该 Fiber 已有的受管 Task，则复用其原策略。
 
-当前 `once()` 使用异步包装：即使用户 callback 是同步函数，也应通过 `emit()`、`parallel()` 或 `serial()` 等支持 awaitable 的方式触发；不能与同步限定的 `bail()` 搭配。使用 `emit()` 时，once 的副作用不保证在 emit 返回前发生。
+`once()` 保留 callback 的同步或异步性质；同步 callback 在 emit 返回前完成，也可用于 bail。监听器在调用 callback 前移除，重入派发和并发异步派发均最多调用一次。
 
 ### 派发方式速查
 
@@ -392,7 +478,7 @@ def on(
 
 | 方法 | 返回值 | 执行方式与异常 |
 | --- | --- | --- |
-| `emit(name, *args, scope=None)` | `None` | 同步调用普通监听器，安排异步回调但不等待。回调错误记入运行时，继续派发 |
+| `emit(name, *args, scope=None)` | `None` | 同步调用普通监听器，安排异步回调但不等待。同步异常立即向调用方抛出并停止派发；异步异常记入运行时 |
 | `await parallel(name, *args, scope=None)` | `None` | 并发等待所有监听器；不返回结果列表。普通异常汇总为 `ExceptionGroup` |
 | `await serial(name, *args, scope=None)` | `object` | 按注册顺序等待；第一个既不是 `None`、也不是 `False` 的结果使派发停止；异常直接传播 |
 | `bail(name, *args, scope=None)` | `object` | 同步版短路；监听器返回 awaitable 时抛出 `TypeError` |
@@ -425,7 +511,7 @@ def waterfall(
 ) -> object: ...
 ```
 
-每个监听器收到 `(*args, next)`。`next()` 沿用当前参数，`next(*new_args)` 改变传给后续监听器的参数；不调用 next 就终止链。最后调用 `final(*args)`，final 不接收 next。
+每个监听器收到 `(*args, next)`。`next()` 沿用当前参数，`next(*new_args)` 改变传给后续监听器的参数；不调用 next 就终止链；同一中间件重复调用 next（包括跨 await）抛出 RuntimeError。最后调用 `final(*args)`，final 不接收 next。
 
 下面的片段假设 `ctx` 是活跃 Context：
 
@@ -444,4 +530,20 @@ assert result == 7
 
 异步中间件需要等待它调用的异步下游；如果结果是 awaitable，最外层调用方也需要等待。异步 final 在没有监听器包装时不会自动成为受管任务，需要调用方管理等待。
 
-内部事件 `internal/status` / `internal/error` 的参数与异常说明见 [API 首页](../api.md#观测与异常)。
+内部事件的参数与异常说明见 [API 首页](../api.md#观测与异常)。
+
+
+## Context 元数据与定时器补充
+
+`ctx.extend(metadata=None, **values) -> Self` 创建元数据派生视图。派生视图保留 Context 子类的实例属性与 slots；元数据沿父视图继承。插件内为已注册服务属性赋值等价于 `ctx.set()`，只允许当前 Fiber 的提供者修改；未声明的新公共属性抛出 `UndeclaredServiceError`。自定义 Context 实例状态建议在子类中定义，临时元数据通过 extend 声明。ServiceKey 描述符继续只读。
+
+`await ctx.timer.timeout(seconds)` 只等待时间；传 callback 时返回保留结果类型的受管 Task。`ctx.timer.interval(seconds, callback)` 返回回调任务；省略 callback 时返回 `TimerTicks` 异步迭代器：
+
+```python
+async with ctx.timer.interval(1) as ticks:
+    async for _ in ticks:
+        if finished():
+            break
+```
+
+提前退出通过 async with 或 `await ticks.aclose()` 清理；手动关闭后迭代终止，Context 卸载会取消计时任务并让待取 tick 抛出 `InactiveContextError`。未消费的 tick 不堆积。`throttle(delay, callback, trailing=False)` 丢弃窗口内的后续调用，被丢弃调用返回结果为 None 的受管 Task；默认保留最后一次尾部调用。

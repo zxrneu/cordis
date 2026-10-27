@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Generic, TypeAlias, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Generic, TypeAlias, TypeVar, cast
 
 from .core import (
     Component,
@@ -19,17 +19,23 @@ from .core import (
     Context,
     ContextCov,
     ContextT,
+    EffectHandle,
     Fiber,
     FiberState,
     FiberView,
     InactiveContextError,
+    Injection,
     Plugin,
     PluginCallback,
     _as_component,
     _await,
     _settle,
+    _normalize_inject,
 )
 from .import_tracing import trace_imports
+
+if TYPE_CHECKING:
+    from .config import ConfigStore
 
 
 Isolation = Mapping[str, bool | str]
@@ -62,6 +68,7 @@ class Entry:
     isolate: Isolation | tuple[str, ...] = field(default_factory=dict)
     intercept: Mapping[str, object] = field(default_factory=dict)
     children: tuple["Entry | Mapping[str, Any]", ...] = ()
+    inject: Injection = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or not self.id:
@@ -79,6 +86,7 @@ class Entry:
         object.__setattr__(self, "isolate", MappingProxyType(isolate))
         object.__setattr__(self, "intercept", _freeze_mapping(self.intercept))
         object.__setattr__(self, "children", tuple(self.children))
+        object.__setattr__(self, "inject", _normalize_inject(self.inject))
         if self.plugin is not None and self.children:
             raise ValueError(
                 f"entry {self.id!r} cannot declare both plugin and children"
@@ -93,6 +101,7 @@ class _Loaded(Generic[ContextT]):
     # inspection only exposes FiberView; typed mounts never enter this record.
     fiber: Fiber[Any, ContextT] | None = None
     component: Component[Any, Any] | None = None
+    transitioning: bool = False
 
 
 def import_plugin(locator: str) -> _PluginLike:
@@ -118,9 +127,103 @@ class Loader(Generic[ContextCov]):
         self._ctx = ctx
         self._loaded: dict[str, _Loaded[ContextCov]] = {}
         self._mounted: dict[str, FiberView[ContextCov]] = {}
+        self._bindings: dict[str, BoundComponent[Any, Any]] = {}
+        self._store: ConfigStore | None = None
         self._local_realms: dict[tuple[str, str], object] = {}
         self._global_realms: dict[tuple[str, str], object] = {}
         self._lock = asyncio.Lock()
+        self._update_listener: EffectHandle | None = None
+        self._publications: dict[str, EffectHandle] = {}
+        self._ensure_listener()
+
+    def _ensure_listener(self) -> None:
+        if self._update_listener is None:
+            self._update_listener = self.ctx.on(
+                "internal/update", self._on_update, global_=True
+            )
+
+    async def _on_update(
+        self,
+        fiber: Fiber[Any, Any],
+        config: object,
+        no_save: bool,
+        next_step: Callable[[], object],
+    ) -> None:
+        if no_save:
+            await _await(next_step())
+            return
+        loaded = next(
+            (item for item in self._loaded.values() if item.fiber is fiber), None
+        )
+        if loaded is None:
+            await _await(next_step())
+            return
+
+        async def update() -> None:
+            previous, previous_config = loaded.entry, fiber.config
+            await _await(next_step())
+            if fiber.config == previous_config:
+                return
+            try:
+                if self._store is not None:
+                    tree = self._store.tree.update(previous.id, config=fiber.config)
+                    await self._store._replace(tree, True)
+                else:
+                    loaded.entry = replace(previous, config=fiber.config)
+            except BaseException:
+                await fiber._update(previous_config, rollback=False)
+                raise
+
+        if self._store is not None:
+            await self._store._run(update)
+        else:
+            await self._run(update)
+
+    async def _on_dispose(self, loaded: _Loaded[ContextCov]) -> None:
+        if loaded.transitioning:
+            return
+        if self.ctx._runtime.root.fiber.state is not FiberState.ACTIVE:
+            return
+        if any(loader is self and state.active for loader, state in _mutations.get()):
+            return
+        if not loaded.entry.enabled:
+            return
+        if self._store is not None:
+            await self._store.update(loaded.entry.id, enabled=False)
+        else:
+            loaded.entry = replace(loaded.entry, enabled=False)
+
+    def walk(self) -> Iterable[Loader[ContextCov]]:
+        """Visit this Loader and every mounted group/include Loader."""
+        yield self
+        for entry_id in tuple(self._loaded):
+            child = self.child(entry_id)
+            if child is not None:
+                yield from child.walk()
+
+    async def wait_ready(self) -> None:
+        """Wait for queued reconciliation and all nested lifecycle work."""
+        async with self._lock:
+            await self.ctx.flush()
+
+    def provide(self, name: str = "loader") -> EffectHandle:
+        """Publish explicitly; intercept(name, {'await': True}) gates consumers."""
+
+        def ready(caller: Context) -> bool:
+            metadata = caller.metadata(name)
+            wait = isinstance(metadata, Mapping) and metadata.get("await")
+            return not wait or not any(
+                fiber.state in (FiberState.LOADING, FiberState.UNLOADING)
+                for loader in self.walk()
+                for fiber in [
+                    *(item.fiber for item in loader._loaded.values() if item.fiber),
+                    *loader._mounted.values(),
+                ]
+            )
+
+        handle = self.ctx.provide(name, self, check=ready)
+        self._publications[name] = handle
+        return handle
 
     async def _run(self, operation: Callable[[], Awaitable[T]]) -> T:
         if any(loader is self and state.active for loader, state in _mutations.get()):
@@ -141,6 +244,7 @@ class Loader(Generic[ContextCov]):
                 finally:
                     state.active = False
                     _mutations.reset(token)
+                    self.ctx.notify("loader", *self._publications)
 
             # Worker imports and rollback settle before releasing this lock.
             return await _settle(run(), name="cordis:loader")
@@ -156,7 +260,13 @@ class Loader(Generic[ContextCov]):
     def get(self, entry_id: str) -> FiberView[ContextCov] | None:
         if entry_id in self._mounted:
             return self._mounted[entry_id]
-        return self._loaded[entry_id].fiber
+        if entry_id in self._loaded:
+            return self._loaded[entry_id].fiber
+        parent, separator, tail = entry_id.partition("/")
+        nested = self.child(parent) if separator else None
+        if nested is None:
+            raise KeyError(entry_id)
+        return nested.get(tail)
 
     def child(self, entry_id: str) -> Loader[ContextCov] | None:
         """Return the nested Loader owned by a mounted group entry, if any."""
@@ -179,15 +289,18 @@ class Loader(Generic[ContextCov]):
         entry_id: str,
         binding: BoundComponent[ConfigT, ContextT],
     ) -> Fiber[ConfigT, ContextT]:
+        self._ensure_listener()
         if entry_id in self._loaded or entry_id in self._mounted:
             raise ValueError(f"entry {entry_id!r} is already mounted")
         fiber = binding._mount(self.ctx)
         self._mounted[entry_id] = fiber
+        self._bindings[entry_id] = binding
         try:
             await fiber.wait()
         except BaseException:
             if self._mounted.get(entry_id) is fiber:
                 del self._mounted[entry_id]
+                self._bindings.pop(entry_id, None)
             await fiber.dispose()
             raise
         return fiber
@@ -198,6 +311,7 @@ class Loader(Generic[ContextCov]):
 
     async def _unmount(self, entry_id: str) -> None:
         if entry_id in self._mounted:
+            self._bindings.pop(entry_id, None)
             await self._mounted.pop(entry_id).dispose()
         else:
             await self._dispose(self._loaded.pop(entry_id))
@@ -227,18 +341,32 @@ class Loader(Generic[ContextCov]):
             if isinstance(entry.plugin, str)
             else entry.plugin
         )
-        return _as_component(value)
+        component = _as_component(value)
+        if entry.inject:
+            component = replace(
+                component,
+                inject={**component.inject, **_normalize_inject(entry.inject)},
+            )
+        return component
 
-    def _config(self, entry: Entry) -> object:
-        return list(entry.children) if entry.plugin is None else entry.config
+    def _config(self, entry: Entry, ctx: Context | None = None) -> object:
+        from .expressions import interpolate
+
+        return (
+            list(entry.children)
+            if entry.plugin is None
+            else interpolate(entry.config, ctx or self.ctx)
+        )
 
     async def _dispose(self, loaded: _Loaded[ContextCov]) -> None:
         if loaded.fiber is None:
             return
+        loaded.transitioning = True
         try:
             await loaded.fiber.dispose()
         finally:
             loaded.fiber = None
+            loaded.transitioning = False
 
     async def _start(
         self, loaded: _Loaded[ContextCov], component: Component[Any, Any] | None = None
@@ -246,7 +374,10 @@ class Loader(Generic[ContextCov]):
         loaded.component = (
             component if component is not None else self._component(loaded.entry)
         )
-        loaded.fiber = loaded.ctx.use(loaded.component, self._config(loaded.entry))
+        loaded.fiber = loaded.ctx.use(
+            loaded.component, self._config(loaded.entry, loaded.ctx)
+        )
+        loaded.fiber._on_dispose = lambda: self._on_dispose(loaded)
         return loaded.fiber
 
     def _patch_context(self, loaded: _Loaded[ContextCov], entry: Entry) -> None:
@@ -284,6 +415,7 @@ class Loader(Generic[ContextCov]):
         return resolved
 
     async def _reconcile(self, entries: Iterable[Entry | Mapping[str, Any]]) -> None:
+        self._ensure_listener()
         values = [_coerce_entry(raw) for raw in entries]
         ids = [entry.id for entry in values]
         if len(ids) != len(set(ids)):
@@ -307,7 +439,9 @@ class Loader(Generic[ContextCov]):
                 and component.validate is not None
                 and (previous is None or previous.entry != entry)
             ):
-                config = await _await(component.validate(self._config(entry)))
+                config = await _await(
+                    component.validate(self._config(entry, self._entry_context(entry)))
+                )
                 if not entry.children:
                     entry = replace(entry, config=config)
             prepared.append(entry)
@@ -413,14 +547,14 @@ class Loader(Generic[ContextCov]):
                 loaded.entry = entry
                 await self._start(loaded, resolved.get(entry.id))
                 continue
-            if previous.plugin != entry.plugin:
+            if previous.plugin != entry.plugin or previous.inject != entry.inject:
                 await self._dispose(loaded)
                 loaded.entry = entry
                 await self._start(loaded, resolved.get(entry.id))
                 continue
-            config = self._config(entry)
-            if self._config(previous) != config:
-                await loaded.fiber.update(config)
+            config = self._config(entry, loaded.ctx)
+            if self._config(previous, loaded.ctx) != config:
+                await loaded.fiber.update(config, persist=False)
             loaded.entry = entry
 
         if self.ctx.fiber.state is FiberState.ACTIVE:
@@ -443,6 +577,16 @@ class Loader(Generic[ContextCov]):
         return await self._run(lambda: self._reload(entry_id))
 
     async def _reload(self, entry_id: str) -> FiberView[ContextCov]:
+        if (
+            entry_id not in self._loaded
+            and entry_id not in self._mounted
+            and "/" in entry_id
+        ):
+            parent, _, tail = entry_id.partition("/")
+            child = self.child(parent)
+            if child is None:
+                raise KeyError(entry_id)
+            return await child.reload(tail)
         if entry_id in self._mounted:
             mounted = self._mounted[entry_id]
             await mounted.restart()
@@ -502,16 +646,19 @@ class Loader(Generic[ContextCov]):
         *,
         interval: float = 0.5,
         stop: asyncio.Event | None = None,
+        on_error: Callable[[Exception], None] | None = None,
+        ready: asyncio.Event | None = None,
     ) -> None:
-        path = Path(path)
-        modified = (await asyncio.to_thread(path.stat)).st_mtime_ns
-        while stop is None or not stop.is_set():
-            await asyncio.sleep(interval)
-            current = (await asyncio.to_thread(path.stat)).st_mtime_ns
-            if current == modified:
-                continue
-            modified = current
-            await self.load_file(path)
+        from .watchers import watch_paths
+
+        async for _ in watch_paths([path], interval=interval, stop=stop, ready=ready):
+            try:
+                await self.load_file(path)
+            except Exception as error:
+                if on_error is not None:
+                    on_error(error)
+                else:
+                    self.ctx._runtime.report(error)
 
     async def close(self) -> None:
         await self._run(self._close)
@@ -524,6 +671,17 @@ class Loader(Generic[ContextCov]):
         )
         self._loaded.clear()
         self._mounted.clear()
+        self._bindings.clear()
+        handles = list(self._publications.values())
+        self._publications.clear()
+        if self._update_listener is not None:
+            handles.append(self._update_listener)
+            self._update_listener = None
+        results.extend(
+            await asyncio.gather(
+                *(handle() for handle in handles), return_exceptions=True
+            )
+        )
         errors = [result for result in results if isinstance(result, Exception)]
         if errors:
             raise ExceptionGroup("loader cleanup failed", errors)

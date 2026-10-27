@@ -139,7 +139,7 @@ flowchart LR
 
 ```python
 @plugin(provide=[VALIDATOR])
-def validation(ctx: AppContext, config: ValidationConfig) -> None:
+def validation(ctx: Context, config: ValidationConfig) -> None:
     ctx.provide(VALIDATOR, AmountValidator(config))
 ```
 
@@ -166,15 +166,15 @@ VALIDATOR = ServiceKey[OrderValidator]("orders.validator")
 
 ```python
 @plugin(inject=[STORE, VALIDATOR], provide=[IMPORTER])
-def importer(ctx: AppContext, _config: None) -> None:
-    ctx.provide(IMPORTER, CsvImporter(ctx))
+def importer(ctx: Context, _config: None) -> None:
+    ctx.provide(IMPORTER, CsvImporter(ctx, ctx.service(VALIDATOR), ctx.service(STORE)))
 ```
 
 `inject=[STORE, VALIDATOR]` 表示存储和校验服务都可用后，这个函数才会运行。依赖还没准备好时，插件会等待；依赖更新时，它会退出并重新启动。
 
-导入逻辑读取服务时使用 `ctx.validator` 和 `ctx.store`。这两个属性在 `AppContext` 上用服务键声明，既支持类型提示，也会执行运行时依赖检查。
+插件通过 `ctx.service(VALIDATOR)` 和 `ctx.service(STORE)` 显式获取依赖，再作为构造参数传给导入对象。业务逻辑调用普通对象的方法，无需了解动态 Context 属性。
 
-目录监听是另一个插件，只声明 `inject=[IMPORTER]`。它通过 `ctx.importer.submit(ImportRequest(path))` 提交文件，等待得到 `ImportReport` 后再发布事件。它不需要知道文件如何解析、订单保存在哪里。
+目录监听是另一个插件，只声明 `inject=[IMPORTER]`。装配时显式获取导入服务，传给目录监听对象，由后者调用 `self.importer.submit(ImportRequest(path))` 提交文件，等待得到 `ImportReport` 后再发布事件。它不需要知道文件如何解析、订单保存在哪里。
 
 ## 自己挂载一个插件
 
@@ -183,22 +183,23 @@ def importer(ctx: AppContext, _config: None) -> None:
 ```python
 import asyncio
 
-from examples.order_importer.definitions import AppContext, ValidateOrderRequest
+from cordis import Context
+from examples.order_importer.definitions import VALIDATOR, ValidateOrderRequest
 from examples.order_importer.providers.validation import ValidationConfig, validation
 
 
 async def main() -> None:
-    async with AppContext() as root:
+    async with Context() as root:
         validator = root.use(
             validation, ValidationConfig(max_amount_cents=5000),
         )
         await validator
-        print(root.validator.validate(
+        print(root.service(VALIDATOR).validate(
             ValidateOrderRequest("ORD-001", "Alice", "25.00"),
         ))
 
         await validator.update(ValidationConfig(max_amount_cents=10000))
-        print(root.validator.validate(
+        print(root.service(VALIDATOR).validate(
             ValidateOrderRequest("ORD-002", "Bob", "80.00"),
         ))
 
@@ -227,7 +228,7 @@ Order(order_id='ORD-002', customer='Bob', amount_cents=8000)
 | --- | --- | --- |
 | `validation` | 插件定义，类型为 **Component** | 传给 `root.use()`，可以挂载多次 |
 | `validator` | 本次挂载的运行句柄，类型为 **Fiber** | 等待启动、更新配置、重启或卸载 |
-| `root.validator` | 插件注册的业务服务 | 调用 `validate()` 校验订单 |
+| `root.service(VALIDATOR)` | 插件注册的业务服务 | 调用 `validate()` 校验订单 |
 
 **更新插件使用 Fiber，调用业务功能使用服务对象。** 默认的 `update()` 会在配置变化时重新运行插件；退出 `async with` 时，根 Context 会关闭它管理的运行时。
 

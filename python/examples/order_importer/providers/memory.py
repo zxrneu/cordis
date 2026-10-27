@@ -1,9 +1,9 @@
-from collections.abc import Iterator
+from contextlib import closing
 from dataclasses import dataclass
 
-from cordis import Cleanup, plugin
+from cordis import Context, plugin
 
-from ..definitions import STORE, AppContext, Order, StoreClosedError
+from ..definitions import STORE, Order, StoreClosedError
 
 
 @dataclass(frozen=True)
@@ -34,7 +34,6 @@ class MemoryStore:
 
 
 @plugin(provide=[STORE])
-def memory(ctx: AppContext, _config: MemoryConfig) -> Iterator[Cleanup]:
-    store = MemoryStore()
-    yield store.close
+def memory(ctx: Context, _config: MemoryConfig) -> None:
+    store = ctx.enter_context(closing(MemoryStore()))
     ctx.provide(STORE, store)

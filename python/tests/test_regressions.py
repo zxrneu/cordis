@@ -274,8 +274,7 @@ class HMRAudit(unittest.IsolatedAsyncioTestCase):
             actual = (root.get("version"), loader.get("app").state)
         self.assertEqual(actual, ("v1", FiberState.ACTIVE))
 
-    async def test_l01_nested_hmr_current_documented_scope(self):
-        """A documented coverage limitation, deliberately not counted as a new bug."""
+    async def test_l01_nested_hmr_reloads_from_root(self):
         async with Context() as root:
             loader = Loader(root)
             await loader.reconcile(
@@ -286,4 +285,4 @@ class HMRAudit(unittest.IsolatedAsyncioTestCase):
             self.path.write_text(module_source("version two"), encoding="utf-8")
             reloaded = await loader.reload_changed([self.path])
             actual = (reloaded, root.get("version"))
-        self.assertEqual(actual, ((), "v1"))
+        self.assertEqual(actual, (("group/app",), "version two"))

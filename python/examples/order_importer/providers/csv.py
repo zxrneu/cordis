@@ -3,26 +3,31 @@ from __future__ import annotations
 import asyncio
 import csv
 
-from cordis import plugin
+from cordis import Context, plugin
 
 from ..definitions import (
     IMPORTER,
     STORE,
     VALIDATOR,
-    AppContext,
     ImportReport,
     ImportRequest,
+    OrderStore,
+    OrderValidator,
     RowIssue,
     ValidateOrderRequest,
 )
 
 
 class CsvImporter:
-    def __init__(self, ctx: AppContext) -> None:
-        self.ctx = ctx
+    def __init__(
+        self, owner: Context, validator: OrderValidator, store: OrderStore
+    ) -> None:
+        self.owner = owner
+        self.validator = validator
+        self.store = store
 
     def submit(self, request: ImportRequest) -> asyncio.Task[ImportReport]:
-        return self.ctx.spawn(
+        return self.owner.spawn(
             self._import(request),
             policy="drain",
             timeout=5,
@@ -41,13 +46,13 @@ class CsvImporter:
                 try:
                     if len(row) != 3:
                         raise ValueError("每行必须有三列")
-                    order = self.ctx.validator.validate(
+                    order = self.validator.validate(
                         ValidateOrderRequest(row[0], row[1], row[2])
                     )
                 except ValueError as error:
                     issues.append(RowIssue(reader.line_num, str(error)))
                 else:
-                    self.ctx.store.save(order)
+                    self.store.save(order)
                     accepted += 1
                 # Yield between rows so config changes and teardown can progress.
                 await asyncio.sleep(0)
@@ -56,5 +61,5 @@ class CsvImporter:
 
 
 @plugin(inject=[STORE, VALIDATOR], provide=[IMPORTER])
-def importer(ctx: AppContext, _config: None) -> None:
-    ctx.provide(IMPORTER, CsvImporter(ctx))
+def importer(ctx: Context, _config: None) -> None:
+    ctx.provide(IMPORTER, CsvImporter(ctx, ctx.service(VALIDATOR), ctx.service(STORE)))

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
-from cordis import plugin
+from cordis import Context, plugin
 
-from ..definitions import STORE, AppContext, Order, StoreClosedError
+from ..definitions import STORE, Order, StoreClosedError
 
 
 @dataclass(frozen=True)
@@ -49,11 +50,10 @@ class SQLiteStore:
 
 
 @plugin(provide=[STORE])
-def database(ctx: AppContext, config: DatabaseConfig) -> None:
+def database(ctx: Context, config: DatabaseConfig) -> None:
     config.path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(config.path)
-    store = SQLiteStore(connection)
-    ctx.defer(store.close, label="sqlite:close")
+    store = ctx.enter_context(closing(SQLiteStore(connection)))
     with connection:
         connection.execute(
             "CREATE TABLE IF NOT EXISTS orders ("

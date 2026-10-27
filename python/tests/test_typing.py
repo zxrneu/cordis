@@ -38,7 +38,7 @@ class StaticTypingTests(unittest.TestCase):
         )
 
     def test_public_api_and_inferred_types_pass_strict_checking(self):
-        result = self.check("src", "examples/demo.py", "typing_tests/contracts.py")
+        result = self.check("src", "examples", "tools", "typing_tests/contracts.py")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_invalid_calls_are_rejected_at_every_marked_line(self):

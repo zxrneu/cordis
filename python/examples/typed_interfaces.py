@@ -24,6 +24,8 @@ class WorkerConfig:
 
 
 class AppContext(Context):
+    """Retain the context subclass for compatibility; new code can use Context."""
+
     pass
 
 
@@ -43,7 +45,7 @@ def decode_config(raw: object) -> WorkerConfig:
 
 
 @plugin
-def worker(ctx: AppContext, config: WorkerConfig) -> None:
+def worker(ctx: Context, config: WorkerConfig) -> None:
     def receive(message: Message) -> None:
         print(f"{config.prefix}: {message.text}")
 
@@ -55,7 +57,7 @@ def worker(ctx: AppContext, config: WorkerConfig) -> None:
 
 
 async def main() -> None:
-    async with AppContext() as root:
+    async with Context() as root:
         loader = Loader(root)
         fiber = await loader.mount("worker", worker.configure(WorkerConfig("hello")))
         view = loader.get("worker")

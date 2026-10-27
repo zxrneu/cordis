@@ -5,13 +5,15 @@ import asyncio
 import tempfile
 from pathlib import Path
 
+from cordis import Context
+
 from .application import Application
-from .definitions import AppContext, ImportReport
+from .definitions import STORE, ImportReport
 from .money import format_cents
 
 
 async def serve(path: Path) -> None:
-    async with AppContext() as root:
+    async with Context() as root:
         app = Application(root, path)
         await app.refresh()
         print(f"正在监听 {app.path}，修改配置或 CSV 后保存；Ctrl+C 退出。", flush=True)
@@ -43,7 +45,7 @@ enabled = true
             "ORD-001,Alice,25.00\nORD-002,Bob,80.00\nORD-003,Carol,-5.00\n",
             encoding="utf-8",
         )
-        async with AppContext() as root:
+        async with Context() as root:
             reports: asyncio.Queue[ImportReport] = asyncio.Queue()
             root.on("orders/imported", reports.put_nowait)
             app = Application(root, path)
@@ -59,14 +61,14 @@ enabled = true
             )
             second = await asyncio.wait_for(reports.get(), timeout=5)
             assert second.accepted == 2 and len(second.rejected) == 1
-            rows = root.store.all()
+            rows = root.service(STORE).all()
             assert len(rows) == 2
             print("\n[数据库] 重复导入按订单号更新，当前共 2 条：", flush=True)
             for order in rows:
                 print(
                     f"  {order.order_id} {order.customer} {format_cents(order.amount_cents)}"
                 )
-            old_store = root.store
+            old_store = root.service(STORE)
             print("\n[演示] 将 database.provider 从 sqlite 改成 memory", flush=True)
             path.write_text(
                 initial.replace(
@@ -75,8 +77,8 @@ enabled = true
                 encoding="utf-8",
             )
             third = await asyncio.wait_for(reports.get(), timeout=5)
-            assert third.accepted == 2 and root.store is not old_store
-            assert root.store.all() == rows
+            assert third.accepted == 2 and root.service(STORE) is not old_store
+            assert root.service(STORE).all() == rows
             print("[替换成功] 内存提供方使用相同契约，导入与日志消费者保持原代码。")
         print("[退出] 配置监听、目录扫描和数据库连接已清理。")
 

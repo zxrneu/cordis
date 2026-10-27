@@ -23,6 +23,7 @@ from .core import (
     DuplicateServiceError,
     EffectCallback,
     EffectHandle,
+    EffectInfo,
     EffectResult,
     Fiber,
     FiberState,
@@ -31,12 +32,20 @@ from .core import (
     InactiveServiceError,
     MissingProvisionError,
     Plugin,
+    ReadinessError,
+    ReadinessIssue,
+    ReadinessTimeoutError,
+    ShutdownBlocker,
+    ShutdownTimeoutError,
+    TaskLimitError,
     TaskPolicy,
     UndeclaredServiceError,
     component,
     plugin,
 )
 from .hmr import FullRestartRequired, HotReloader, ModuleGraph
+from .expressions import ConfigExpression
+from .patches import ConfigChange, ConfigConflict, ConfigPatch
 from .keys import EventKey, QueryKey, ServiceKey
 from .loader import Entry, Loader, group, import_plugin
 from .logger import ContextLogger, LoggerService, console_handler
@@ -49,8 +58,8 @@ from .schema import (
     decode_schema,
     schema_decoder,
 )
-from .services import BoundService, Service, current_context
-from .timer import Debounced, Throttled, TimerService
+from .services import BoundService, ContextAware, Service, current_context
+from .timer import Debounced, Throttled, TimerService, TimerTicks
 
 __all__ = [
     "Accessor",
@@ -60,11 +69,16 @@ __all__ = [
     "Component",
     "ComponentRegistry",
     "ConfigBackend",
+    "ConfigChange",
+    "ConfigConflict",
+    "ConfigExpression",
+    "ConfigPatch",
     "ConfigCodec",
     "ConfigError",
     "ConfigIncludes",
     "ConfigStore",
     "Context",
+    "ContextAware",
     "ContextLogger",
     "CordisError",
     "Debounced",
@@ -73,6 +87,7 @@ __all__ = [
     "DuplicateServiceError",
     "EffectCallback",
     "EffectHandle",
+    "EffectInfo",
     "EffectResult",
     "Entry",
     "EntryTree",
@@ -94,14 +109,21 @@ __all__ = [
     "Plugin",
     "PythonSchema",
     "QueryKey",
+    "ReadinessError",
+    "ReadinessIssue",
+    "ReadinessTimeoutError",
     "Schema",
     "SchemaLike",
     "Service",
     "ServiceKey",
+    "ShutdownBlocker",
+    "ShutdownTimeoutError",
     "StaleConfigError",
     "TaskPolicy",
+    "TaskLimitError",
     "Throttled",
     "TimerService",
+    "TimerTicks",
     "UndeclaredServiceError",
     "YamlCodec",
     "codec_for_path",

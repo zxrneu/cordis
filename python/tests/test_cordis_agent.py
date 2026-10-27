@@ -8,9 +8,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from cordis import Context, Loader
+from cordis import Context, Loader, plugin
 from examples.cordis_agent import DeepSeekAPI, Workspace, bundle
 from examples.cordis_agent import llm as agent_llm
+from examples.cordis_agent.plugins import memory_tools_plugin
+from examples.cordis_agent.tools import ApprovalPolicy, ToolRuntime
+from examples.cordis_agent.contracts import Tool
 
 
 class AsyncWriter:
@@ -31,6 +34,25 @@ class AsyncWriter:
 
 
 class CordisAgentDemoTests(unittest.IsolatedAsyncioTestCase):
+    async def test_partial_tool_registration_is_rolled_back(self):
+        @plugin(provide=["tools", "memory", "policy"])
+        def provider(ctx, _config):
+            policy = ApprovalPolicy(interactive=False)
+            ctx.provide("policy", policy)
+            tools = ToolRuntime(policy)
+            ctx.provide("tools", tools)
+            ctx.provide("memory", {})
+            tools.register(Tool("recall", "existing", {}, lambda _: None))
+
+        async with Context() as root:
+            await root.use(provider)
+            with self.assertRaisesRegex(ValueError, "工具重复注册"):
+                await root.use(memory_tools_plugin)
+            self.assertEqual(
+                [item["function"]["name"] for item in root.service("tools").schemas()],
+                ["recall"],
+            )
+
     async def test_deepseek_chat_completion_wire_protocol(self):
         body = json.dumps(
             {

@@ -16,10 +16,16 @@ from contracts import (
     greeter,
     validated,
     handle_message,
+    numbered_resource,
+    async_numbered_resource,
 )
 
 
 async def invalid(ctx: AppContext, fiber: Fiber[GreeterConfig, AppContext]) -> None:
+    _resource_text: str = ctx.enter_context(numbered_resource())  # E
+    _async_resource_text: str = await ctx.enter_async_context(async_numbered_resource())  # E
+    ctx.enter_context(async_numbered_resource())  # E
+    await ctx.enter_async_context(numbered_resource())  # E
     ctx.provide(COUNT, "one")  # E
     ctx.set(COUNT, "two")  # E
     ctx[GREETER].greet(123)  # E
@@ -58,7 +64,11 @@ async def invalid(ctx: AppContext, fiber: Fiber[GreeterConfig, AppContext]) -> N
     entry = Entry("consumer", consumer, intercept={"count": "text"})
     entry.intercept["count"].bit_length()  # E
     ctx.provide("numeric", 1, adapt=lambda value, metadata, ctx: value.missing())  # E
-    ctx.provide("numeric", 1, adapt=lambda value, metadata, ctx: metadata.missing())  # E
+    ctx.provide(
+        "numeric",
+        1,
+        adapt=lambda value, metadata, ctx: metadata.missing(),  # E
+    )
     for task in fiber.tasks:
         (await task).bit_length()  # E
     await ctx.fiber.update(123)  # E
@@ -98,9 +108,21 @@ async def invalid(ctx: AppContext, fiber: Fiber[GreeterConfig, AppContext]) -> N
     ctx.on(MESSAGE, lambda message: message.bit_length())  # E
     ctx.once(MESSAGE, lambda message: 123)  # E
     ctx.on(FIND_USER, handle_message)  # E
-    await ctx.serial(MESSAGE, "hi")  # E
+    await ctx.serial(MESSAGE, 123)  # E
     ctx.handle(FIND_USER, lambda user_id: 123)  # E
     ctx.handle(FIND_USER, handle_message)  # E
     await ctx.query(FIND_USER, "wrong")  # E
     await ctx.query(MESSAGE, "hi")  # E
     _wrong_result: int | None = await ctx.query(FIND_USER, 1)  # E
+    ctx.timer.timeout(0.1, lambda: "value", policy="forget")  # E
+    ctx.timer.throttle(0.1, handle_message, trailing="yes")  # E
+    _wait: asyncio.Task[str] = ctx.timer.timeout(0.1)  # E
+    _ticks: asyncio.Task[None] = ctx.timer.interval(0.1)  # E
+    fiber.effects[0].label = "replacement"  # E
+    await fiber.update(config, persist="yes")  # E
+    Context(max_tasks="many")  # E
+    Context(error_history_limit=None)  # E
+    await ctx.close(timeout="later")  # E
+    await ctx.wait_ready(timeout="later")  # E
+    ctx.task_count = 0  # E
+    ctx.error_count = 0  # E

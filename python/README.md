@@ -1,24 +1,20 @@
 # Cordis for Python
 
+Python 推荐用法与旧接口迁移见[Python 接口约定](docs/python-style.md)；TS 行为兼容范围见[对齐记录](docs/ts-parity.md)。
+
 入门文档：[开发者完全指南（入门到深入与 Q&A）](docs/developer-guide.md) · [第一次使用 Cordis](docs/zh-CN.md) · [使用教程](docs/tutorial.md) · [核心概念](docs/core-concepts.md) · [类型化插件开发](docs/typing.md) · [类型化接口迁移](docs/migration-typed-interfaces.md) · [实战：配置自动更新的 CSV 导入](docs/scenarios.md)
 
 进阶参考：[Python vs TS 全方位对比与不足](docs/python-vs-typescript.md) · [核心原理代码走读与维护手册](docs/internals-walkthrough.md) · [API 参考](docs/api.md) · [实现与维护参考](docs/implementation.md) · [与最新 DSH 的差距](docs/cordis-agent-vs-dsh.md) · [Cordis Agent](examples/cordis_agent/) · [离线架构 Demo](examples/dsh_like.py) · [安全卸载 Demo](examples/graceful_unload.py)
 
 本仓库是论文 [*A Programming Paradigm for Spatiotemporal Composability*](https://arxiv.org/abs/2608.25512) 中所描述运行时架构的 Python 实现：
 
-- **增量可逆 Effect 迭代器**：增量注册逆操作（Inverse），并在卸载时严格按后进先出（LIFO）顺序恢复；
-- **独立的惯性 `Fiber` 生命周期**：每个组件拥有独立的生命周期控制与异步惯性状态机；
-- **响应式 Coeffect**：声明的 Coeffect（依赖与条件）以响应式方式激活和停用组件；
-- **一致的依赖视图**：已提交的依赖视图在完整的卸载（Teardown）流程中保持可读；
-- **统一的生命周期归属**：子组件、事件、服务及嵌套 Effect 共享生命周期所有权；
-- **受管异步任务**：`ctx.spawn()` 与异步事件回调跟随所属插件或嵌套 Effect，在资源回收前排空或取消；
-- **类型化 API**：泛型 `Component` / `Fiber` 保留配置与 Context 类型，`FiberView` 分离状态查看与配置写入，`ServiceKey[T]` 检查服务注册和读取，`EventKey` / `QueryKey` 关联事件参数和查询结果；
-- **隔离域与拦截机制**：Context 支持隔离 Realm 与动态合并的拦截元数据；
-- **声明式加载器**：基于键控配置树与受管 Realm 进行协调管理（Reconciliation）；
-- **持久化配置事务**：不可变 `EntryTree`、原子 JSON/YAML 回写、乐观并发检查与多文件 include；
-- **上下文服务工具**：可选 `Service` 基类、调用方 Context 传播、Accessor/mixin、logger、timer 和组件 registry；
-- **感知依赖的 HMR（热重载）**：合并 AST 与运行时 import 边，事务性替换模块并在失败时回滚。
+- **依赖驱动的插件生命周期**：声明服务依赖，按可用性启动、更新和退出插件。
+- **明确的资源管理**：使用标准上下文管理器获取资源，按作用域和依赖顺序清理。
+- **受管异步任务**：在释放资源前等待相关工作完成或响应取消。
+- **类型化服务与事件**：通过共享契约检查配置、服务调用、通知参数和查询结果。
+- **动态装配与配置更新**：支持插件树、服务隔离、配置持久化和源码热重载。
 
+插件中显式获取依赖，再传给普通 Python 对象；业务代码无需继承服务基类，也无需通过动态属性访问服务。
 
 运行时修复：[2026-09-13 缺陷修复与验证](docs/bug-fixes-2026-09-13.md)（审计 10 项已修复，含取消、并发和回滚回归）。
 ## 快速上手
@@ -48,17 +44,13 @@ class Greeter(Protocol):
 GREETER = ServiceKey[Greeter]("greeter")
 
 
-class AppContext(Context):
-    greeter = GREETER
-
-
 @dataclass(frozen=True)
 class GreeterConfig:
     prefix: str
 
 
 @plugin(provide=[GREETER])
-def greeter(ctx: AppContext, config: GreeterConfig) -> None:
+def greeter(ctx: Context, config: GreeterConfig) -> None:
     def greet(name: str) -> str:
         return f"{config.prefix} {name}"
 
@@ -66,12 +58,13 @@ def greeter(ctx: AppContext, config: GreeterConfig) -> None:
 
 
 @plugin(inject=[GREETER])
-def app(ctx: AppContext, _config: None) -> None:
-    print(ctx.greeter("Cordis"))
+def app(ctx: Context, _config: None) -> None:
+    greet = ctx.service(GREETER)
+    print(greet("Cordis"))
 
 
 async def main() -> None:
-    async with AppContext() as root:
+    async with Context() as root:
         consumer = root.use(app)
         provider = root.use(greeter, GreeterConfig(prefix="你好"))
         await root.flush()
@@ -82,7 +75,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-组件支持同步或异步函数、生成器，以及具有 `start`/`stop` 生命周期的对象；初始化还可以返回上下文管理器。组件可返回清理回调，通过 `yield` 逐步登记清理，或通过 `await ctx.effect(...)` 创建嵌套 Effect。部分初始化失败时，运行时撤销已经登记的操作。服务读取需要匹配已声明的依赖，`ctx.get()` 提供非严格的反射式查询；两者区别见[核心概念](docs/core-concepts.md)。
+插件推荐使用返回 `None` 的普通函数或异步函数。通过 `ctx.enter_context()` / `ctx.enter_async_context()` 获取资源，通过 `ctx.defer()` 登记已有清理函数，局部生命周期使用 `async with ctx.scope()`。部分初始化失败时，运行时清理已经登记的资源。服务读取需要匹配已声明的依赖，`ctx.get()` 提供非严格查询；旧的初始化返回值协议仍兼容，见[Python 接口约定](docs/python-style.md)。
 
 `@plugin(inject={"database": metadata}, provide=[...], validate=...)` 支持依赖拦截、服务提供检查以及同步/异步配置校验。默认的 `Fiber.update()` 在新配置启动失败时尝试恢复旧配置；自定义原地更新 hook 需要自行负责回滚。
 
@@ -119,13 +112,13 @@ await loader.reload_changed(["my_app/plugins/shared.py"])
 
 ## 服务与运行时辅助层
 
-复杂对象服务可以选择继承 `Service`。构造函数会自注册；消费者读取到的是绑定视图，服务方法内的 `self.ctx` 自动指向本次调用方，因此创建的任务、监听器和子插件跟随消费者卸载。普通值仍可直接使用 `ctx.provide()`，无需继承框架类型。
+服务推荐使用普通对象，在插件装配处通过 `ctx.service(KEY)` 获取依赖，再以构造参数或方法参数传入。为调用方启动任务时，显式接收它的 Context，明确工作归属。
 
-`ctx.accessor()` 和 `ctx.mixin()` 提供生命周期绑定的动态属性；`ctx.include()` 将 isolate/intercept 与组件挂载合并为一次调用。`ctx.logger` 基于标准库 logging 并附加 Fiber 元数据，`ctx.timer` 提供受管 timeout/interval/debounce/throttle，`ctx.registry` 用于查询、重启和销毁已挂载组件。
+`Service` 的自动注册、调用方 Context 传播以及 `accessor/mixin` 动态属性继续作为兼容能力提供。`ctx.logger`、`ctx.timer` 和 `ctx.registry` 是明确声明的辅助属性，分别用于日志、受管定时任务和插件管理。
 
 ## 事件派发
 
-生命周期绑定的事件监听器支持同步派发 `emit`、并发聚合 `parallel`、短路中断 `serial`/`bail` 以及中间件风格的 `waterfall`。内置的 `internal/status` 和 `internal/error` 事件用于暴露生命周期状态转换和异常；`ctx.fibers` 与 `ctx.errors` 提供运行时的快照信息。
+生命周期绑定的事件监听器支持同步派发 `emit`、并发聚合 `parallel`、短路中断 `serial`/`bail` 以及中间件风格的 `waterfall`。内置 internal 事件暴露状态、异常、服务变化、配置更新与派发钩子；`ctx.fibers` 与 `ctx.errors` 提供运行时的快照信息。
 
 业务通知可用 `EventKey[*Args]` 与 on/once、emit/parallel 关联零到多个参数，例如 `EventKey[int, str]`；单处理器请求用 `QueryKey[Request, Result]` 与 handle/query，查询返回 Result 或 None。两种键按对象身份匹配，需由注册方和调用方共享。字符串事件保留原有动态派发策略。
 
@@ -134,8 +127,10 @@ await loader.reload_changed(["my_app/plugins/shared.py"])
 ```python
 @plugin(inject=["database"])
 def worker(ctx, _config):
+    database = ctx.service("database")
+
     async def execute(job):
-        await ctx.database.execute(job)
+        await database.execute(job)
 
     # 异步回调自动归属注册它的插件；卸载时最多等待 30 秒，再请求取消。
     ctx.on("job", execute, timeout=30)
@@ -144,7 +139,7 @@ def worker(ctx, _config):
     ctx.spawn(execute("warmup"), policy="cancel", name="warmup")
 ```
 
-`policy="drain"`（默认）等待任务完成；`policy="cancel"` 在卸载时立即请求取消。`timeout` 是卸载阶段的 drain 宽限期，不是任务执行时限。异步监听器用 `task_policy` 设置相同策略。插件停止接收新任务和事件后，运行时先等待在途任务及其 `finally`，再按 LIFO 撤销 Effect；依赖服务在消费者退出后才关闭。嵌套 `ctx.effect()` 同样拥有其中的任务和监听器。
+`policy="drain"`（默认）等待任务完成；`policy="cancel"` 在卸载时立即请求取消。`timeout` 是卸载阶段的 drain 宽限期，不是任务执行时限。异步监听器用 `task_policy` 设置相同策略。插件停止接收新任务和事件后，运行时先等待在途任务及其 `finally`，再按登记顺序逆序清理资源；依赖服务在消费者退出后才关闭。局部 `ctx.scope()` 同样管理其中的任务和监听器。
 
 任务结果可以直接 `await`；异常自动带上所属 Fiber 写入 `ctx.errors` 并触发 `internal/error`。`fiber.tasks` 提供未完成任务的快照；`ctx.flush()` 只等待生命周期转换。取消是协作式的：任务必须响应 `CancelledError`，不应阻塞事件循环。裸 `asyncio.create_task()` 不会自动纳管。请从宿主发起卸载；受管任务不能等待自身或依赖的卸载，否则会形成自等待。
 
@@ -157,7 +152,9 @@ PYTHONPATH=src python3 examples/graceful_unload.py
 
 ## 边界与限制
 
-时间维度的恢复仅适用于通过上下文执行的操作，或显式配对了逆操作的操作。对于直接修改进程级全局变量、泄漏线程或丢弃系统资源句柄的 Python 代码，系统无法进行自动恢复。此外，Python 不会卸载已被其他地方引用的字节码对象；HMR（热重载）替换的是模块缓存条目和组件 Fiber，而非解释器进程本身。
+根 Context 默认限制 1024 个未完成受管任务、保留最近 256 条错误；可用 `Context(max_tasks=..., error_history_limit=...)` 调整。宿主在接收请求前调用 `await root.wait_ready(timeout=...)`，在退出时调用 `await root.close(timeout=...)`。关闭默认等待 30 秒；超时返回阻塞组件和任务快照，后台继续安全清理。新默认值及故障处理方式见[生产运行约定](docs/production.md)。
+
+自动清理覆盖运行时已登记的资源与工作；业务状态的恢复需要明确的补偿措施。对于直接修改进程级全局变量、泄漏线程或丢弃系统资源句柄的 Python 代码，系统无法进行自动恢复。此外，Python 不会卸载已被其他地方引用的字节码对象；HMR（热重载）替换的是模块缓存条目和组件 Fiber，而非解释器进程本身。
 
 ## 本地开发
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from cordis import Entry, FiberState, Loader
+from cordis import Context, Entry, FiberState, Loader
 
 from .config import AppConfig, parse_config
 from .consumers.console import console
@@ -11,7 +11,6 @@ from .consumers.directory import directory
 from .definitions import (
     EVENT_CONFIG_APPLIED,
     EVENT_CONFIG_ERROR,
-    AppContext,
 )
 from .money import format_cents
 from .providers.csv import importer
@@ -23,7 +22,7 @@ from .providers.validation import validation
 class Application:
     """Convert validated business settings to a stable Cordis plugin tree."""
 
-    def __init__(self, ctx: AppContext, path: Path) -> None:
+    def __init__(self, ctx: Context, path: Path) -> None:
         self.ctx = ctx
         self.path = path.resolve()
         self.loader = Loader(ctx)

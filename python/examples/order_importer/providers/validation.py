@@ -1,8 +1,8 @@
 from dataclasses import dataclass
 
-from cordis import plugin
+from cordis import Context, plugin
 
-from ..definitions import VALIDATOR, AppContext, Order, ValidateOrderRequest
+from ..definitions import VALIDATOR, Order, ValidateOrderRequest
 from ..money import format_cents, parse_cents
 
 
@@ -28,5 +28,5 @@ class AmountValidator:
 
 
 @plugin(provide=[VALIDATOR])
-def validation(ctx: AppContext, config: ValidationConfig) -> None:
+def validation(ctx: Context, config: ValidationConfig) -> None:
     ctx.provide(VALIDATOR, AmountValidator(config))

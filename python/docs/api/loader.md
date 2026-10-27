@@ -15,6 +15,7 @@ Entry(
     isolate={},
     intercept={},
     children=(),
+    inject=(),
 )
 ```
 
@@ -28,6 +29,7 @@ Entry(
 | `enabled` | `bool` | 是否启用；默认 `True`，停用条目仍保留在 `entries` 中 |
 | `isolate` | `Mapping[str, bool \| str] \| tuple[str, ...]` | 按字符串服务名配置隔离域，规则见下表 |
 | `intercept` | `Mapping[str, object]` | 按字符串服务名给当前条目设置拦截元数据，读取后需收窄类型 |
+| `inject` | `Injection` | 叠加插件依赖；映射值同时提供拦截元数据，同名项以 Entry 为准 |
 | `children` | `tuple[Entry \| Mapping[str, Any], ...]` | 嵌套插件清单；默认为空 |
 
 指定 `plugin` 表示插件条目；不指定 plugin 表示 group，`children` 可以为空。不能同时指定插件和子条目。
@@ -77,7 +79,7 @@ await loader.unmount("worker")
 
 mount 等待当前启动转换完成；缺少依赖时可以返回处于 `PENDING` 的 Fiber，语义与 `await fiber` 相同。启动失败会清理本次挂载、释放 id 并抛出异常。id 与现有 mount 或 Entry 冲突时，在修改前抛出 `ValueError`。unmount 可移除任一入口的条目；不存在时抛出 `KeyError`。
 
-mount 管理的条目不进入 `entries`，也不会被 `reconcile()` 的完整清单删除；`reconcile([])` 只清空声明式条目。两种入口共享 id 范围，清单与 mount 的 id 冲突会在修改前被拒绝。`close()` 清理两种入口的全部挂载。源码 HMR 仍只处理 Entry 的字符串定位符；类型化挂载通过 `reload(id)` 重启已有组件定义。
+mount 管理的条目不进入 `entries`，也不会被 `reconcile()` 的完整清单删除；`reconcile([])` 只清空声明式条目。两种入口共享 id 范围，清单与 mount 的 id 冲突会在修改前被拒绝。`close()` 清理两种入口的全部挂载。源码 HMR 可处理字符串定位符以及可由模块名和限定名重新导入的类型化挂载；类型化挂载通过 `reload(id)` 仍重启已有定义，源码替换使用 `HotReloader.reload_changed()`。
 
 类型化挂载使用 Loader 的 Context；如需隔离或拦截，可先通过 `ctx.isolate()` / `ctx.intercept()` 创建装配 Context。完整示例见 [`typed_interfaces.py`](../../examples/typed_interfaces.py)。
 
@@ -225,7 +227,7 @@ tenant = await includes.include_file("tenant-a", "tenant-a.yaml")
 await tenant.update("worker", config={"interval": 10})
 ```
 
-`ConfigStore` 依赖 `ConfigBackend` 和 `ConfigCodec` 协议；内置 `FileBackend`、`JsonCodec`、`YamlCodec`。文件写入使用同目录临时文件和 `os.replace()`，写入前比较内容摘要；外部编辑过的文件会抛出 `StaleConfigError`，同时恢复 Loader 的上一棵树。CRUD、保存和取消等待均串行收尾，避免两个并发修改从同一旧树派生后互相覆盖。`watch(interval=0.5, stop=None, on_error=None)` 支持监控外部文件修改并自动重新加载，中间暂存态的语法与解析异常可通过 `on_error` 捕获而不中断监听。
+`ConfigStore` 依赖 `ConfigBackend` 和 `ConfigCodec` 协议；内置 `FileBackend`、`JsonCodec`、`YamlCodec`。文件写入使用同目录临时文件和 `os.replace()`，写入前比较内容摘要；外部编辑过的文件会抛出 `StaleConfigError`，同时恢复 Loader 的上一棵树。CRUD、保存和取消等待均串行收尾，避免两个并发修改从同一旧树派生后互相覆盖。`watch(interval=0.5, stop=None, on_error=None, ready=None)` 支持监控外部文件修改并自动重新加载，中间暂存态的语法与解析异常可通过 `on_error` 捕获而不中断监听。
 
 `ConfigIncludes` 把每个文件挂成一个空 group，再对它的 nested Loader 建立独立 ConfigStore。因此不同文件可以使用相同的局部条目 id，并分别更新、监听与回写。`include_file()` 加载失败会移除刚建立的 group；`remove(name)` 卸载该文件内的全部插件。
 
@@ -269,6 +271,8 @@ async def watch_file(
     *,
     interval: float = 0.5,
     stop: asyncio.Event | None = None,
+    on_error: Callable[[Exception], None] | None = None,
+    ready: asyncio.Event | None = None,
 ) -> None: ...
 ```
 
@@ -285,7 +289,7 @@ watcher = root.spawn(
 )
 ```
 
-路径必须存在。`interval` 是检查间隔，调用方应传有限正数；stop 在循环边界检查，不保证设置后立即返回。文件错误、配置解析或更新错误会结束 watcher，不会自动重试。需要“修正配置后继续监听”的业务策略，参考 [CSV 宿主](../scenarios.md#配置如何选择提供方)。
+`interval` 必须为有限正数；stop 可中断轮询等待。支持删除与重建文件；读取、解析和更新失败交给 on_error（默认记录到运行时），下一次文件变化时继续加载。可传 ready Event，在建立初始文件快照后置位。
 
 ## group
 
@@ -315,3 +319,24 @@ import_plugin(locator: str) -> PluginLike
 同步导入模块并解析属性，例如 `my_app.plugins:server`；冒号后可以是多级属性路径。缺少模块名、冒号或属性名会抛出 `ValueError`，模块和属性查找异常直接传播。
 
 返回被定位的对象，**不挂载插件**；是否为合法插件由后续 `ctx.use()` / Loader 挂载检查。字符串导入是动态边界，不能据此得到具体配置类型的静态保证。
+
+
+## 运行时同步、表达式与就绪门控
+
+声明式条目的 Fiber.update() 自动同步 Entry 配置及绑定的 ConfigStore；直接 dispose() 将条目标为 disabled 并持久化。Loader 自己的协调、HMR 和父级退出不会被记录为用户停用。close() 释放挂载、监听器和显式发布的服务，可以再次 reconcile 使用该 Loader。
+
+`ConfigExpression("ctx.port + 1")` 或文件中的 `{"__expr__": "ctx.port + 1"}` 在插件装配时递归求值。普通字符串保持字面值；仅支持表达式、公共属性、索引与常规运算，不支持调用、语句或私有名称。上下文中的服务访问遵守通常的依赖约束；表达式仍可能触发属性逻辑，配置来源须可信。
+
+`loader.walk()` 递归访问 group/include 的 Loader，`get("group/worker")` 查询嵌套条目。`await loader.wait_ready()` 等待协调与生命周期推进；缺失依赖的 PENDING 不会无限等待。需要依赖就绪门控时显式 `loader.provide()`，消费者用 `ctx.intercept("loader", {"await": True})` 并 inject loader；任何嵌套挂载正在 LOADING/UNLOADING 时暂不激活。
+
+宿主需要确认启动成功时，在装配后调用 `await ctx.wait_ready(timeout=...)`；它会拒绝缺失依赖、启动失败及未在期限内稳定的运行时，提供结构化诊断。Loader 的同名旧方法保持原有等待语义。
+
+## 配置补丁、冲突与延迟回写
+
+ConfigStore 的默认策略仍是 `conflicts="raise", deferred=False`：外部变化抛 StaleConfigError，回写失败恢复运行态。ConfigIncludes 的默认值为 `conflicts="file_wins", deferred=True`，也可显式覆盖。
+
+`ConfigPatch(path, changes={...})` 覆盖条目字段；`ConfigPatch(parent_path, insert=(Entry(...),))` 插入补丁拥有的条目，根级 parent_path 用 None。传给 `ConfigStore.file(..., patches=..., patch_path="overrides.json")`；sidecar 为 JSON 数组，每项含 path、changes、insert。若不配置 patch_path，补丁只保存在内存中。补丁覆盖的字段和插入条目的修改回到补丁，其余字段回到主文件；移除目标时清除失效补丁。
+
+`file_wins` 对基线、运行态、文件态做三方合并：保留互不冲突的修改，冲突处以文件为准，`store.conflicts` 提供路径、字段与说明。`deferred=True` 在 OSError 时保留有效运行态，将未写入差异放入只读 `store.journal` 快照，并记录 `write_error`。`await store.flush()` 显式重试，watch 也会重试；成功后清空 journal。宿主退出前应显式 flush，进程退出不会保存内存日志。
+
+主文件和 sidecar 各自原子替换；sidecar 写入失败会尝试恢复主文件，恢复失败报告异常组。两个文件不构成跨文件原子事务；需要这一保证时应提供具备事务能力的后端。

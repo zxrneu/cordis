@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import importlib
 import json
@@ -9,9 +10,18 @@ import tempfile
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Protocol, TypeAlias, TypeVar, cast
+from typing import Any, Literal, Protocol, TypeAlias, TypeVar, cast
 
 from .loader import Entry, Loader
+from .patches import (
+    ConfigChange,
+    ConfigConflict,
+    ConfigPatch,
+    apply_patches,
+    changes,
+    merge_trees,
+    route_patches,
+)
 
 
 EntryPath: TypeAlias = str | Sequence[str]
@@ -78,7 +88,7 @@ def _entry_data(entry: Entry) -> dict[str, object]:
     else:
         data["plugin"] = entry.plugin
         if entry.config is not None:
-            data["config"] = entry.config
+            data["config"] = _config_data(entry.config)
     if not entry.enabled:
         data["enabled"] = False
     if entry.isolate:
@@ -86,7 +96,25 @@ def _entry_data(entry: Entry) -> dict[str, object]:
         data["isolate"] = dict(entry.isolate)
     if entry.intercept:
         data["intercept"] = dict(entry.intercept)
+    if entry.inject:
+        data["inject"] = (
+            dict(entry.inject)
+            if isinstance(entry.inject, Mapping)
+            else list(entry.inject)
+        )
     return data
+
+
+def _config_data(value: object) -> object:
+    from .expressions import ConfigExpression
+
+    if isinstance(value, ConfigExpression):
+        return {"__expr__": value.source}
+    if isinstance(value, Mapping):
+        return {key: _config_data(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_config_data(item) for item in value]
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +202,7 @@ class EntryTree:
                 "isolate": current.isolate,
                 "intercept": current.intercept,
                 "children": current.children,
+                "inject": current.inject,
                 **changes,
             }
             return Entry(**cast(Any, values))
@@ -338,9 +367,21 @@ def _fingerprint(text: str | None) -> str | None:
 
 
 async def _serialized(lock: asyncio.Lock, operation: Callable[[], Awaitable[T]]) -> T:
+    if any(
+        active_lock is lock and mutation.active
+        for active_lock, mutation in _transactions.get()
+    ):
+        raise ConfigError("cannot recursively mutate the same configuration store")
+
     async def locked() -> T:
         async with lock:
-            return await operation()
+            mutation = _Transaction()
+            token = _transactions.set((*_transactions.get(), (lock, mutation)))
+            try:
+                return await operation()
+            finally:
+                mutation.active = False
+                _transactions.reset(token)
 
     task = asyncio.create_task(locked(), name="cordis:config-store")
     try:
@@ -360,6 +401,16 @@ async def _serialized(lock: asyncio.Lock, operation: Callable[[], Awaitable[T]])
         raise
 
 
+@dataclass
+class _Transaction:
+    active: bool = True
+
+
+_transactions: contextvars.ContextVar[tuple[tuple[asyncio.Lock, _Transaction], ...]] = (
+    contextvars.ContextVar("cordis_config_transactions", default=())
+)
+
+
 class ConfigStore:
     """Transactionally keep an EntryTree, a Loader, and storage in sync."""
 
@@ -368,12 +419,30 @@ class ConfigStore:
         loader: Loader[Any],
         backend: ConfigBackend,
         codec: ConfigCodec,
+        *,
+        patches: Sequence[ConfigPatch] = (),
+        patch_backend: ConfigBackend | None = None,
+        conflicts: Literal["raise", "file_wins"] = "raise",
+        deferred: bool = False,
     ) -> None:
         self.loader = loader
+        if loader._store is not None:
+            raise ConfigError("a Loader can have only one configuration store")
+        loader._store = self
         self.backend = backend
         self.codec = codec
+        self.patches = tuple(patches)
+        self.patch_backend = patch_backend
+        self.conflict_policy = conflicts
+        self.deferred = deferred
+        self.conflicts: tuple[ConfigConflict, ...] = ()
+        self.write_error: OSError | None = None
         self._tree = EntryTree(tuple(loader.entries))
+        self._file_tree = self._tree
+        self._base_tree = self._tree
+        self._pending = False
         self._revision: str | None = None
+        self._patch_revision: str | None = None
         self._lock = asyncio.Lock()
 
     @classmethod
@@ -383,12 +452,60 @@ class ConfigStore:
         path: str | Path,
         *,
         codec: ConfigCodec | None = None,
+        patches: Sequence[ConfigPatch] = (),
+        patch_path: str | Path | None = None,
+        conflicts: Literal["raise", "file_wins"] = "raise",
+        deferred: bool = False,
     ) -> ConfigStore:
-        return cls(loader, FileBackend(path), codec or codec_for_path(path))
+        return cls(
+            loader,
+            FileBackend(path),
+            codec or codec_for_path(path),
+            patches=patches,
+            patch_backend=FileBackend(patch_path) if patch_path is not None else None,
+            conflicts=conflicts,
+            deferred=deferred,
+        )
 
     @property
     def tree(self) -> EntryTree:
         return self._tree
+
+    @property
+    def journal(self) -> tuple[ConfigChange, ...]:
+        return changes(self._base_tree, self._tree) if self._pending else ()
+
+    async def _read_patches(self) -> None:
+        if self.patch_backend is None:
+            return
+        text = await self.patch_backend.read()
+        if text is not None:
+            self.patches = tuple(
+                ConfigPatch(
+                    value.get("path"),
+                    value.get("changes", {}),
+                    tuple(_coerce_entry(item) for item in value.get("insert", ())),
+                )
+                for value in json.loads(text)
+            )
+        self._patch_revision = _fingerprint(text)
+
+    def _patch_text(self, patches: Sequence[ConfigPatch]) -> str:
+        return (
+            json.dumps(
+                [
+                    {
+                        "path": list(patch.path or ()),
+                        "changes": _config_data(patch.changes),
+                        "insert": [_entry_data(entry) for entry in patch.insert],
+                    }
+                    for patch in patches
+                ],
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n"
+        )
 
     async def _run(self, operation: Callable[[], Awaitable[T]]) -> T:
         return await _serialized(self._lock, operation)
@@ -397,9 +514,24 @@ class ConfigStore:
         text = await self.backend.read()
         if text is None:
             raise FileNotFoundError(self.backend.identity)
-        tree = EntryTree.from_values(self.codec.loads(text))
-        await self.loader.reconcile(tree.entries)
+        raw = EntryTree.from_values(self.codec.loads(text))
+        previous_patches, previous_revision = self.patches, self._patch_revision
+        try:
+            await self._read_patches()
+            tree = apply_patches(
+                raw, self.patches, strict=self.conflict_policy == "raise"
+            )
+            if self._pending:
+                tree, self.conflicts = merge_trees(self._base_tree, self._tree, tree)
+            await self.loader.reconcile(tree.entries)
+        except BaseException:
+            self.patches, self._patch_revision = previous_patches, previous_revision
+            raise
         self._tree = tree
+        self._file_tree = raw
+        self._base_tree = apply_patches(
+            raw, self.patches, strict=self.conflict_policy == "raise"
+        )
         self._revision = _fingerprint(text)
         return tree
 
@@ -407,17 +539,32 @@ class ConfigStore:
         return await self._run(self._load)
 
     async def _save_current(self) -> None:
-        await self._save(self._tree)
+        previous = self.loader.entries
+        try:
+            self._tree = await self._save(self._tree)
+        except BaseException:
+            await self.loader.reconcile(previous)
+            raise
 
     async def save(self) -> None:
         await self._run(self._save_current)
+
+    async def flush(self) -> None:
+        """Retry pending writes; failures keep the journal available for retry."""
+        await self.save()
 
     async def _replace(self, tree: EntryTree, persist: bool) -> EntryTree:
         previous = self._tree
         try:
             await self.loader.reconcile(tree.entries)
             if persist:
-                await self._save(tree)
+                try:
+                    tree = await self._save(tree)
+                except OSError as error:
+                    if not self.deferred:
+                        raise
+                    self.write_error = error
+                    self._pending = True
         except BaseException as error:
             try:
                 await self.loader.reconcile(previous.entries)
@@ -433,15 +580,63 @@ class ConfigStore:
     async def replace(self, tree: EntryTree, *, persist: bool = True) -> EntryTree:
         return await self._run(lambda: self._replace(tree, persist))
 
-    async def _save(self, tree: EntryTree) -> None:
+    async def _save(self, tree: EntryTree) -> EntryTree:
         current = await self.backend.read()
         if _fingerprint(current) != self._revision:
-            raise StaleConfigError(
-                f"configuration changed outside this store: {self.backend.identity}"
+            if self.conflict_policy == "raise":
+                raise StaleConfigError(
+                    f"configuration changed outside this store: {self.backend.identity}"
+                )
+            if current is None:
+                raise FileNotFoundError(self.backend.identity)
+            raw = EntryTree.from_values(self.codec.loads(current))
+            tree, self.conflicts = merge_trees(
+                self._base_tree, tree, apply_patches(raw, self.patches, strict=False)
             )
-        text = self.codec.dumps(tree.entries)
+        else:
+            raw = self._file_tree
+        file_tree, patches = route_patches(raw, tree, self.patches)
+        text = self.codec.dumps(file_tree.entries)
+        await self.loader.reconcile(tree.entries)
+        # Check again immediately before writing, after codecs and patch routing.
+        if await self.backend.read() != current:
+            raise StaleConfigError(
+                f"configuration changed while preparing write: {self.backend.identity}"
+            )
+        previous_patches = (
+            await self.patch_backend.read() if self.patch_backend else None
+        )
+        if (
+            self.patch_backend is not None
+            and _fingerprint(previous_patches) != self._patch_revision
+        ):
+            raise StaleConfigError(
+                f"patches changed outside this store: {self.patch_backend.identity}"
+            )
         await self.backend.write(text)
+        try:
+            if self.patch_backend is not None:
+                await self.patch_backend.write(self._patch_text(patches))
+        except BaseException as error:
+            if current is not None:
+                try:
+                    await self.backend.write(current)
+                    if self.patch_backend is not None and previous_patches is not None:
+                        await self.patch_backend.write(previous_patches)
+                except BaseException as recovery:
+                    raise BaseExceptionGroup(
+                        "configuration write and recovery failed", [error, recovery]
+                    ) from error
+            raise
+        self.patches = patches
+        if self.patch_backend is not None:
+            self._patch_revision = _fingerprint(self._patch_text(patches))
+        self._file_tree = file_tree
+        self._base_tree = tree
+        self._pending = False
+        self.write_error = None
         self._revision = _fingerprint(text)
+        return tree
 
     async def create(
         self,
@@ -495,16 +690,40 @@ class ConfigStore:
         interval: float = 0.5,
         stop: asyncio.Event | None = None,
         on_error: Callable[[Exception], None] | None = None,
+        ready: asyncio.Event | None = None,
     ) -> None:
+        import math
+
+        if not math.isfinite(interval) or interval <= 0:
+            raise ValueError("watch interval must be finite and positive")
+        if ready is not None:
+            ready.set()
         while stop is None or not stop.is_set():
-            await asyncio.sleep(interval)
-            text = await self.backend.read()
-            if _fingerprint(text) != self._revision:
+            if stop is None:
+                await asyncio.sleep(interval)
+            else:
                 try:
+                    await asyncio.wait_for(stop.wait(), interval)
+                    return
+                except TimeoutError:
+                    pass
+            try:
+                text = await self.backend.read()
+                patch_text = (
+                    await self.patch_backend.read() if self.patch_backend else None
+                )
+                if (
+                    _fingerprint(text) != self._revision
+                    or _fingerprint(patch_text) != self._patch_revision
+                ):
                     await self.load()
-                except Exception as error:
-                    if on_error is not None:
-                        on_error(error)
+                if self._pending:
+                    await self.flush()
+            except Exception as error:
+                if on_error is not None:
+                    on_error(error)
+                else:
+                    self.loader.ctx._runtime.report(error)
 
 
 class ConfigIncludes:
@@ -527,6 +746,11 @@ class ConfigIncludes:
         name: str,
         backend: ConfigBackend,
         codec: ConfigCodec,
+        *,
+        patches: Sequence[ConfigPatch] = (),
+        patch_backend: ConfigBackend | None = None,
+        conflicts: Literal["raise", "file_wins"] = "file_wins",
+        deferred: bool = True,
     ) -> ConfigStore:
         if not name:
             raise ValueError("include name must be non-empty")
@@ -542,7 +766,15 @@ class ConfigIncludes:
             if child is None:
                 await self.loader.reconcile(previous)
                 raise ConfigError(f"include group {name!r} did not create a Loader")
-            store = ConfigStore(child, backend, codec)
+            store = ConfigStore(
+                child,
+                backend,
+                codec,
+                patches=patches,
+                patch_backend=patch_backend,
+                conflicts=conflicts,
+                deferred=deferred,
+            )
             try:
                 await store.load()
             except BaseException as error:
@@ -565,11 +797,19 @@ class ConfigIncludes:
         path: str | Path,
         *,
         codec: ConfigCodec | None = None,
+        patches: Sequence[ConfigPatch] = (),
+        patch_path: str | Path | None = None,
+        conflicts: Literal["raise", "file_wins"] = "file_wins",
+        deferred: bool = True,
     ) -> ConfigStore:
         return await self.include(
             name,
             FileBackend(path),
             codec or codec_for_path(path),
+            patches=patches,
+            patch_backend=FileBackend(patch_path) if patch_path is not None else None,
+            conflicts=conflicts,
+            deferred=deferred,
         )
 
     async def remove(self, name: str) -> ConfigStore:

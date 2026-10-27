@@ -21,7 +21,7 @@
   - [3.2 编写与装配最简插件 (Hello World)](#32-编写与装配最简插件-hello-world)
   - [3.3 声明服务契约与带类型的 AppContext](#33-声明服务契约与带类型的-appcontext)
   - [3.4 服务的提供 (Provide) 与消费 (Inject)](#34-服务的提供-provide-与消费-inject)
-  - [3.5 资源与清理：Effect 的四种实现形态](#35-资源与清理effect-的四种实现形态)
+  - [3.5 资源与清理：显式获取与兼容协议](#35-资源与清理显式获取与兼容协议)
   - [3.6 托管后台并发任务：`ctx.spawn`](#36-托管后台并发任务ctxspawn)
   - [3.7 事件总线全景：广播、并行、短路与流水线](#37-事件总线全景广播并行短路与流水线)
 - [4. 深入剖析与底层原理 (Deep Dive & Internals)](#4-深入剖析与底层原理-deep-dive--internals)
@@ -38,7 +38,7 @@
   - [Q1: Cordis 与常规依赖注入（如 FastAPI Depends / dependency-injector）有何本质差异？](#q1-cordis-与常规依赖注入如-fastapi-depends--dependency-injector有何本质差异)
   - [Q2: 为什么我的插件状态一直是 `pending`？排查路径是什么？](#q2-为什么我的插件状态一直是-pending排查路径是什么)
   - [Q3: `await fiber` 到底在等什么？它会无限挂起等待未来依赖吗？](#q3-await-fiber-到底在等什么它会无限挂起等待未来依赖吗)
-  - [Q4: 为什么严禁在插件内直接调用 `asyncio.create_task()`？](#q4-为什么严禁在插件内直接调用-asynciocreate_task)
+  - [Q4: 插件后台任务应由谁管理？](#q4-插件后台任务应由谁管理)
   - [Q5: `ctx.spawn` 的 `policy="drain"` 与 `policy="cancel"` 该如何抉择？](#q5-ctxspawn-的-policydrain-与-policycancel-该如何抉择)
   - [Q6: 清理阶段（Cleanup）抛出异常会怎样？会阻断其他资源释放吗？](#q6-清理阶段cleanup抛出异常会怎样会阻断其他资源释放吗)
   - [Q7: 插件如何支持“配置原地热更”而不重启销毁服务？](#q7-插件如何支持配置原地热更而不重启销毁服务)
@@ -49,6 +49,8 @@
 ---
 
 ## 1. 全景认知：Cordis 是什么与解决什么问题
+
+推荐的 Python 使用方式见 [Python 接口约定](python-style.md)：装配处显式获取服务，业务对象通过参数接收依赖，资源通过标准上下文管理器和明确作用域管理。本页保留 Effect、Coeffect 和 Fiber 等架构术语，用于理解内部调度；动态属性、服务代理和多种初始化返回值属于兼容接口，不是编写业务插件的前提。
 
 ### 1.1 架构起源与设计哲学
 
@@ -91,7 +93,7 @@ flowchart TB
 Cordis 的运行逻辑紧紧围绕三要素运转：
 1. **契约（Contracts & Keys）**：通过 `ServiceKey` 声明强类型接口，消费者与提供者解耦，仅依赖接口契约。
 2. **状态与纤程（Fiber & Drive Loop）**：每个加载的组件对应一个 Fiber。依赖可用即进入 `ACTIVE`，依赖缺失或变更即优雅卸载并回到 `PENDING`。
-3. **效应闭包（Effect Sinks）**：所有注册的服务、事件监听、文件句柄、后台协程，都注册在当前作用域的 Sink 树中，卸载时以严格的 LIFO 逆序自动撤销。
+3. **资源作用域**：登记服务、监听器、清理函数和后台任务的所有权。卸载时先协调依赖方退出，再让任务完成或取消，最后按登记顺序逆序释放资源。
 
 ---
 
@@ -319,9 +321,11 @@ def consumer_plugin(ctx: AppContext, _config: None) -> None:
     print(f"[ConsumerPlugin] 调用结果: {msg}")
 ```
 
-### 3.5 资源与清理：Effect 的四种实现形态
+### 3.5 资源与清理：显式获取与兼容协议
 
-插件生命周期不仅包含“启动”，还必须包含“卸载与清理”。Cordis 原生支持四种声明清理操作的形态：
+插件生命周期包含启动与清理。新代码使用 `ctx.enter_context()` / `await ctx.enter_async_context()` 获取标准上下文管理器的资源值，或通过 `ctx.defer()` 立即登记已有清理函数。局部生命周期使用 `async with ctx.scope() as scope`。这能让资源获取位置、使用范围和释放时机保持清楚。
+
+下面四种初始化协议继续兼容，用于理解现有插件：
 
 #### 形态 1：返回清理 Callable（同步或异步）
 ```python
@@ -332,7 +336,7 @@ def resource_plugin_1(ctx: Context, _config: None):
     return lambda: print("资源已释放 (形态 1)")
 ```
 
-#### 形态 2：使用 `yield` 生成器（推荐，最直观）
+#### 形态 2：原始生成器初始化协议（兼容）
 ```python
 @plugin
 def resource_plugin_2(ctx: Context, _config: None):
@@ -371,11 +375,11 @@ class ServerPlugin:
         print(f"TCP 端口 {self.port} 关闭 (形态 4)")
 ```
 
-> **核心原则**：清理操作执行顺序严格遵循 **LIFO（后进先出）**。后初始化的资源会先被清理，确保没有半解构的悬垂依赖。
+> 同一作用域的资源按获取顺序逆序清理。跨插件顺序遵守依赖关系，任务先按策略结束；不能把所有任务与服务简单串行按 LIFO 处理。
 
 ### 3.6 托管后台并发任务：`ctx.spawn`
 
-在插件内部启动后台协程时，**绝对禁止直接使用 `asyncio.create_task`**！必须使用 `ctx.spawn`，将任务挂载到当前插件的生命周期中。
+跟随插件生命周期运行的后台协程使用 `ctx.spawn`。局部并发可以使用标准结构化并发机制，并在离开作用域前等待任务结束。宿主调度和运行时底层可以自行创建任务，但需要明确的所有者、等待和取消路径。
 
 ```mermaid
 sequenceDiagram
@@ -424,7 +428,7 @@ def worker_plugin(ctx: Context, _config: None) -> None:
         await asyncio.sleep(2)
         print("[Job] 大文件导入完成！")
 
-    # 策略 2: policy="drain" - 插件退出时允许最多等待 5 秒自然完成，超时再强制取消
+    # 策略 2: policy="drain" - 插件退出时允许最多等待 5 秒自然完成，超时再请求取消
     ctx.spawn(heavy_job(), policy="drain", timeout=5.0, name="csv-job")
 ```
 
@@ -765,14 +769,14 @@ Cordis 包含真正针对 Python 代码文件的源码级热替换引擎（[`src
 
 ---
 
-### Q4: 为什么严禁在插件内直接调用 `asyncio.create_task()`？
+### Q4: 插件后台任务应由谁管理？
 
-> **原因：逃逸协程会引发悬挂死锁与内存泄漏。**
+> 插件退出前必须等待仍在使用其资源的工作结束。
 
-如果使用原生的 `asyncio.create_task()`：
+如果创建后台任务后没有登记所有者和退出路径：
 1. **脱离生命周期**：插件卸载后，该协程依然在后台运行。它可能继续向已经关闭的数据库连接发送 SQL，或者向已经注销的消息队列发送消息，导致无法预知的运行时崩溃。
 2. **阻断依赖回收**：底层服务卸载时，无法感知到上层还有裸协程正在访问它，导致底层服务强行关闭，裸协程抛出未捕获异常。
-3. **Cordis 解决方案**：必须使用 `ctx.spawn()`。它会将任务注册到当前 Fiber 的 Sink 中，在卸载前强制完成排空或取消。
+3. **生命周期管理**：跟随插件运行的后台任务使用 `ctx.spawn()`，卸载时等待完成或请求取消并等待退出。局部并发可用标准结构化并发机制；宿主和运行时自行创建的任务也要有明确的等待、取消和异常处理路径。
 
 ---
 
@@ -855,6 +859,7 @@ InactiveContextError: a managed task cannot wait for teardown of its own scope o
   - A 启动前计算目标：发现缺少 B 提供的服务，目标为 `None`，保持 `PENDING`；
   - B 启动前计算目标：发现缺少 A 提供的服务，目标为 `None`，保持 `PENDING`；
   - 驱动循环结束，两者安静等待。
+- **启动检查**：宿主调用 `await root.wait_ready(timeout=...)` 会收到 `ReadinessError`，其 `issues` 报告不可用的服务名；`cycles` 按 Realm 匹配，提供唯一声明提供者之间的环线索。动态提供的服务无法在运行前完整推断。
 - **架构建议**：循环依赖属于严重的设计异味（Code Smell）。应引入第三个中立的共享契约服务（例如抽取共享的数据总线或事件中继），消除强耦合环路。
 
 ---
@@ -862,16 +867,21 @@ InactiveContextError: a managed task cannot wait for teardown of its own scope o
 ### Q10: 生产级系统使用 Cordis 有哪些已知局限与加固建议？
 
 1. **同步阻塞防护**：Cordis 驱动层基于 `asyncio` 事件循环。严禁在插件 `apply` 或事件回调中执行高耗时 CPU 密集计算或同步阻塞 I/O（如 `time.sleep()`, 同步 `requests.get()`），这会冻结整个运行时的调度驱动。必须使用 `asyncio.to_thread` 转移到线程池。
-2. **优雅停机信号集成**：生产中需捕获 `SIGTERM` 与 `SIGINT`，并在退出处理器中正确 `await root.close()`：
+2. **优雅停机信号集成**：由宿主统一接收停止请求、停止接收新业务，再 `await root.close(timeout=...)`。支持 `add_signal_handler` 的 Unix 事件循环可以这样通知宿主：
    ```python
+   stop = asyncio.Event()
    loop = asyncio.get_running_loop()
    for sig in (signal.SIGTERM, signal.SIGINT):
-       loop.add_signal_handler(sig, lambda: asyncio.create_task(root.close()))
+       loop.add_signal_handler(sig, stop.set)
+   await stop.wait()
+   await root.close(timeout=20)
    ```
+   Windows 服务停止等平台事件由宿主适配。关闭超时提供阻塞诊断，清理继续；进程管理器负责最终退出期限。
 3. **全局错误监控**：始终在 Root Context 上注册错误监听，防范未捕获异常：
    ```python
    root.on("internal/error", lambda error, fiber: logger.error("Cordis 内部异常: %s (来自 %s)", error, fiber))
    ```
+4. **容量与启动检查**：使用 `Context(max_tasks=..., error_history_limit=...)` 声明容量，接收请求前 `await root.wait_ready(timeout=...)`，并处理 `TaskLimitError`。默认值、故障语义与验证范围见[生产运行约定](production.md)。
 
 ---
 

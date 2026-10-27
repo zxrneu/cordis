@@ -15,7 +15,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from cordis import Context, Entry, Loader, plugin
+from cordis import Context, Entry, Loader, ServiceKey, plugin
 
 
 JsonObject = dict[str, Any]
@@ -74,8 +74,9 @@ class Policy:
 class ToolRuntime:
     """工具定义注册表 + 策略化执行入口。"""
 
-    def __init__(self, ctx: Context):
-        self.ctx = ctx
+    def __init__(self, policy: Policy, owner: Context) -> None:
+        self.policy = policy
+        self.owner = owner
         self._tools: dict[str, Tool] = {}
 
     def register(self, tool: Tool) -> Callable[[], None]:
@@ -96,7 +97,7 @@ class ToolRuntime:
         ]
 
     async def execute(self, call: ToolCall) -> JsonObject:
-        denial = self.ctx.policy.authorize(call)
+        denial = self.policy.authorize(call)
         if denial:
             result = {"ok": False, "error": denial}
         elif (tool := self._tools.get(call.name)) is None:
@@ -107,7 +108,7 @@ class ToolRuntime:
                 result = {"ok": True, "value": value}
             except Exception as error:
                 result = {"ok": False, "error": f"{type(error).__name__}: {error}"}
-        self.ctx.emit("tools/result", call, result)
+        self.owner.emit("tools/result", call, result)
         return result
 
 
@@ -150,18 +151,23 @@ class FakeDeepSeek:
 
 
 class AgentRuntime:
-    def __init__(self, ctx: Context):
-        self.ctx = ctx
+    def __init__(
+        self, session: SessionLog, model: FakeDeepSeek, tools: ToolRuntime, prompt: str
+    ) -> None:
+        self.session = session
+        self.model = model
+        self.tools = tools
+        self.prompt = prompt
 
     async def run(self, user: str) -> str:
-        session = self.ctx.session
+        session = self.session
         session.append("user", content=user)
 
         for _ in range(4):
-            reply = await self.ctx.llm.complete(
+            reply = await self.model.complete(
                 session.events,
-                self.ctx.tools.schemas(),
-                self.ctx.system_prompt,
+                self.tools.schemas(),
+                self.prompt,
             )
             if reply.tool_call is None:
                 answer = reply.content or ""
@@ -175,83 +181,107 @@ class AgentRuntime:
                 name=call.name,
                 arguments=call.arguments,
             )
-            result = await self.ctx.tools.execute(call)
+            result = await self.tools.execute(call)
             session.append("tool_result", id=call.id, name=call.name, result=result)
 
         raise RuntimeError("Agent Loop 超过最大迭代次数")
 
 
-@plugin(provide=["session"])
-def session_plugin(ctx: Context, _config: Any):
-    ctx.provide("session", SessionLog())
+SESSION = ServiceKey[SessionLog]("session")
+POLICY = ServiceKey[Policy]("policy")
+TOOLS = ServiceKey[ToolRuntime]("tools")
+MEMORY = ServiceKey[dict[str, object]]("memory")
+MODEL = ServiceKey[FakeDeepSeek]("llm")
+PROMPT = ServiceKey[str]("system_prompt")
+AGENT = ServiceKey[AgentRuntime]("agent")
 
 
-@plugin(provide=["memory"])
-def memory_plugin(ctx: Context, _config: Any):
-    ctx.provide("memory", {})
+@plugin(provide=[SESSION])
+def session_plugin(ctx: Context, _config: None) -> None:
+    ctx.provide(SESSION, SessionLog())
 
 
-@plugin(provide=["policy"])
-def policy_plugin(ctx: Context, config: JsonObject):
-    ctx.provide("policy", Policy(config["allow"]))
+@plugin(provide=[MEMORY])
+def memory_plugin(ctx: Context, _config: None) -> None:
+    ctx.provide(MEMORY, {})
 
 
-@plugin(inject=["policy"], provide=["tools"])
-def tools_plugin(ctx: Context, _config: Any):
-    ctx.provide("tools", ToolRuntime(ctx))
+@plugin(provide=[POLICY])
+def policy_plugin(ctx: Context, config: JsonObject) -> None:
+    ctx.provide(POLICY, Policy(config["allow"]))
 
 
-@plugin(inject=["tools"])
-def calculator_tool(ctx: Context, _config: Any):
-    return ctx.tools.register(Tool("calculator", "计算四则表达式", calculate))
+@plugin(inject=[POLICY], provide=[TOOLS])
+def tools_plugin(ctx: Context, _config: None) -> None:
+    ctx.provide(TOOLS, ToolRuntime(ctx.service(POLICY), ctx))
 
 
-@plugin(inject=["tools", "memory"])
-def memory_tools(ctx: Context, _config: Any):
+@plugin(inject=[TOOLS])
+def calculator_tool(ctx: Context, _config: None) -> None:
+    ctx.defer(
+        ctx.service(TOOLS).register(Tool("calculator", "计算四则表达式", calculate))
+    )
+
+
+@plugin(inject=[TOOLS, MEMORY])
+def memory_tools(ctx: Context, _config: None) -> None:
+    memory = ctx.service(MEMORY)
+
     def remember(arguments: Mapping[str, Any]) -> str:
         key = str(arguments["key"])
-        ctx.memory[key] = arguments["value"]
+        memory[key] = arguments["value"]
         return f"已记住 {key}"
 
     def recall(arguments: Mapping[str, Any]) -> Any:
-        return ctx.memory.get(str(arguments["key"]), "未找到")
+        return memory.get(str(arguments["key"]), "未找到")
 
-    return [
-        ctx.tools.register(Tool("remember", "保存一条长期记忆", remember)),
-        ctx.tools.register(Tool("recall", "读取一条长期记忆", recall)),
-    ]
+    for tool in (
+        Tool("remember", "保存一条长期记忆", remember),
+        Tool("recall", "读取一条长期记忆", recall),
+    ):
+        ctx.defer(ctx.service(TOOLS).register(tool))
 
 
-@plugin(inject=["tools"])
-def uppercase_tool(ctx: Context, _config: Any):
+@plugin(inject=[TOOLS])
+def uppercase_tool(ctx: Context, _config: None) -> None:
     def uppercase(arguments: Mapping[str, Any]) -> str:
         return str(arguments["text"]).upper()
 
-    return ctx.tools.register(Tool("uppercase", "把文本转换为大写", uppercase))
+    ctx.defer(
+        ctx.service(TOOLS).register(Tool("uppercase", "把文本转换为大写", uppercase))
+    )
 
 
-@plugin(provide=["system_prompt"])
-def system_prompt_plugin(ctx: Context, config: JsonObject):
-    ctx.provide("system_prompt", config["text"])
+@plugin(provide=[PROMPT])
+def system_prompt_plugin(ctx: Context, config: JsonObject) -> None:
+    ctx.provide(PROMPT, config["text"])
 
 
-@plugin(provide=["llm"])
-def llm_plugin(ctx: Context, config: JsonObject):
-    ctx.provide("llm", FakeDeepSeek(config["model"]))
+@plugin(provide=[MODEL])
+def llm_plugin(ctx: Context, config: JsonObject) -> None:
+    ctx.provide(MODEL, FakeDeepSeek(config["model"]))
 
 
 @plugin(
-    inject=["llm", "tools", "session", "system_prompt"],
-    provide=["agent"],
+    inject=[MODEL, TOOLS, SESSION, PROMPT],
+    provide=[AGENT],
 )
-def agent_plugin(ctx: Context, _config: Any):
-    ctx.provide("agent", AgentRuntime(ctx))
+def agent_plugin(ctx: Context, _config: None) -> None:
+    ctx.provide(
+        AGENT,
+        AgentRuntime(
+            ctx.service(SESSION),
+            ctx.service(MODEL),
+            ctx.service(TOOLS),
+            ctx.service(PROMPT),
+        ),
+    )
 
 
-@plugin(inject=["agent"])
-async def headless_plugin(ctx: Context, config: JsonObject):
+@plugin(inject=[AGENT])
+async def headless_plugin(ctx: Context, config: JsonObject) -> None:
     for prompt in config["prompts"]:
-        answer = await ctx.agent.run(prompt)
+        answer = await ctx.service(AGENT).run(prompt)
         print(f"用户> {prompt}\n助手> {answer}\n")
 
 
@@ -267,8 +297,10 @@ def calculate(arguments: Mapping[str, Any]) -> int | float:
     """只解释数字和四则运算，不使用 eval。"""
 
     def visit(node: ast.AST) -> int | float:
-        if isinstance(node, ast.Constant) and type(node.value) in (int, float):
-            return node.value
+        if isinstance(node, ast.Constant):
+            value = node.value
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return value
         if isinstance(node, ast.BinOp) and type(node.op) in _OPERATORS:
             return _OPERATORS[type(node.op)](visit(node.left), visit(node.right))
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
@@ -303,58 +335,57 @@ def headless_profile(prompts: list[str]) -> Entry:
 
 
 async def main() -> None:
-    root = Context()
-    loader = Loader(root)
+    async with Context() as root:
+        loader = Loader(root)
 
-    # 第一次启动：uppercase 已注册、模型也能看到，但策略拒绝执行。
-    base = base_bundle(["calculator", "remember", "recall"])
-    await loader.reconcile(
-        [
-            *base,
-            headless_profile(
-                [
-                    "计算 (7 + 5) * 3",
-                    "记住 project=cordis",
-                    "回忆 project",
-                    "大写 cordis",
-                ]
-            ),
+        # 第一次启动：uppercase 已注册、模型也能看到，但策略拒绝执行。
+        base = base_bundle(["calculator", "remember", "recall"])
+        await loader.reconcile(
+            [
+                *base,
+                headless_profile(
+                    [
+                        "计算 (7 + 5) * 3",
+                        "记住 project=cordis",
+                        "回忆 project",
+                        "大写 cordis",
+                    ]
+                ),
+            ]
+        )
+
+        # 卸下 one-shot app，再像应用 patch 一样替换 policy 配置。
+        await loader.reconcile(base)
+        patched = base_bundle(["calculator", "remember", "recall", "uppercase"])
+        await loader.reconcile(patched)
+        await loader.reconcile([*patched, headless_profile(["大写 cordis"])])
+
+        events = list(root.service(SESSION).events)
+        print("=== append-only session log ===")
+        for event in events:
+            print(json.dumps(event, ensure_ascii=False, sort_keys=True))
+
+        denied = [
+            event
+            for event in events
+            if event["kind"] == "tool_result"
+            and event["name"] == "uppercase"
+            and not event["result"]["ok"]
         ]
-    )
+        allowed = [
+            event
+            for event in events
+            if event["kind"] == "tool_result"
+            and event["name"] == "uppercase"
+            and event["result"]["ok"]
+        ]
+        assert len(denied) == len(allowed) == 1
+        assert any(
+            event["kind"] == "tool_result" and event["result"].get("value") == "cordis"
+            for event in events
+        )
 
-    # 卸下 one-shot app，再像应用 patch 一样替换 policy 配置。
-    await loader.reconcile(base)
-    patched = base_bundle(["calculator", "remember", "recall", "uppercase"])
-    await loader.reconcile(patched)
-    await loader.reconcile([*patched, headless_profile(["大写 cordis"])])
-
-    events = list(root.session.events)
-    print("=== append-only session log ===")
-    for event in events:
-        print(json.dumps(event, ensure_ascii=False, sort_keys=True))
-
-    denied = [
-        event
-        for event in events
-        if event["kind"] == "tool_result"
-        and event["name"] == "uppercase"
-        and not event["result"]["ok"]
-    ]
-    allowed = [
-        event
-        for event in events
-        if event["kind"] == "tool_result"
-        and event["name"] == "uppercase"
-        and event["result"]["ok"]
-    ]
-    assert len(denied) == len(allowed) == 1
-    assert any(
-        event["kind"] == "tool_result" and event["result"].get("value") == "cordis"
-        for event in events
-    )
-
-    await loader.close()
-    await root.close()
+        await loader.close()
 
 
 if __name__ == "__main__":

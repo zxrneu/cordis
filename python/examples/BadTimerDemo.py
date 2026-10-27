@@ -1,43 +1,20 @@
+"""Show how an explicit owner prevents tasks from outliving their consumer."""
+
 import asyncio
-from cordis import Context, plugin
 
-class BadTimer:
-    def __init__(self, ctx: Context) -> None:
-        self.ctx = ctx  # 绑定提供方的 ctx
+from cordis import Context
+from examples.timer_demo import TIMER, TimerService
 
-    def interval(self, seconds: float, callback):
-        print(f"[启动任务] 任务实际挂载在 Fiber: {self.ctx.fiber.name}")
-        async def _loop():
-            while True:
-                await asyncio.sleep(seconds)
-                callback()
-        return self.ctx.spawn(_loop(), policy="cancel")
 
-@plugin(provide=["timer"])
-def timer_plugin(ctx: Context, _config: None):
-    # ctx.provide("timer", BadTimer(ctx))  # 未使用 adapt
-    # 使用adapt
-    def adapt(value: BadTimer, metadata: None, ctx: Context) -> BadTimer:
-        return BadTimer(ctx)
-    ctx.provide("timer", BadTimer(ctx), adapt=adapt)
-
-@plugin(inject=["timer"])
-def consumer_plugin(ctx: Context, _config: None):
-    print(f"[消费者] 消费者的 Fiber 是: {ctx.fiber.name}")
-    ctx.timer.interval(0.2, lambda: print("  -> 定时器还在跳动..."))
-
-async def main():
+async def main() -> None:
     async with Context() as root:
-        root.use(timer_plugin)
-        consumer = root.use(consumer_plugin)
-        await root.flush()
-        await asyncio.sleep(0.3)
+        root.provide(TIMER, TimerService())
+        async with root.scope() as consumer:
+            timer = consumer.service(TIMER)
+            task = timer.interval(consumer, 0.2, lambda: print("消费者的周期回调"))
+            await asyncio.sleep(0.3)
+        print(f"消费者退出后任务已取消：{task.cancelled()}")
 
-        print("\n>>> 卸载 consumer_plugin <<<")
-        await consumer.dispose()
-        print(">>> 卸载完成 <<<\n")
 
-        print("等待观察：")
-        await asyncio.sleep(3)
-
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

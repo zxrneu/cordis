@@ -4,6 +4,8 @@
 
 Python 接口已同步当前仓库：除 FiberView、类型键和类型化挂载外，现已提供可选 Service 基类、调用方 Context 传播、Accessor/mixin、EntryTree/ConfigStore、多文件 include、混合静态/运行时 HMR 依赖追踪，以及 logger/timer/registry/schema 辅助层。已有项目的改法见[迁移指南](migration-typed-interfaces.md)。
 
+Python 的推荐入口是显式服务获取、普通对象组合、标准上下文管理器和局部资源作用域，见 [Python 接口约定](python-style.md)。下文对代理、动态属性与调用方传播的对照说明兼容能力，不代表新业务代码应复制 TS 的调用形式。
+
 ---
 
 ## 目录
@@ -86,7 +88,7 @@ Python 接口已同步当前仓库：除 FiberView、类型键和类型化挂载
   app.http.post('https://api.com', {})
   ```
 - **Python 版**：
-  `Service` 构造时自注册，`BoundService` 同时代理普通方法和 `__call__`；调用期间 `service.ctx` 指向消费者 Context，调用结束后恢复提供方 Context。它不修改类原型，也不使用 Metaclass，符合 Python 对显式对象组合的习惯。
+  兼容接口中，`Service` 构造时自注册，`BoundService` 同时代理普通方法和 `__call__`；调用期间 `service.ctx` 指向消费者 Context，调用结束后恢复提供方 Context。这仍有隐式代理的理解成本。新服务优先发布普通对象，在需要调用者归属时通过参数显式接收所有者。
 
 ---
 
@@ -120,7 +122,7 @@ TS 版适配 [`@standard-schema/spec`](https://github.com/standard-schema/standa
 | EventKey + on/emit/parallel | 通过 TypeVarTuple 关联零到多个参数 | 字符串事件不关联参数类型 |
 | QueryKey + handle/query | 请求、结果和可选 None | 单处理器语义，不替代多监听器短路链 |
 
-EventKey/QueryKey 按对象身份匹配，必须共享同一个键；ServiceKey 继续按字符串名字路由。类型化 mount 目前不参与源码 HMR，动态 Entry 的字符串定位符仍是代码替换入口。
+EventKey/QueryKey 按对象身份匹配，必须共享同一个键；ServiceKey 继续按字符串名字路由。模块级可重新导入的类型化 mount 和嵌套 group/include 均参与源码 HMR；局部闭包与 lambda 应使用稳定入口替代。
 
 ---
 
@@ -137,20 +139,20 @@ EventKey/QueryKey 按对象身份匹配，必须共享同一个键；ServiceKey 
   - 上下文派生扩展（`[symbols.extend]`）；
   - 配置合并算法（`[symbols.resolveConfig]`）。
 - **Python 版**：
-  `Service(ctx, key)` 是可选的自注册基类，适合需要调用方 Context 的对象服务；轻量值和第三方对象仍可继续使用 `ctx.provide()`。两条路径共享 Realm、依赖声明和 Effect 回滚，不强迫所有服务继承框架类型。
+  新服务推荐普通对象与显式 `ctx.provide()`，资源通过 `enter_context()` / `enter_async_context()` 获取，通过 `defer()` 登记清理。`Service(ctx, key)` 自注册基类继续兼容；两条路径共享服务隔离和依赖调度，不要求业务对象继承框架类型。
 
 ### 4.2 上下文反向追踪（Caller Traceability）
 
 - **TypeScript 版**：
   拥有强大的 `getTraceable` 机制。当消费者通过 `ctx.db.query()` 访问数据库时，运行时自动给数据库服务挂载 `symbols.caller = ctx`。数据库内部读取 `this.ctx[symbols.caller]` 即可**精确获知是哪一个插件的哪次调用触发了自己**，为权限鉴定、插件调用量配额与链路追踪提供了底层支持。
 - **Python 版**：
-  `BoundService` 在同步方法、awaitable、同步迭代器和异步迭代器的实际执行期间设置 `contextvars`。服务通过 `self.ctx` 或 `current_context()` 获得调用方；服务内部创建的监听器、任务和子插件因此归消费者生命周期所有。传播只针对 `Service`，不会隐式包装任意对象。
+  `BoundService` 在同步方法、awaitable、同步迭代器和异步迭代器的实际执行期间设置 `contextvars`。服务通过 `self.ctx` 或 `current_context()` 获得调用方；服务内部创建的监听器、任务和子插件因此归消费者生命周期所有。依赖读取保留定义方的声明，副作用归调用方。普通对象可通过 ContextAware 显式选择传播范围。
 
 ---
 
 ## 5. 异步与并发任务治理模型 (Concurrency & Task Supervision)
 
-在此维度，Python 版凭借其现代异步设计展现出了显著的架构优势，但也暴露出关键的停机隐患：
+Python 版为受管任务提供排空和取消策略，并为根运行时停机提供等待期限：
 
 ```mermaid
 flowchart TD
@@ -174,10 +176,12 @@ flowchart TD
 - 引入了工业级的结构化并发工具 [`ctx.spawn()`](../src/cordis/core.py#L1463)，支持 `policy="drain"`（优雅排空）与 `policy="cancel"`（即时取消），能够保证“在提供者服务关闭前，消费者的在途事务被安全排空或协作退出”。
 
 ### 5.2 Python 版的任务治理短板与风险
-1. **Cleanup 清理阶段缺少全局超时保护（P0 级风险）**：
-   在 [`_dispose_actions`](../src/cordis/core.py#L449) 中，`_dispose_actions` 清理动作栈时是无限期等待的。若某个插件的清理函数发生永久死锁（例如等待未关闭的连接池），整个进程的卸载与重载流程将被永久冻结。
+1. **等待期限与清理完成有不同的保证**：
+   `Context.close(timeout=...)` 默认在 30 秒内结束调用方的等待，超时提供阻塞组件与任务快照，清理继续执行。它不会提前释放仍被使用的资源。单独卸载、重载和局部作用域退出仍等待安全清理；进程管理器需负责最终的进程退出期限。
 2. **协作取消的天然脆弱性**：
    Python 协程的取消依赖协作让出，若插件内存在同步 CPU 密集死循环或阻塞式系统调用（如未经线程化的文件读写），`cancel()` 信号无法强制打断执行。
+
+运行时还提供共享任务容量和有界错误历史，以及能拒绝缺失依赖、初始化失败和启动超时的 `wait_ready()`。这些机制和现有回归测试仍需目标业务的长期负载验证，见[生产运行约定](production.md)。
 
 ---
 
@@ -209,7 +213,7 @@ Python 已增加不可变 `EntryTree` 的 create/update/remove/move 路径操作
 
 Python 的 B04/B05 已修复：模块缓存和父包属性一起恢复，操作取消会等提交或回滚收尾。接受的包会扩展到缓存子模块，并在 reload_changed 中检查 external 边界。
 
-当前依赖图合并 AST 静态边和插件导入期间捕获的 `__import__` / `importlib.import_module()` 动态边；动态模块名因此能参与反向影响分析。剩余边界是插件加载窗口之外才发生的条件导入、全进程源码扫描成本、导入时外部副作用，以及外层 Loader 不自动遍历 group 子 Loader。见 [HMR API](api/hmr.md)。
+当前依赖图合并 AST 静态边和插件导入期间捕获的 `__import__` / `importlib.import_module()` 动态边；动态模块名因此能参与反向影响分析。剩余边界是插件加载窗口之外才发生的条件导入、全进程源码扫描成本、导入时外部副作用，以及无法按模块限定名重新导入的局部闭包。见 [HMR API](api/hmr.md)。
 
 
 ---
@@ -236,7 +240,7 @@ Python 当前状态:
 └── examples/ (CSV 导入、Agent、安全卸载、类型化接口等示例)
 ```
 
-Python 的这些能力采用标准库习惯：`ctx.timer.timeout()/interval()/debounce()/throttle()` 返回受管 Task；`ctx.logger` 基于 `logging` 并自动附加 Fiber 元数据；`ContextLogger.add_handler()` 随作用域移除 handler。与 TS 的主要差距从“缺少能力”变成了“生态包数量和长期生产验证规模不同”。
+Python 的这些能力采用标准库习惯：`ctx.timer.timeout()/debounce()/throttle()` 返回受管 Task，interval 还可返回具备显式关闭语义的异步 tick 流；`ctx.logger` 基于 `logging` 并自动附加 Fiber 元数据；`ContextLogger.add_handler()` 随作用域移除 handler。与 TS 的主要差距从“缺少能力”变成了“生态包数量和长期生产验证规模不同”。
 
 ---
 
@@ -262,8 +266,8 @@ Python 的这些能力采用标准库习惯：`ctx.timer.timeout()/interval()/de
 审计的 10 项缺陷、Loader 串行协调与失败恢复已经完成。后续工作集中在：
 
 1. cleanup 期限、容量和长期运行诊断。
-2. 动态依赖声明、嵌套 Loader 的 HMR 范围与 watcher 恢复策略。
-3. 依赖环、整组就绪和 Realm 冲突预检。
+2. 加载窗口之外的动态导入追踪与长期运行性能。
+3. 依赖环诊断与 Realm 冲突预检；整组就绪已可通过 Loader 发布服务显式门控。
 4. 长期运行观测、插件生态规模与更多第三方 Schema/日志 handler 集成。
 
 完整状态见[实现与维护参考](implementation.md#维护清单)。

@@ -7,8 +7,6 @@ from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
-from cordis import Context
-
 from .contracts import Json, Tool, ToolCall, required_string
 
 
@@ -29,8 +27,8 @@ class ApprovalPolicy:
 
 
 class ToolRuntime:
-    def __init__(self, ctx: Context):
-        self.ctx = ctx
+    def __init__(self, policy: ApprovalPolicy) -> None:
+        self.policy = policy
         self._tools: dict[str, Tool] = {}
 
     def register(self, tool: Tool) -> Callable[[], None]:
@@ -61,7 +59,7 @@ class ToolRuntime:
         tool = self._tools.get(call.name)
         if tool is None:
             return {"ok": False, "error": f"未知工具 {call.name!r}"}
-        if denial := await self.ctx.policy.authorize(tool, call):
+        if denial := await self.policy.authorize(tool, call):
             return {"ok": False, "error": denial}
         try:
             value = tool.execute(call.arguments)
@@ -137,8 +135,10 @@ _OPERATORS: dict[type[ast.operator], Callable[[float, float], float]] = {
 
 def calculate(arguments: Mapping[str, Any]) -> int | float:
     def visit(node: ast.AST) -> int | float:
-        if isinstance(node, ast.Constant) and type(node.value) in (int, float):
-            return node.value
+        if isinstance(node, ast.Constant):
+            value = node.value
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return value
         if isinstance(node, ast.BinOp) and type(node.op) in _OPERATORS:
             return _OPERATORS[type(node.op)](visit(node.left), visit(node.right))
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):

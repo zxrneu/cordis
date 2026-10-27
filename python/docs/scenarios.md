@@ -172,7 +172,7 @@ class OrderStore(Protocol):
 | `OrderValidator.validate()` | `ValidateOrderRequest`：订单号、客户、金额文本 | `Order`：规范化后的订单，金额为整数分；非法值抛出 `ValueError` |
 | `OrderImporter.submit()` | `ImportRequest`：待导入文件的路径 | `asyncio.Task[ImportReport]`：等待任务得到成功行数和拒绝原因 |
 
-这些类型都属于契约模块，调用方无需为获取 `ImportReport` 去导入 CSV 实现。`ServiceKey[OrderStore]` 等带类型的键把接口与运行时服务对应起来，`AppContext` 则提供 `ctx.store`、`ctx.validator`、`ctx.importer` 这些有类型提示的访问方式。
+这些类型都属于契约模块，调用方无需为获取 `ImportReport` 去导入 CSV 实现。`ServiceKey[OrderStore]` 等带类型的键把接口与运行时服务对应起来，在插件装配处用 `ctx.service(KEY)` 取得具体依赖，再传给业务对象；基础 Context 即可保留类型提示。
 
 这里使用 Python `Protocol`：实现满足接口即可，不要求继承统一基类。**类型一致还不够，还要遵守同一套行为约定。** 本例要求存储按订单号覆盖写入，`all()` 返回按订单号排序的不可变快照，实例关闭后抛出 `StoreClosedError`。同一组测试会验证 SQLite 和内存实现。
 
@@ -183,19 +183,20 @@ class OrderStore(Protocol):
 | 文件 | 实现与资源 |
 | --- | --- |
 | [`providers/validation.py`](../examples/order_importer/providers/validation.py) | 实现 `OrderValidator`，按金额上限校验；配置类型 `ValidationConfig` 由它拥有 |
-| [`providers/sqlite.py`](../examples/order_importer/providers/sqlite.py) | 实现 `OrderStore`，管理数据库连接；使用 `ctx.defer(store.close)` 绑定连接关闭生命周期 |
+| [`providers/sqlite.py`](../examples/order_importer/providers/sqlite.py) | 实现 `OrderStore`，管理数据库连接；使用标准上下文管理器绑定连接关闭生命周期 |
 | [`providers/memory.py`](../examples/order_importer/providers/memory.py) | 实现同一个 `OrderStore`，把订单保存在当前实例的字典中 |
 | [`providers/csv.py`](../examples/order_importer/providers/csv.py) | 实现 `OrderImporter`，读取单个文件，调用校验与存储接口，返回导入报告 |
 
-SQLite 提供方使用 `ctx.defer` 注册连接关闭，免去了写生成器插件的繁琐：
+SQLite 提供方通过标准库 `closing()` 与 `ctx.enter_context()` 绑定资源生命周期：
 
 ```python
+from contextlib import closing
+
 @plugin(provide=[STORE])
 def database(ctx: AppContext, config: DatabaseConfig) -> None:
     config.path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(config.path)
-    store = SQLiteStore(connection)
-    ctx.defer(store.close, label="sqlite:close")
+    store = ctx.enter_context(closing(SQLiteStore(connection)))
     with connection:
         connection.execute(...)
     ctx.provide(STORE, store)
@@ -205,11 +206,11 @@ CSV 提供方的插件定义很短：
 
 ```python
 @plugin(inject=[STORE, VALIDATOR], provide=[IMPORTER])
-def importer(ctx: AppContext, _config: None) -> None:
-    ctx.provide(IMPORTER, CsvImporter(ctx))
+def importer(ctx: Context, _config: None) -> None:
+    ctx.provide(IMPORTER, CsvImporter(ctx, ctx.service(VALIDATOR), ctx.service(STORE)))
 ```
 
-它通过 `ctx.validator.validate(...)` 和 `ctx.store.save(...)` 调用共享契约，不认识 `SQLiteStore` 或 `MemoryStore`。对于存储能力，它是调用方；对于文件导入能力，它是提供方。三种角色是相对于一项能力而言的。
+业务对象通过构造参数取得校验器与存储，直接调用 `self.validator.validate(...)` 和 `self.store.save(...)`，不认识 `SQLiteStore` 或 `MemoryStore`。对于存储能力，它是调用方；对于文件导入能力，它是提供方。三种角色是相对于一项能力而言的。
 
 每次 `submit()` 都由 CSV 提供方创建受管任务，完成后只返回 `ImportReport`。它不扫描目录，也不打印日志或发送展示事件。
 
@@ -221,7 +222,7 @@ def importer(ctx: AppContext, _config: None) -> None:
 @plugin(inject=[IMPORTER])
 def directory(ctx: AppContext, config: ImporterConfig) -> None:
     config.directory.mkdir(parents=True, exist_ok=True)
-    watcher = DirectoryWatcher(ctx, config)
+    watcher = DirectoryWatcher(ctx, config, ctx.service(IMPORTER))
     ctx.timer.interval(
         config.interval, watcher.scan_step, immediate=True, policy="cancel"
     )
@@ -231,7 +232,7 @@ def directory(ctx: AppContext, config: ImporterConfig) -> None:
 
 ```python
 report = await asyncio.shield(
-    self.ctx.importer.submit(ImportRequest(path))
+    self.importer.submit(ImportRequest(path))
 )
 self.ctx.emit(EVENT_ORDERS_IMPORTED, report)
 ```

@@ -46,18 +46,14 @@ class Greeter(Protocol):
 GREETER = ServiceKey[Greeter]("greeter")
 
 
-class AppContext(Context):
-    greeter = GREETER
-
-
 @dataclass(frozen=True)
 class GreeterConfig:
     prefix: str
 ```
 
-`Greeter` 是服务接口，符合签名的函数也能实现它。`GREETER` 把服务名与接口类型关联起来；`AppContext.greeter` 是只读服务描述符，使 `ctx.greeter("Cordis")` 具有参数检查和编辑器补全。
+`Greeter` 是服务接口，符合签名的函数也能实现它。`GREETER` 把服务名与接口类型关联起来；通过 `ctx.service(GREETER)` 获取普通对象，保留参数检查和编辑器补全。
 
-实际项目中，把接口、服务键和 `AppContext` 放到共享的 `contracts.py`，由提供者和消费者共同导入。配置使用不可变 dataclass，更新时创建新配置，避免原地修改导致变更比较失效。
+实际项目中，把接口和服务键放到共享的契约模块，由提供者和消费者共同导入。配置使用不可变 dataclass，更新时创建新配置，避免原地修改导致变更比较失效。
 
 ## 3. 编写提供者与消费者
 
@@ -66,11 +62,11 @@ class GreeterConfig:
 ```python
 import asyncio
 
-from cordis import Cleanup, plugin
+from cordis import plugin
 
 
 @plugin(provide=[GREETER])
-def greeter(ctx: AppContext, config: GreeterConfig) -> Cleanup:
+def greeter(ctx: Context, config: GreeterConfig) -> None:
     def greet(name: str) -> str:
         return f"{config.prefix} {name}"
 
@@ -80,14 +76,16 @@ def greeter(ctx: AppContext, config: GreeterConfig) -> Cleanup:
     def cleanup() -> None:
         print(f"服务清理: {config.prefix}")
 
-    return cleanup
+    ctx.defer(cleanup)
 
 
 @plugin(inject=[GREETER])
-def app(ctx: AppContext, _config: None) -> Cleanup:
+def app(ctx: Context, _config: None) -> None:
+    greet = ctx.service(GREETER)
+
     async def on_greet(name: str) -> str:
         await asyncio.sleep(0)
-        message = ctx.greeter(name)
+        message = greet(name)
         print(message)
         return message
 
@@ -97,12 +95,12 @@ def app(ctx: AppContext, _config: None) -> Cleanup:
     def cleanup() -> None:
         print("应用清理")
 
-    return cleanup
+    ctx.defer(cleanup)
 ```
 
 `provide=[GREETER]` 声明组件承诺提供服务，`ctx.provide()` 注册实际对象。`inject=[GREETER]` 声明组件的启动条件；服务缺失时，`app` 保持 `pending`，函数体尚不会执行。`_config: None` 表示这个插件不需要配置。
 
-返回的 `cleanup` 会在卸载时执行。监听器、服务注册本身已经由 Context 管理，无需在 cleanup 中重复注销。本例用打印展示清理顺序；数据库连接、文件句柄等资源则应在对应清理中关闭。
+`ctx.defer(cleanup)` 登记的清理函数会在卸载时执行。监听器、服务注册本身已经由 Context 管理，无需在 cleanup 中重复注销。本例用打印展示清理顺序；数据库连接、文件句柄等资源则应在对应清理中关闭。
 
 异步监听器的任务属于注册它的 `app` 插件。这里的 `timeout=5` 表示卸载时最多等待 5 秒自然完成，随后请求取消；它不是每次事件处理的执行时限。
 
@@ -115,7 +113,7 @@ from cordis import FiberState
 
 
 async def main() -> None:
-    async with AppContext() as root:
+    async with Context() as root:
         consumer = root.use(app)
         assert (await consumer).state is FiberState.PENDING
         print(f"等待依赖: {consumer.state.value}")
@@ -143,7 +141,7 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-`ctx.use()` 返回的是插件运行实例 `Fiber`，并立即调度启动。`provider` 的类型是 `Fiber[GreeterConfig, AppContext]`，因此 `provider.update()` 也要求 `GreeterConfig`；错误的配置类型会被 mypy 拒绝。
+`ctx.use()` 返回的是插件运行实例 `Fiber`，并立即调度启动。`provider` 的类型是 `Fiber[GreeterConfig, Context]`，因此 `provider.update()` 也要求 `GreeterConfig`；错误的配置类型会被 mypy 拒绝。
 
 `provider.ctx.fiber`、`root.fibers` 及 Loader 的字符串查询返回 FiberView：它可以查看状态、等待、重启和卸载，但静态接口没有 update。更新配置时保留上面的 provider，不要通过状态查询重新获取写配置的句柄。
 
@@ -182,17 +180,15 @@ Hello Cordis
 
 ## 5. 管理资源和后台任务
 
-有多个资源时，用生成器在每一步获得资源后立即交出清理操作：
+资源需要活到插件退出时，通过标准上下文管理器获取，并立即交给当前作用域管理：
 
 ```python
-from collections.abc import Iterator
 from pathlib import Path
 
 
 @plugin
-def audit(ctx: Context, path: Path) -> Iterator[Cleanup]:
-    stream = path.open("a", encoding="utf-8")
-    yield stream.close
+def audit(ctx: Context, path: Path) -> None:
+    stream = ctx.enter_context(path.open("a", encoding="utf-8"))
 
     def write(message: str) -> None:
         stream.write(message + "\n")
@@ -201,7 +197,7 @@ def audit(ctx: Context, path: Path) -> Iterator[Cleanup]:
     ctx.on("audit", write)
 ```
 
-每次 `yield` 的清理会先注册，再继续初始化。如果后续初始化失败，已经注册的清理仍会执行。卸载时按后进先出顺序撤销：这里先注销监听器，再关闭文件。关闭句柄不会撤销已经写入文件的内容。
+进入方法返回实际资源值，并登记退出操作。如果后续初始化失败，已经取得的资源仍会被释放。卸载时先注销监听器，再关闭文件；关闭句柄不会撤销已经写入的内容。异步资源使用 `await ctx.enter_async_context(...)`，局部生命周期用 `async with ctx.scope() as scope`。旧的生成器和 Effect 协议仍兼容，见 [Python 接口约定](python-style.md)。
 
 主动启动后台任务时使用 `ctx.spawn()`：
 
@@ -230,14 +226,14 @@ def ticker(ctx: Context, _config: None) -> None:
 ```python
 import asyncio
 
-from cordis import Loader
+from cordis import Context, Loader
 from examples.typed_interfaces import (
-    AppContext, FIND_USER, MESSAGE, Message, WorkerConfig, worker,
+    FIND_USER, MESSAGE, Message, WorkerConfig, worker,
 )
 
 
 async def main() -> None:
-    async with AppContext() as root:
+    async with Context() as root:
         loader = Loader(root)
         await loader.mount("worker", worker.configure(WorkerConfig("hello")))
         await root.parallel(MESSAGE, Message("Cordis"))
@@ -258,12 +254,12 @@ worker 内部用 `ctx.on(MESSAGE, receive)` 和 `ctx.handle(FIND_USER, find_user
 ```python
 import asyncio
 
-from cordis import Entry, FiberState, Loader
-from examples.tutorial import AppContext, GreeterConfig, app, greeter
+from cordis import Context, Entry, FiberState, Loader
+from examples.tutorial import GreeterConfig, app, greeter
 
 
 async def main() -> None:
-    async with AppContext() as root:
+    async with Context() as root:
         loader = Loader(root)
         try:
             for prefix in ("你好", "Hello"):
@@ -286,7 +282,7 @@ asyncio.run(main())
 
 清单中新增的 id 会挂载，移除的 id 会卸载，已有 id 的配置变化会触发更新；`enabled=False` 可保留条目但停用实例。reconcile 在修改前预检，失败时尝试恢复旧条目；同一 Loader 的管理操作串行执行，详见 [Loader API](api/loader.md)。
 
-`Entry` 容纳不同类型的组件，配置类型为 object，不保留组件与配置的静态对应关系。代码内需要严格匹配时，用 `ctx.use()`，或先 `binding = greeter.configure(config)` 再 `fiber = await loader.mount("greeter", binding)`。后者保留 Fiber[GreeterConfig, AppContext]，可以直接检查 fiber.update 的参数。
+`Entry` 容纳不同类型的组件，配置类型为 object，不保留组件与配置的静态对应关系。代码内需要严格匹配时，用 `ctx.use()`，或先 `binding = greeter.configure(config)` 再 `fiber = await loader.mount("greeter", binding)`。后者保留 Fiber[GreeterConfig, Context]，可以直接检查 fiber.update 的参数。
 
 mount 条目不进入 loader.entries，也不会被 reconcile([]) 删除；使用 unmount(id) 或 close() 清理。两种入口的 id 不能冲突。mount 等待当前启动转换，但缺少依赖时仍可能返回 PENDING。loader.get/reload 返回 FiberView，仅用于查看状态及不需要配置类型的生命周期操作。
 
@@ -297,12 +293,12 @@ mount 条目不进入 loader.entries，也不会被 reconcile([]) 删除；使�
 文件配置不会自动构造 dataclass。可以加一个接收 `object` 的入口，检查外部输入后再挂载类型化插件。在 `python/my_app/` 中创建空的 `__init__.py`，并保存以下 `plugins.py`：
 
 ```python
-from cordis import plugin
-from examples.tutorial import AppContext, GreeterConfig, greeter
+from cordis import Context, plugin
+from examples.tutorial import GreeterConfig, greeter
 
 
 @plugin
-def file_greeter(ctx: AppContext, raw: object) -> None:
+def file_greeter(ctx: Context, raw: object) -> None:
     if not isinstance(raw, dict):
         raise TypeError("greeter.config 必须是对象")
     prefix: object = raw.get("prefix")
@@ -363,11 +359,12 @@ HMR 根据静态导入关系决定受影响模块；它不能替换进程里所�
 ```python
 import asyncio
 
-from examples.tutorial import AppContext, GREETER, GreeterConfig, app, greeter
+from cordis import Context
+from examples.tutorial import GREETER, GreeterConfig, app, greeter
 
 
 async def main() -> None:
-    async with AppContext() as root:
+    async with Context() as root:
         left = root.isolate(GREETER)
         right = root.isolate(GREETER)
         left_provider = left.use(greeter, GreeterConfig(prefix="A"))

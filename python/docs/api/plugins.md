@@ -85,6 +85,10 @@ def apply(self, ctx: ContextT, config: ConfigT, /) -> PluginResult: ...
 
 ### 初始化可以返回什么
 
+推荐插件使用返回 `None` 的普通函数或异步函数，在取得资源后立即通过 [`enter_context()` / `enter_async_context()` / `defer()`](context.md#资源与任务) 登记清理。局部生命周期用 `async with ctx.scope()` 表达。
+
+需要用 `try/finally` 表达整个插件生命周期时，也可返回标准 `@contextmanager` / `@asynccontextmanager` 对象。下表保留其余初始化协议的兼容说明；原始生成器的 `yield cleanup` 与标准上下文管理器的 `yield` 语义不同。
+
 | 形式 | 初始化与清理方式 |
 | --- | --- |
 | `None` | 初始化结束；通过 Context 注册的资源仍受管理 |
@@ -144,6 +148,7 @@ ctx.inject(dependencies, callback, config=None) -> Fiber[ConfigT, ContextT]
 | `inject` | `Mapping[str, object]` | 规范化后的依赖声明 |
 | `error` | `Exception \| None` | 初始化错误；受管后台任务失败查看 `ctx.errors` |
 | `cleanup_error` | `ExceptionGroup \| None` | 最近卸载阶段收集的清理错误 |
+| `effects` | `tuple[EffectInfo, ...]` | 活跃 Effect 树的不可变快照；每个节点含 label 和 children |
 | `tasks` | `tuple[asyncio.Task[object], ...]` | 本 Fiber 尚未完成的受管任务快照，包括嵌套 Effect 的任务；单次 spawn 返回值仍保留 Task[T] |
 
 这些属性供读取和诊断。生命周期操作使用以下方法；不要直接写 `state` 或原地修改 `config` 来更新插件。
@@ -161,7 +166,7 @@ async def wait(*, raise_error: bool = True) -> Self: ...
 ### update
 
 ```python
-async def update(config: ConfigT, *, rollback: bool = True) -> None: ...
+async def update(config: ConfigT, *, rollback: bool = True, persist: bool = True) -> None: ...
 ```
 
 已销毁或已撤销 desired 的 Fiber 在校验和修改配置前抛出 InactiveContextError；自等待检查也在操作开始前执行。随后校验新配置；校验后与当前配置 `==` 时直接返回。建议用不可变 dataclass，在更新时构造新值。
@@ -170,6 +175,8 @@ async def update(config: ConfigT, *, rollback: bool = True) -> None: ...
 - **原地更新路径**：插件处于 `ACTIVE` 且提供了 `update` hook 时，调用 `update(ctx, previous, next)`，成功后保存新配置，不自动重启消费者。
 
 `rollback=False` 只关闭默认重启路径的恢复尝试。自定义 hook 必须自行恢复它修改的对象或外部状态，`rollback=True` 不会自动撤销 hook 的副作用。新配置的运行时激活可能再次调用 validate。
+
+Loader 管理的声明式 Entry 会同步保存更新后的配置；绑定 ConfigStore 时自动回写。`persist=False` 跳过这层持久化协调，供 Loader 自身 reconcile 使用。`internal/update` 中间件可拦截或拒绝更新。
 
 update 开始后，取消调用方会等更新提交或默认路径回滚完成后再抛出 CancelledError，重复取消也不会遗弃恢复。取消不等于撤销成功更新；可读取 config 确认结果。
 

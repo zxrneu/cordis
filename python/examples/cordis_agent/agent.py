@@ -4,14 +4,25 @@ import asyncio
 import json
 from typing import Any
 
-from cordis import Context
-
-from .contracts import ToolCall
+from .contracts import LanguageModel, ToolCall
+from .session import SessionLog
+from .tools import ToolRuntime
 
 
 class AgentRuntime:
-    def __init__(self, ctx: Context, *, max_steps: int):
-        self.ctx = ctx
+    def __init__(
+        self,
+        session: SessionLog,
+        model: LanguageModel,
+        tools: ToolRuntime,
+        system_prompt: str,
+        *,
+        max_steps: int,
+    ) -> None:
+        self.session = session
+        self.model = model
+        self.tools = tools
+        self.system_prompt = system_prompt
         self.max_steps = max_steps
         self._lock = asyncio.Lock()
 
@@ -20,15 +31,15 @@ class AgentRuntime:
             return await self._run(text)
 
     async def _run(self, text: str) -> str:
-        session = self.ctx.session
+        session = self.session
         if not session.messages:
-            await session.append({"role": "system", "content": self.ctx.system_prompt})
+            await session.append({"role": "system", "content": self.system_prompt})
         await session.append({"role": "user", "content": text})
 
         for _ in range(self.max_steps):
-            message = await self.ctx.llm.complete(
+            message = await self.model.complete(
                 session.messages,
-                self.ctx.tools.schemas(),
+                self.tools.schemas(),
             )
             await session.append(message)
             calls = message.get("tool_calls") or []
@@ -37,7 +48,7 @@ class AgentRuntime:
 
             for raw in calls:
                 call = self._parse_call(raw)
-                result = await self.ctx.tools.execute(call)
+                result = await self.tools.execute(call)
                 await session.append(
                     {
                         "role": "tool",
